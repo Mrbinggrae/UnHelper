@@ -101,7 +101,7 @@ class ProductWeightCrawler:
     SKU_SEARCH_BUTTON_LOCATOR: Locator = (By.CSS_SELECTOR, "button.btn-search")
     RESULT_ROWS_LOCATOR: Locator = (By.CSS_SELECTOR, "#wms__container table tbody tr")
     HIDDEN_WEIGHT_LOCATOR: Locator = (By.CSS_SELECTOR, "input.hidden-weight")
-    RESULT_SKU_COLUMN_INDEX = 0
+    RESULT_EXTERNAL_ID_COLUMN_INDEX = 1
     RESULT_PRODUCT_NAME_COLUMN_INDEX = 10
     NO_RESULT_TEXT = "조회 결과가 없습니다"
 
@@ -482,8 +482,10 @@ class ProductWeightCrawler:
             columns = row.find_elements(By.TAG_NAME, "td")
             if len(columns) <= cls.RESULT_PRODUCT_NAME_COLUMN_INDEX:
                 return None
-            row_sku = cls.normalize_sku(columns[cls.RESULT_SKU_COLUMN_INDEX].text)
-            if row_sku != sku_id:
+            row_external_id = cls.normalize_sku(
+                columns[cls.RESULT_EXTERNAL_ID_COLUMN_INDEX].text
+            )
+            if row_external_id != sku_id:
                 return None
             product_column = columns[cls.RESULT_PRODUCT_NAME_COLUMN_INDEX]
             links = product_column.find_elements(By.TAG_NAME, "a")
@@ -496,7 +498,7 @@ class ProductWeightCrawler:
             if not product_name:
                 return None
             return _SearchResult(
-                sku_id=row_sku,
+                sku_id=row_external_id,
                 product_name=product_name,
                 link=link,
                 href=str(link.get_attribute("href") or ""),

@@ -76,7 +76,8 @@ class _Element:
 
 
 def _result_row(
-    sku: str,
+    internal_sku: str,
+    external_id: str,
     product_name: str,
     href: str = "/sku/detail",
     *,
@@ -85,7 +86,8 @@ def _result_row(
 ) -> _Element:
     link = _Element(product_name, href=href, target=target)
     columns = [_Element() for _ in range(column_count)]
-    columns[0] = _Element(sku)
+    columns[0] = _Element(internal_sku)
+    columns[1] = _Element(external_id)
     columns[10] = _Element(product_name, links=[link])
     return _Element(columns=columns)
 
@@ -130,9 +132,9 @@ class ProductWeightCrawlerTests(unittest.TestCase):
             (By.CSS_SELECTOR, "input.form-control.input-external-id"),
         )
 
-    def test_exact_sku_row_only_and_product_name_preserves_slash(self) -> None:
-        wrong = _result_row("999", "다른 상품")
-        exact = _result_row("123", "상품 A /\n상품 B")
+    def test_exact_external_id_row_only_and_product_name_preserves_slash(self) -> None:
+        wrong = _result_row("111", "999", "다른 상품")
+        exact = _result_row("222", "123", "상품 A /\n상품 B")
 
         self.assertIsNone(ProductWeightCrawler._parse_result_row(wrong, "123"))
         parsed = ProductWeightCrawler._parse_result_row(exact, "123")
@@ -146,30 +148,32 @@ class ProductWeightCrawlerTests(unittest.TestCase):
     def test_actual_wms_row_uses_eleventh_column_link_without_relying_on_target(self) -> None:
         row = _result_row(
             "163108821",
+            "56913939",
             "Box*크리넥스 안심 다용도 타월 100매X10개 , 1박스",
             "/sku/163108821",
             target="*blank",
             column_count=16,
         )
 
-        parsed = ProductWeightCrawler._parse_result_row(row, "163108821")
+        parsed = ProductWeightCrawler._parse_result_row(row, "56913939")
 
         self.assertIsNotNone(parsed)
-        self.assertEqual(parsed.sku_id, "163108821")
+        self.assertEqual(parsed.sku_id, "56913939")
         self.assertEqual(parsed.product_name, "Box*크리넥스 안심 다용도 타월 100매X10개 , 1박스")
         self.assertEqual(parsed.href, "/sku/163108821")
         self.assertEqual(parsed.link.get_attribute("target"), "*blank")
 
-    def test_exact_sku_must_come_from_first_column_even_when_link_points_to_it(self) -> None:
+    def test_exact_match_uses_external_id_not_internal_sku_or_link_href(self) -> None:
         row = _result_row(
-            "999999999",
-            "다른 SKU 행",
+            "163108821",
+            "99999999",
+            "다른 External ID 행",
             "/sku/163108821",
             target="_blank",
             column_count=16,
         )
 
-        self.assertIsNone(ProductWeightCrawler._parse_result_row(row, "163108821"))
+        self.assertIsNone(ProductWeightCrawler._parse_result_row(row, "56913939"))
 
     def test_sku_normalization_removes_excel_decimal_but_keeps_leading_zero(self) -> None:
         self.assertEqual(ProductWeightCrawler.normalize_sku("1,234.0"), "1234")
@@ -300,6 +304,59 @@ class ProductWeightCrawlerTests(unittest.TestCase):
             result = crawler._wait_for_fresh_result("123", ("old",), None)
 
         self.assertIs(result, candidate)
+
+    def test_actual_external_id_candidate_stabilizes_twice_and_product_link_is_clicked(self) -> None:
+        crawler = self.make_crawler()
+        crawler.timeout = 0.05
+        crawler.SKU_SEARCH_TIMEOUT_SECONDS = 0.05
+        crawler.POLL_INTERVAL_SECONDS = 0.001
+        driver = _TabDriver(["main"], "main")
+        crawler.driver = driver
+        clicks: list[str] = []
+
+        def open_internal_sku_detail() -> None:
+            clicks.append("/sku/163108821")
+            driver.window_handles.append("detail")
+
+        row = _result_row(
+            "163108821",
+            "56913939",
+            "Box*크리넥스 안심 다용도 타월 100매X10개 , 1박스",
+            "/sku/163108821",
+            target="*blank",
+            column_count=16,
+        )
+        row.columns[10].links[0].on_click = open_internal_sku_detail
+
+        with (
+            mock.patch.object(crawler, "_ensure_browser_open"),
+            mock.patch.object(crawler, "_table_signature", return_value=("new",)),
+            mock.patch.object(crawler, "_is_stale", return_value=False),
+            mock.patch.object(crawler, "_result_mutation_count", return_value=0),
+            mock.patch.object(crawler, "_result_rows", return_value=[row]),
+            mock.patch.object(crawler, "_has_no_result_message", return_value=False),
+            mock.patch.object(
+                crawler,
+                "_find_exact_result",
+                wraps=crawler._find_exact_result,
+            ) as find_exact,
+        ):
+            candidate = crawler._wait_for_fresh_result(
+                "56913939",
+                ("old",),
+                None,
+            )
+
+        self.assertEqual(find_exact.call_count, 2)
+        self.assertEqual(candidate.sku_id, "56913939")
+        self.assertEqual(candidate.href, "/sku/163108821")
+
+        with mock.patch.object(crawler, "_wait_document_ready"):
+            detail = crawler._open_product_detail(candidate.link)
+
+        self.assertEqual(clicks, ["/sku/163108821"])
+        self.assertTrue(detail.opened_new_tab)
+        self.assertEqual(detail.detail_handle, "detail")
 
     def test_old_exact_row_is_not_accepted_without_fresh_transition(self) -> None:
         crawler = self.make_crawler()
