@@ -73,7 +73,8 @@ class ErrorReportDialog(QDialog):
         layout.addWidget(self.detail_view, 1)
 
         self.action_status = QLabel(
-            "신고 버튼을 누르면 개인정보와 인증정보를 가린 보고서를 복사하고 GitHub 작성 화면을 엽니다."
+            "신고 버튼을 누르면 개인정보와 인증정보를 가린 보고서를 복사하고 GitHub 작성 화면을 엽니다. "
+            "열린 본문 입력칸에 Ctrl+V로 붙여넣어 주세요."
         )
         self.action_status.setWordWrap(True)
         self.action_status.setStyleSheet("color: #A1A1AA;")
@@ -102,8 +103,8 @@ class ErrorReportDialog(QDialog):
         self.copy_report()
         if self._open_url(QUrl(self.issue_url)):
             self.action_status.setText(
-                "GitHub 이슈 작성 화면을 열었습니다. 내용을 확인한 뒤 제출해 주세요. "
-                "본문이 잘렸다면 클립보드의 전체 내용을 붙여넣을 수 있습니다."
+                "GitHub 이슈 작성 화면을 열었습니다. 본문 입력칸에 Ctrl+V로 복사된 오류 내용을 "
+                "붙여넣고 확인한 뒤 제출해 주세요."
             )
             return
         self.action_status.setText(

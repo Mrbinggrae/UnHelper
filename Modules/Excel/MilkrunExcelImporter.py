@@ -12,7 +12,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from Modules.Shipments.DailyInbound import extract_order_numbers
+from Modules.Shipments.DailyInbound import (
+    extract_dispatch_numbers,
+    normalize_dispatch_number,
+)
 
 
 LogCallback = Callable[[str], None]
@@ -33,7 +36,7 @@ class MilkrunExcelImportResult:
     sheet_name: str
     rows: int
     columns: int
-    order_numbers: tuple[str, ...]
+    dispatch_numbers: tuple[str, ...]
     filtered_rows: int = 0
 
 
@@ -223,7 +226,12 @@ class MilkrunExcelImporter:
                 raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
 
             normalized_values = self._rectangularize(values, columns)
-            order_numbers = extract_order_numbers(normalized_values)
+            dispatch_numbers = extract_dispatch_numbers(normalized_values)
+            if exclude_arrival_date is not None and rows > 1 and not dispatch_numbers:
+                raise ExcelImportError(
+                    "오늘 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
+                    "기존 값을 지우지 않았습니다."
+                )
             clear_range = sheet.Range(self.CLEAR_RANGE)
             original_attribute = "Value2"
             original_contents = clear_range.Value2
@@ -278,7 +286,7 @@ class MilkrunExcelImporter:
                 sheet_name=self.TARGET_SHEET,
                 rows=rows,
                 columns=columns,
-                order_numbers=order_numbers,
+                dispatch_numbers=dispatch_numbers,
                 filtered_rows=filtered_rows,
             )
         except (ExcelImportCancelled, ExcelImportError):
@@ -646,6 +654,15 @@ class MilkrunExcelImporter:
         header = tuple(rows[0])
         if len(header) < 3:
             raise ExcelImportError("다운로드 데이터의 C열에서 '입고일' 헤더를 찾을 수 없습니다.")
+        dispatch_header = re.sub(
+            r"\s+",
+            "",
+            str(header[0] or "").lstrip("\ufeff").strip(),
+        )
+        if dispatch_header != "배차번호":
+            raise ExcelImportError(
+                "다운로드 데이터의 A열 헤더가 '배차번호'가 아닙니다. 기존 값을 지우지 않았습니다."
+            )
         header_text = str(header[2] or "").lstrip("\ufeff").strip()
         if header_text != "입고일":
             raise ExcelImportError("다운로드 데이터의 C열 헤더가 '입고일'이 아닙니다. 기존 값을 지우지 않았습니다.")
@@ -667,6 +684,11 @@ class MilkrunExcelImporter:
             if arrival_date == excluded_date:
                 filtered_rows += 1
                 continue
+            if row and cls._cell_has_value(row[0]) and not normalize_dispatch_number(row[0]):
+                raise ExcelImportError(
+                    f"다운로드 데이터 {row_number}행의 A열 배차번호를 확인할 수 없습니다. "
+                    "기존 값을 지우지 않았습니다."
+                )
             kept_rows.append(row)
 
         # A header-only matrix remains a valid replacement. This clears stale

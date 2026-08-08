@@ -277,11 +277,11 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             root = Path(temp)
             source, target = self._paths(root)
             source.write_text(
-                "센터,SKU,입고일,수량\n"
-                "안산2,100,2026-08-07,1\n"
-                "안산2,101,2026. 8. 7.,2\n"
-                "안산2,102,2026/08/08,3\n"
-                "안산2,103,08/08/2026,4\n",
+                "배차번호,SKU,입고일,수량\n"
+                "T3369001,100,2026-08-07,1\n"
+                ",101,2026. 8. 7.,2\n"
+                "3370492,102,2026/08/08,3\n"
+                "M3370510,103,08/08/2026,4\n",
                 encoding="utf-8-sig",
             )
             original_source = source.read_bytes()
@@ -300,11 +300,12 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual(
                 sheet.destination.Value2,
                 (
-                    ("센터", "SKU", "입고일", "수량"),
-                    ("안산2", "102", "2026/08/08", "3"),
-                    ("안산2", "103", "08/08/2026", "4"),
+                    ("배차번호", "SKU", "입고일", "수량"),
+                    ("3370492", "102", "2026/08/08", "3"),
+                    ("M3370510", "103", "08/08/2026", "4"),
                 ),
             )
+            self.assertEqual(result.dispatch_numbers, ("M3370492", "M3370510"))
             self.assertEqual(target_book.save_count, 1)
             self.assertEqual(source.read_bytes(), original_source)
 
@@ -321,10 +322,10 @@ class MilkrunExcelImporterTests(unittest.TestCase):
                 target,
                 sheet,
                 (
-                    ("센터", "SKU", "입고일", "수량"),
-                    ("안산2", "100", date(2026, 8, 7), 1),
-                    ("안산2", "101", float(excel_serial), 2),
-                    ("안산2", "102", datetime(2026, 8, 8, 15, 30), 3),
+                    ("배차번호", "SKU", "입고일", "수량"),
+                    (3369001, "100", date(2026, 8, 7), 1),
+                    (3369002, "101", float(excel_serial), 2),
+                    (3370492.0, "102", datetime(2026, 8, 8, 15, 30), 3),
                 ),
             )
 
@@ -338,10 +339,11 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual(
                 sheet.destination.Value2,
                 (
-                    ("센터", "SKU", "입고일", "수량"),
-                    ("안산2", "102", datetime(2026, 8, 8, 15, 30), 3),
+                    ("배차번호", "SKU", "입고일", "수량"),
+                    (3370492.0, "102", datetime(2026, 8, 8, 15, 30), 3),
                 ),
             )
+            self.assertEqual(result.dispatch_numbers, ("M3370492",))
             self.assertEqual(target_book.save_count, 1)
             self.assertEqual(source_book.close_calls, [False])
             self.assertEqual(source.read_bytes(), original_source)
@@ -351,7 +353,7 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             root = Path(temp)
             source, target = self._paths(root)
             source.write_text(
-                "센터,SKU,날짜,수량\n안산2,100,2026-08-08,1\n",
+                "배차번호,SKU,날짜,수량\n3370492,100,2026-08-08,1\n",
                 encoding="utf-8",
             )
             sheet = FakeTargetSheet()
@@ -367,13 +369,34 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual(sheet.clear_range.clear_count, 0)
             self.assertEqual(target_book.save_count, 0)
 
+    def test_wrong_dispatch_header_is_rejected_before_target_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "발주번호,SKU,입고일,수량\n3370492,100,2026-08-08,1\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "A열 헤더"):
+                importer.import_values(
+                    source,
+                    target,
+                    exclude_arrival_date=date(2026, 8, 7),
+                )
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
+
     def test_invalid_or_blank_arrival_date_is_rejected_before_target_change(self) -> None:
         for label, arrival_value in (("blank", ""), ("invalid", "2026-02-30")):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 source, target = self._paths(root)
                 source.write_text(
-                    f"센터,SKU,입고일,수량\n안산2,100,{arrival_value},1\n",
+                    f"배차번호,SKU,입고일,수량\n3370492,100,{arrival_value},1\n",
                     encoding="utf-8",
                 )
                 sheet = FakeTargetSheet()
@@ -394,9 +417,9 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             root = Path(temp)
             source, target = self._paths(root)
             source.write_text(
-                "센터,SKU,입고일,수량\n"
-                "안산2,100,2026.08.07,1\n"
-                "안산2,101,08/07/2026,2\n",
+                "배차번호,SKU,입고일,수량\n"
+                "3369001,100,2026.08.07,1\n"
+                "3369002,101,08/07/2026,2\n",
                 encoding="utf-8",
             )
             sheet = FakeTargetSheet()
@@ -412,8 +435,9 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual(sheet.destination_coordinates, ((1, 3), (1, 6)))
             self.assertEqual(
                 sheet.destination.Value2,
-                (("센터", "SKU", "입고일", "수량"),),
+                (("배차번호", "SKU", "입고일", "수량"),),
             )
+            self.assertEqual(result.dispatch_numbers, ())
             self.assertEqual(sheet.clear_range.clear_count, 1)
             self.assertEqual(target_book.save_count, 1)
 
@@ -422,12 +446,12 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             root = Path(temp)
             source, target = self._paths(root)
             lines = [
-                "센터,SKU,입고일,수량",
-                "안산2,1,2026-08-07,1",
-                "안산2,2,2026-08-07,1",
+                "배차번호,SKU,입고일,수량",
+                "3369001,1,2026-08-07,1",
+                "3369002,2,2026-08-07,1",
             ]
             lines.extend(
-                f"안산2,{1000 + index},2026-08-08,1" for index in range(999)
+                f"{3370000 + index},{1000 + index},2026-08-08,1" for index in range(999)
             )
             source.write_text("\n".join(lines) + "\n", encoding="utf-8")
             sheet = FakeTargetSheet()
@@ -465,18 +489,18 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual(excel.quit_count, 0)
             self.assertEqual((pythoncom.initialized, pythoncom.uninitialized), (1, 1))
 
-    def test_import_result_contains_unique_p_column_order_numbers(self) -> None:
+    def test_import_result_contains_unique_a_column_dispatch_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source, target = self._paths(root)
             rows = [
                 [f"열{index}" for index in range(1, 15)],
-                [""] * 13 + ["8789357/8789357"],
-                [""] * 13 + ["T8789357"],
-                [""] * 13 + ["8827836"],
+                ["3370492"] + [""] * 13,
+                [3370492.0] + [""] * 13,
+                ["M3370510"] + [""] * 13,
             ]
             source.write_text(
-                "\n".join(",".join(row) for row in rows),
+                "\n".join(",".join(str(value) for value in row) for row in rows),
                 encoding="utf-8-sig",
             )
             sheet = FakeTargetSheet()
@@ -484,7 +508,74 @@ class MilkrunExcelImporterTests(unittest.TestCase):
 
             result = importer.import_values(source, target)
 
-            self.assertEqual(result.order_numbers, ("8789357", "8827836"))
+            self.assertEqual(result.dispatch_numbers, ("M3370492", "M3370510"))
+
+    def test_invalid_today_dispatch_number_is_rejected_before_target_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "배차번호,SKU,입고일,수량\n"
+                "T3370492,100,2026-08-08,1\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "A열 배차번호"):
+                importer.import_values(
+                    source,
+                    target,
+                    exclude_arrival_date=date(2026, 8, 7),
+                )
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
+
+    def test_blank_dispatch_continuation_row_keeps_first_group_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "배차번호,SKU,입고일,수량\n"
+                "3370492,100,2026-08-08,1\n"
+                ",101,2026-08-08,2\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+            )
+
+            self.assertEqual(result.dispatch_numbers, ("M3370492",))
+            self.assertEqual(sheet.clear_range.clear_count, 1)
+            self.assertEqual(target_book.save_count, 1)
+
+    def test_today_rows_without_dispatch_are_rejected_before_target_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "배차번호,SKU,입고일,수량\n"
+                ",100,2026-08-08,1\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "배차번호를 찾지 못했습니다"):
+                importer.import_values(
+                    source,
+                    target,
+                    exclude_arrival_date=date(2026, 8, 7),
+                )
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
 
     def test_formula_like_text_is_copied_as_source_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

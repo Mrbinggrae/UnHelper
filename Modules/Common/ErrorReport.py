@@ -14,7 +14,6 @@ from Modules.Common.version import CURRENT_VERSION
 
 GITHUB_ISSUES_URL = "https://github.com/Mrbinggrae/UnHelper/issues/new"
 _REPORT_LIMIT = 50_000
-_ISSUE_BODY_LIMIT = 5_500
 
 
 @dataclass(frozen=True)
@@ -130,12 +129,15 @@ def build_error_report(
 
 
 def build_github_issue_url(title: str, report: str) -> str:
+    """Build a short issue URL; the full report is copied to the clipboard.
+
+    GitHub rejects very long ``issues/new?body=...`` URLs with its
+    ``Whoa there!`` page.  Tracebacks and Korean text expand considerably
+    after percent-encoding, so even a character-limited body is not a safe
+    browser URL.  Keep ``report`` in the public signature for callers that
+    build the report and URL together, but never place it in the URL.
+    """
+
     issue_title = re.sub(r"\s+", " ", sanitize_report_text(title)).strip()
     issue_title = f"[UnHelper] {issue_title or '오류 신고'}"[:120]
-    sanitized = sanitize_report_text(report)
-    if len(sanitized) > _ISSUE_BODY_LIMIT:
-        sanitized = (
-            sanitized[:_ISSUE_BODY_LIMIT]
-            + "\n\n---\n전체 오류 내용은 클립보드에 복사되어 있습니다. 이 아래에 붙여넣어 주세요."
-        )
-    return f"{GITHUB_ISSUES_URL}?{urlencode({'title': issue_title, 'body': sanitized})}"
+    return f"{GITHUB_ISSUES_URL}?{urlencode({'title': issue_title})}"

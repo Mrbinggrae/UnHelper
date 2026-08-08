@@ -77,31 +77,33 @@ class _StubScraper(DailyInboundScraper):
     def _query_schedule(self) -> None:
         pass
 
-    def _matching_slots(self, order_number: str):
-        return [object()] if order_number == "8789357" else []
+    def _matching_slots(self, dispatch_number: str):
+        return [object()] if dispatch_number == "M3370492" else []
 
-    def _open_detail_and_read(self, card, order_number: str):
+    def _open_detail_and_read(self, card, dispatch_number: str):
         return (
-            MilkrunProductRow("거래처 A", "100", "1", "10", "SKU1", "상품 A", order_number),
-            MilkrunProductRow("거래처 B", "100", "1", "10", "SKU1", "상품 B", order_number),
+            MilkrunProductRow("거래처 A", "100", "1", "10", "SKU1", "상품 A", dispatch_number),
+            MilkrunProductRow("거래처 B", "100", "1", "10", "SKU1", "상품 B", dispatch_number),
         )
 
 
 class DailyInboundScraperTests(unittest.TestCase):
     def test_stale_unrelated_card_does_not_discard_an_exact_match(self) -> None:
-        browser = _Browser((_Card(stale=True), _Card("T8789357")))
+        browser = _Browser(
+            (_Card(stale=True), _Card("M3370492"), _Card("T3370492"), _Card("3370492"))
+        )
         scraper = DailyInboundScraper(browser)
 
-        matches = scraper._matching_slots("8789357")
+        matches = scraper._matching_slots("M3370492")
 
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].label, "T8789357")
+        self.assertEqual(matches[0].label, "M3370492")
 
     def test_distinct_display_rows_are_not_deduplicated_by_sku_alone(self) -> None:
         scraper = _StubScraper(_Browser())
 
         result = scraper.run(
-            ("8789357", "9999999"),
+            ("M3370492", "M9999999"),
             center_name="안산2",
             schedule_date=date(2026, 8, 8),
         )
@@ -109,7 +111,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(len(result.products), 2)
         self.assertEqual(result.products[0].sku_id, result.products[1].sku_id)
         self.assertNotEqual(result.products[0].vendor_name, result.products[1].vendor_name)
-        self.assertEqual(result.unmatched_orders, ("9999999",))
+        self.assertEqual(result.unmatched_dispatches, ("M9999999",))
 
     def test_worker_reports_partial_cancel_after_excel_was_saved(self) -> None:
         download_result = MilkrunDownloadResult(
@@ -124,7 +126,7 @@ class DailyInboundScraperTests(unittest.TestCase):
             sheet_name="Raw_밀크런",
             rows=2,
             columns=14,
-            order_numbers=("8789357",),
+            dispatch_numbers=("M3370492",),
         )
 
         fake_importer = mock.Mock()
@@ -169,7 +171,7 @@ class DailyInboundScraperTests(unittest.TestCase):
             sheet_name="Raw_밀크런",
             rows=1,
             columns=14,
-            order_numbers=(),
+            dispatch_numbers=(),
             filtered_rows=2,
         )
         fake_importer = mock.Mock()
@@ -199,7 +201,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].excel, import_result)
         self.assertEqual(completed[0].daily_inbound.products, ())
-        self.assertEqual(completed[0].daily_inbound.requested_orders, ())
+        self.assertEqual(completed[0].daily_inbound.requested_dispatches, ())
         self.assertEqual(failures, [])
         self.assertTrue(any("상세 조회를 건너뜁니다" in message for message in logs))
         scraper_class.assert_not_called()
@@ -220,18 +222,18 @@ class DailyInboundScraperTests(unittest.TestCase):
         }
         with (
             mock.patch.object(scraper, "_query_monitor_state", return_value=base_state),
-            mock.patch.object(scraper, "_slot_signature", return_value=("8789357",)),
+            mock.patch.object(scraper, "_slot_signature", return_value=("M3370492",)),
             mock.patch.object(scraper, "_has_no_result_message", return_value=False),
         ):
-            self.assertFalse(scraper._fresh_query_result_observed(("8789357",)))
+            self.assertFalse(scraper._fresh_query_result_observed(("M3370492",)))
 
         successful_query = dict(base_state, query_successes=1, query_settled_ms=1000)
         with (
             mock.patch.object(scraper, "_query_monitor_state", return_value=successful_query),
-            mock.patch.object(scraper, "_slot_signature", return_value=("8789357",)),
+            mock.patch.object(scraper, "_slot_signature", return_value=("M3370492",)),
             mock.patch.object(scraper, "_has_no_result_message", return_value=False),
         ):
-            self.assertTrue(scraper._fresh_query_result_observed(("8789357",)))
+            self.assertTrue(scraper._fresh_query_result_observed(("M3370492",)))
 
     def test_query_http_failure_is_reported(self) -> None:
         scraper = DailyInboundScraper(_Browser())

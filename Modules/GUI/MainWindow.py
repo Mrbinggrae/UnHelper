@@ -126,23 +126,25 @@ class MilkrunWorker(QThread):
             )
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
-            if import_result.rows == 1 and not import_result.order_numbers:
+            if import_result.rows == 1 and not import_result.dispatch_numbers:
                 self.log_updated.emit(
                     "오늘 반영할 Milkrun 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
                 )
                 daily_result = DailyInboundResult(
                     products=(),
-                    requested_orders=(),
-                    matched_orders=(),
-                    unmatched_orders=(),
+                    requested_dispatches=(),
+                    matched_dispatches=(),
+                    unmatched_dispatches=(),
                 )
             else:
-                self.log_updated.emit("Excel P열의 발주번호로 오늘 일별 입고 상세를 조회합니다.")
+                self.log_updated.emit(
+                    "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
+                )
                 daily_result = DailyInboundScraper(
                     self.downloader,
                     evidence_dir=self.request.download_dir,
                 ).run(
-                    import_result.order_numbers,
+                    import_result.dispatch_numbers,
                     center_name=self.request.center_name,
                     schedule_date=download_result.end_date,
                 )
@@ -782,10 +784,10 @@ class MainWindow(QMainWindow):
         if excel.filtered_rows:
             self.append_log(f"입고일이 어제인 행 {excel.filtered_rows}개를 제외했습니다.")
         self.append_log(f"일별 입고 상세 표시 완료: {len(daily.products)}개 상품")
-        if daily.unmatched_orders:
+        if daily.unmatched_dispatches:
             self.append_log(
-                "오늘 카드에서 찾지 못한 발주번호: "
-                + ", ".join(f"T{value}" for value in daily.unmatched_orders)
+                "오늘 카드에서 찾지 못한 배차번호: "
+                + ", ".join(daily.unmatched_dispatches)
             )
         self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
         self._start_weight_lookup(daily.products)
@@ -1041,7 +1043,7 @@ class MainWindow(QMainWindow):
         wms_successes = summary.wms_successes if summary is not None else 0
         product_count = len(self.current_products)
         unmatched = (
-            self.current_pipeline_result.daily_inbound.unmatched_orders
+            self.current_pipeline_result.daily_inbound.unmatched_dispatches
             if self.current_pipeline_result is not None
             else ()
         )
@@ -1053,9 +1055,7 @@ class MainWindow(QMainWindow):
             f"WMS 신규 조회: {wms_successes}개"
         )
         if unmatched:
-            message += "\n\n오늘 카드에서 찾지 못한 발주번호: " + ", ".join(
-                f"T{value}" for value in unmatched
-            )
+            message += "\n\n오늘 카드에서 찾지 못한 배차번호: " + ", ".join(unmatched)
             QMessageBox.warning(self, "Milkrun 작업 완료", message)
         else:
             QMessageBox.information(self, "Milkrun 작업 완료", message)

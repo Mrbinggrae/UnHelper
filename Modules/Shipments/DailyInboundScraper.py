@@ -20,7 +20,8 @@ from selenium.webdriver.remote.webelement import WebElement
 
 from .DailyInbound import (
     MilkrunProductRow,
-    normalize_order_number,
+    normalize_dispatch_number,
+    normalize_milkrun_card_number,
     parse_detail_table_cells,
 )
 
@@ -46,9 +47,9 @@ class DailyInboundError(RuntimeError):
 @dataclass(frozen=True)
 class DailyInboundResult:
     products: tuple[MilkrunProductRow, ...]
-    requested_orders: tuple[str, ...]
-    matched_orders: tuple[str, ...]
-    unmatched_orders: tuple[str, ...]
+    requested_dispatches: tuple[str, ...]
+    matched_dispatches: tuple[str, ...]
+    unmatched_dispatches: tuple[str, ...]
 
 
 class DailyInboundScraper:
@@ -67,15 +68,15 @@ class DailyInboundScraper:
 
     def run(
         self,
-        order_numbers: Iterable[str],
+        dispatch_numbers: Iterable[str],
         *,
         center_name: str,
         schedule_date: date,
     ) -> DailyInboundResult:
-        requested = self._unique_orders(order_numbers)
+        requested = self._unique_dispatches(dispatch_numbers)
         if not requested:
             raise DailyInboundError(
-                "Raw_밀크런 시트의 P열에서 조회할 발주번호를 찾지 못했습니다. "
+                "다운로드 첫 시트의 A열에서 조회할 Milkrun 배차번호를 찾지 못했습니다. "
                 "Excel 값 반영은 완료되었지만 일별 입고 상세 조회는 진행하지 않았습니다."
             )
 
@@ -89,31 +90,31 @@ class DailyInboundScraper:
         unmatched: list[str] = []
         seen_products: set[MilkrunProductRow] = set()
 
-        for order_number in requested:
+        for dispatch_number in requested:
             self.browser._check_cancelled()
-            matching_count = len(self._matching_slots(order_number))
+            matching_count = len(self._matching_slots(dispatch_number))
             if matching_count == 0:
-                unmatched.append(order_number)
-                self.log(f"일별 입고 카드에서 발주번호 T{order_number}를 찾지 못했습니다.")
+                unmatched.append(dispatch_number)
+                self.log(f"일별 입고 카드에서 배차번호 {dispatch_number}를 찾지 못했습니다.")
                 continue
 
-            self.log(f"발주번호 T{order_number}의 상세 상품을 조회합니다.")
-            matched.append(order_number)
+            self.log(f"배차번호 {dispatch_number}의 상세 상품을 조회합니다.")
+            matched.append(dispatch_number)
             for match_index in range(matching_count):
                 self.browser._check_cancelled()
-                cards = self._matching_slots(order_number)
+                cards = self._matching_slots(dispatch_number)
                 if match_index >= len(cards):
                     raise DailyInboundError(
-                        f"발주번호 T{order_number} 카드가 조회 중 변경되었습니다. 다시 실행해 주세요."
+                        f"배차번호 {dispatch_number} 카드가 조회 중 변경되었습니다. 다시 실행해 주세요."
                     )
                 try:
-                    rows = self._open_detail_and_read(cards[match_index], order_number)
+                    rows = self._open_detail_and_read(cards[match_index], dispatch_number)
                 except Exception as exc:
                     if self.browser.stop_event.is_set():
                         raise
                     failure_url = str(getattr(exc, "failure_url", "")) or self._safe_current_url()
                     raise DailyInboundError(
-                        f"발주번호 T{order_number} 상세 조회에 실패했습니다.\n"
+                        f"배차번호 {dispatch_number} 상세 조회에 실패했습니다.\n"
                         f"실패 주소: {failure_url}\n{exc}",
                         evidence_captured=bool(
                             getattr(exc, "evidence_captured", False)
@@ -126,26 +127,26 @@ class DailyInboundScraper:
                         products.append(row)
 
         if not products:
-            missing = ", ".join(f"T{value}" for value in unmatched or requested)
+            missing = ", ".join(unmatched or requested)
             raise DailyInboundError(
                 "오늘 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
-                f"미조회 발주번호: {missing}"
+                f"미조회 배차번호: {missing}"
             )
 
         self.log(f"일별 입고 상세 {len(products)}개 상품을 수집했습니다.")
         return DailyInboundResult(
             products=tuple(products),
-            requested_orders=requested,
-            matched_orders=tuple(matched),
-            unmatched_orders=tuple(unmatched),
+            requested_dispatches=requested,
+            matched_dispatches=tuple(matched),
+            unmatched_dispatches=tuple(unmatched),
         )
 
     @staticmethod
-    def _unique_orders(values: Iterable[str]) -> tuple[str, ...]:
+    def _unique_dispatches(values: Iterable[str]) -> tuple[str, ...]:
         seen: set[str] = set()
         result: list[str] = []
         for value in values:
-            normalized = normalize_order_number(value)
+            normalized = normalize_dispatch_number(value)
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 result.append(normalized)
@@ -312,7 +313,7 @@ class DailyInboundScraper:
             "일별 입고 카드 목록이 계속 변경되어 안정된 조회 결과를 확인하지 못했습니다."
         )
 
-    def _matching_slots(self, order_number: str) -> list[WebElement]:
+    def _matching_slots(self, dispatch_number: str) -> list[WebElement]:
         for _attempt in range(3):
             matches: list[WebElement] = []
             had_stale = False
@@ -323,7 +324,11 @@ class DailyInboundScraper:
             for card in cards:
                 try:
                     labels = card.find_elements(By.CSS_SELECTOR, "b")
-                    if labels and normalize_order_number(labels[0].text) == order_number:
+                    if (
+                        labels
+                        and normalize_milkrun_card_number(labels[0].text)
+                        == dispatch_number
+                    ):
                         matches.append(card)
                 except (StaleElementReferenceException, WebDriverException):
                     had_stale = True
@@ -336,12 +341,12 @@ class DailyInboundScraper:
     def _slot_signature(self) -> tuple[str, ...]:
         try:
             return tuple(
-                normalize_order_number(element.text)
+                normalize_milkrun_card_number(element.text)
                 for element in self.browser._driver.find_elements(
                     By.CSS_SELECTOR,
                     "div.booking-slot b",
                 )
-                if normalize_order_number(element.text)
+                if normalize_milkrun_card_number(element.text)
             )
         except (StaleElementReferenceException, WebDriverException):
             return ()
@@ -590,13 +595,13 @@ class DailyInboundScraper:
     def _open_detail_and_read(
         self,
         card: WebElement,
-        order_number: str,
+        dispatch_number: str,
     ) -> tuple[MilkrunProductRow, ...]:
         original_handle = self.browser._driver.current_window_handle
         handles_before = set(self.browser._driver.window_handles)
         created_handles: set[str] = set()
         try:
-            self.browser._click_element(card, f"발주번호 T{order_number} 카드")
+            self.browser._click_element(card, f"배차번호 {dispatch_number} 카드")
             link = self.browser._first_visible(
                 By.XPATH,
                 "//a[@target='_blank' and contains(@href,'/app/inbound-booking/milkrun/detail')]"
@@ -636,7 +641,10 @@ class DailyInboundScraper:
                 "밀크런 예약 상세 화면",
             )
             logical_rows = self._wait_for_detail_rows()
-            products = parse_detail_table_cells(logical_rows, order_number=order_number)
+            products = parse_detail_table_cells(
+                logical_rows,
+                dispatch_number=dispatch_number,
+            )
             if not products:
                 raise DailyInboundError("예약 상세 표의 SKU 열을 읽지 못했습니다. 사이트 표 구조를 확인해 주세요.")
             return products

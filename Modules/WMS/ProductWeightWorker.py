@@ -231,7 +231,7 @@ class ProductWeightWorker(QThread):
                         box_count=product.box_count,
                         sku_id=sku_id,
                         sku_name=product.sku_name,
-                        order_number=product.order_number,
+                        dispatch_number=product.dispatch_number,
                     )
                 )
         return tuple(unique), tuple(failures)

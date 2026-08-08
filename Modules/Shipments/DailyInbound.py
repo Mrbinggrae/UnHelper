@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 
-_ORDER_NUMBER_PATTERN = re.compile(r"^T?(\d{5,20})$", re.IGNORECASE)
+_DISPATCH_NUMBER_PATTERN = re.compile(r"^M?(\d{5,20})$", re.IGNORECASE)
 _VENDOR_CODE_SUFFIX = re.compile(r"\s*\(\s*A[0-9A-Z_-]+\s*\)\s*$", re.IGNORECASE)
 
 
@@ -17,11 +17,11 @@ class MilkrunProductRow:
     box_count: str
     sku_id: str
     sku_name: str
-    order_number: str = ""
+    dispatch_number: str = ""
 
 
-def normalize_order_number(value: Any) -> str:
-    """Return the numeric key used by both Excel P values and schedule cards."""
+def normalize_dispatch_number(value: Any) -> str:
+    """Return the canonical ``M<digits>`` key for Milkrun schedule cards."""
     if value is None or isinstance(value, bool):
         return ""
     if isinstance(value, int):
@@ -31,20 +31,31 @@ def normalize_order_number(value: Any) -> str:
     else:
         candidate = str(value)
 
-    candidate = candidate.split("/", 1)[0].strip().upper()
+    candidate = candidate.strip().upper()
     candidate = re.sub(r"[\s,]+", "", candidate)
-    if candidate.endswith(".0") and candidate[:-2].isdigit():
+    if candidate.endswith(".0") and re.fullmatch(r"M?\d+", candidate[:-2]):
         candidate = candidate[:-2]
-    match = _ORDER_NUMBER_PATTERN.fullmatch(candidate)
-    return match.group(1) if match else ""
+    match = _DISPATCH_NUMBER_PATTERN.fullmatch(candidate)
+    return f"M{match.group(1)}" if match else ""
 
 
-def extract_order_numbers(
+def normalize_milkrun_card_number(value: Any) -> str:
+    """Accept only a schedule-card label that explicitly starts with ``M``."""
+
+    if not isinstance(value, str):
+        return ""
+    candidate = re.sub(r"[\s,]+", "", value.strip().upper())
+    if not candidate.startswith("M"):
+        return ""
+    return normalize_dispatch_number(candidate)
+
+
+def extract_dispatch_numbers(
     rows: Iterable[Sequence[Any]],
     *,
-    source_column: int = 14,
+    source_column: int = 1,
 ) -> tuple[str, ...]:
-    """Read target column P from values pasted at C (the source's 14th column)."""
+    """Read unique dispatch numbers from the downloaded first sheet's A column."""
     if source_column < 1:
         raise ValueError("source_column must be 1 or greater")
 
@@ -54,10 +65,10 @@ def extract_order_numbers(
     for row in rows:
         if len(row) <= index:
             continue
-        order_number = normalize_order_number(row[index])
-        if order_number and order_number not in seen:
-            seen.add(order_number)
-            result.append(order_number)
+        dispatch_number = normalize_dispatch_number(row[index])
+        if dispatch_number and dispatch_number not in seen:
+            seen.add(dispatch_number)
+            result.append(dispatch_number)
     return tuple(result)
 
 
@@ -72,7 +83,7 @@ def _clean_vendor_name(value: Any) -> str:
 def parse_detail_table_cells(
     rows: Iterable[Sequence[Any]],
     *,
-    order_number: str = "",
+    dispatch_number: str = "",
 ) -> tuple[MilkrunProductRow, ...]:
     """Parse the detail tbody, including five-cell rows continued by rowspan."""
     current_group: tuple[str, str, str, str] | None = None
@@ -109,7 +120,7 @@ def parse_detail_table_cells(
                 box_count=current_group[3],
                 sku_id=sku_id,
                 sku_name=sku_name,
-                order_number=normalize_order_number(order_number),
+                dispatch_number=normalize_dispatch_number(dispatch_number),
             )
         )
 

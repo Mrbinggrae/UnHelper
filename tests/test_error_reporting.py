@@ -86,7 +86,7 @@ class ErrorReportTests(unittest.TestCase):
         self.assertIn("Authorization: ***", sanitized)
         self.assertIn("safe diagnostic line", sanitized)
 
-    def test_issue_url_targets_unhelper_and_prefills_sanitized_report(self) -> None:
+    def test_issue_url_targets_unhelper_without_putting_report_in_query(self) -> None:
         failure = FailureDetails("실패", "token=do-not-send")
         report = build_error_report("Excel 반영 실패", failure)
         issue_url = build_github_issue_url("Excel 반영 실패", report)
@@ -96,7 +96,14 @@ class ErrorReportTests(unittest.TestCase):
         self.assertEqual(parsed.netloc, "github.com")
         self.assertEqual(parsed.path, "/Mrbinggrae/UnHelper/issues/new")
         self.assertEqual(query["title"], ["[UnHelper] Excel 반영 실패"])
-        self.assertNotIn("do-not-send", query["body"][0])
+        self.assertNotIn("body", query)
+        self.assertNotIn("do-not-send", issue_url)
+
+    def test_very_long_report_still_builds_a_short_issue_url(self) -> None:
+        issue_url = build_github_issue_url("자동화 오류", "한글 traceback " * 10_000)
+
+        self.assertLess(len(issue_url), 1_000)
+        self.assertNotIn("body=", issue_url)
 
     def test_error_dialog_copies_report_and_opens_prefilled_issue(self) -> None:
         opened = []
@@ -113,6 +120,7 @@ class ErrorReportTests(unittest.TestCase):
             self.assertNotIn("hidden", dialog.report)
             self.assertEqual([QUrl(value) for value in opened], [QUrl(dialog.issue_url)])
             self.assertIn("GitHub 이슈 작성 화면", dialog.action_status.text())
+            self.assertIn("Ctrl+V", dialog.action_status.text())
         finally:
             dialog.close()
 

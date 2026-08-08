@@ -2,8 +2,9 @@
 
 from .DailyInbound import (
     MilkrunProductRow,
-    extract_order_numbers,
-    normalize_order_number,
+    extract_dispatch_numbers,
+    normalize_dispatch_number,
+    normalize_milkrun_card_number,
     parse_detail_table_cells,
 )
 from .DailyInboundScraper import DailyInboundError, DailyInboundResult, DailyInboundScraper
@@ -23,8 +24,9 @@ __all__ = [
     "MilkrunDownloadResult",
     "MilkrunDownloader",
     "MilkrunProductRow",
-    "extract_order_numbers",
-    "normalize_order_number",
+    "extract_dispatch_numbers",
+    "normalize_dispatch_number",
+    "normalize_milkrun_card_number",
     "parse_detail_table_cells",
     "DailyInboundError",
     "DailyInboundResult",
