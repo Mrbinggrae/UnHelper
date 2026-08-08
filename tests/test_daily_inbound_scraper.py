@@ -9,14 +9,28 @@ from unittest import mock
 from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.by import By
 
+from decimal import Decimal
+
 from Modules.Excel.MilkrunExcelImporter import MilkrunExcelImportResult
+from Modules.Excel.TruckExcelImporter import (
+    TruckExcelImportResult,
+    TruckReservationMetrics,
+)
 from Modules.GUI.MainWindow import MilkrunWorker
 from Modules.Shipments.DailyInbound import MilkrunProductRow
-from Modules.Shipments.DailyInboundScraper import DailyInboundScraper
+from Modules.Shipments.DailyInboundScraper import (
+    TRUCK_DAILY_INBOUND_PROFILE,
+    DailyInboundError,
+    DailyInboundScraper,
+)
 from Modules.Shipments.MilkrunDownloader import (
     AutomationCancelled,
     MilkrunDownloadRequest,
     MilkrunDownloadResult,
+)
+from Modules.Shipments.TruckDownloader import (
+    TruckDownloadRequest,
+    TruckDownloadResult,
 )
 
 
@@ -98,6 +112,43 @@ class DailyInboundScraperTests(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0].label, "M3370492")
+
+    def test_truck_profile_matches_only_explicit_t_card_with_same_number(self) -> None:
+        browser = _Browser(
+            (_Card(stale=True), _Card("T3370492"), _Card("M3370492"), _Card("3370492"))
+        )
+        scraper = DailyInboundScraper(
+            browser,
+            profile=TRUCK_DAILY_INBOUND_PROFILE,
+        )
+
+        matches = scraper._matching_slots("T3370492")
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].label, "T3370492")
+        self.assertEqual(
+            scraper._unique_dispatches(("3370492", "T3370492", "M3370492")),
+            ("T3370492",),
+        )
+
+    def test_truck_profile_uses_truck_detail_href_and_source_error_message(self) -> None:
+        scraper = DailyInboundScraper(
+            _Browser(),
+            profile=TRUCK_DAILY_INBOUND_PROFILE,
+        )
+
+        xpath = scraper._detail_link_xpath()
+
+        self.assertIn("/app/inbound-booking/truck/detail", xpath)
+        self.assertNotIn("/app/inbound-booking/milkrun/detail", xpath)
+        with self.assertRaises(DailyInboundError) as raised:
+            scraper.run(
+                ("M3370492",),
+                center_name="안산2",
+                schedule_date=date(2026, 8, 8),
+            )
+        self.assertIn("C열 예약번호", str(raised.exception))
+        self.assertIn("트럭", str(raised.exception))
 
     def test_distinct_display_rows_are_not_deduplicated_by_sku_alone(self) -> None:
         scraper = _StubScraper(_Browser())
@@ -258,6 +309,141 @@ class DailyInboundScraperTests(unittest.TestCase):
             events.index("wms_can_start"),
         )
         fake_downloader.close.assert_called_once()
+
+    def test_truck_worker_applies_units_and_pallets_after_all_details_are_read(self) -> None:
+        download_result = TruckDownloadResult(
+            Path("truck.csv"),
+            date(2026, 8, 8),
+            date(2026, 8, 8),
+            "08.08",
+        )
+        metrics = TruckReservationMetrics(
+            reservation_number="T3372829",
+            unit_count=Decimal("2"),
+            pallet_count=Decimal("1"),
+            source_rows=(2,),
+        )
+        import_result = TruckExcelImportResult(
+            source_file=Path("truck.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_트럭",
+            rows=2,
+            columns=19,
+            dispatch_numbers=("T3372829",),
+            reservation_metrics=(metrics,),
+        )
+        daily_result = mock.Mock(
+            products=(
+                MilkrunProductRow(
+                    "거래처",
+                    "트럭 예약",
+                    "사이트 팔렛트",
+                    "사이트 박스",
+                    "56913939",
+                    "상품",
+                    "T3372829",
+                ),
+            ),
+            requested_dispatches=("T3372829",),
+            matched_dispatches=("T3372829",),
+            unmatched_dispatches=(),
+        )
+        # dataclasses.replace requires the real immutable result type.
+        from Modules.Shipments.DailyInboundScraper import DailyInboundResult
+
+        daily_result = DailyInboundResult(
+            products=daily_result.products,
+            requested_dispatches=daily_result.requested_dispatches,
+            matched_dispatches=daily_result.matched_dispatches,
+            unmatched_dispatches=(),
+        )
+        fake_importer = mock.Mock()
+        fake_importer.validate_workbook.return_value = import_result.target_workbook
+        fake_importer.import_values.return_value = import_result
+        fake_downloader = mock.Mock()
+        fake_downloader.run.return_value = download_result
+        fake_downloader.log = mock.Mock()
+        fake_downloader.stop_event = threading.Event()
+        fake_scraper = mock.Mock()
+        events: list[str] = []
+        fake_scraper.run.side_effect = lambda *args, **kwargs: (
+            events.append("all_truck_details_read") or daily_result
+        )
+
+        worker = MilkrunWorker(
+            TruckDownloadRequest(Path("downloads"), today=date(2026, 8, 8)),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+            booking_type="truck",
+        )
+        completed = []
+        worker.completed.connect(
+            lambda result: (events.append("wms_can_start"), completed.append(result))
+        )
+
+        with (
+            mock.patch("Modules.GUI.MainWindow.TruckExcelImporter", return_value=fake_importer),
+            mock.patch("Modules.GUI.MainWindow.TruckDownloader", return_value=fake_downloader),
+            mock.patch("Modules.GUI.MainWindow.DailyInboundScraper", return_value=fake_scraper) as scraper,
+        ):
+            worker.run()
+
+        self.assertEqual(events, ["all_truck_details_read", "wms_can_start"])
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].booking_type, "truck")
+        product = completed[0].daily_inbound.products[0]
+        self.assertEqual(product.dispatch_number, "T3372829")
+        self.assertEqual(product.box_count, Decimal("2"))
+        self.assertEqual(product.pallet_count, Decimal("1"))
+        self.assertNotIn("exclude_arrival_date", fake_importer.import_values.call_args.kwargs)
+        self.assertEqual(scraper.call_args.kwargs["profile"].booking_prefix, "T")
+        fake_downloader.close.assert_called_once()
+
+    def test_truck_worker_rejects_reservation_counts_for_multiple_skus(self) -> None:
+        from Modules.Shipments.DailyInboundScraper import DailyInboundResult
+
+        metric = TruckReservationMetrics(
+            reservation_number="T3372829",
+            unit_count=Decimal("20"),
+            pallet_count=Decimal("1"),
+            source_rows=(2,),
+        )
+        import_result = TruckExcelImportResult(
+            source_file=Path("truck.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_트럭",
+            rows=2,
+            columns=19,
+            dispatch_numbers=("T3372829",),
+            reservation_metrics=(metric,),
+        )
+        daily_result = DailyInboundResult(
+            products=(
+                MilkrunProductRow("A", "1", "1", "1", "SKU1", "상품1", "T3372829"),
+                MilkrunProductRow("A", "1", "1", "1", "SKU2", "상품2", "T3372829"),
+            ),
+            requested_dispatches=("T3372829",),
+            matched_dispatches=("T3372829",),
+            unmatched_dispatches=(),
+        )
+        worker = MilkrunWorker(
+            TruckDownloadRequest(Path("downloads")),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+            booking_type="truck",
+        )
+
+        with self.assertRaisesRegex(DailyInboundError, "서로 다른 SKU 2개"):
+            worker._apply_truck_reservation_metrics(daily_result, import_result)
+
+    def test_truck_detail_sheet_close_uses_truck_profile_href(self) -> None:
+        browser = _Browser()
+        browser._visible_elements = mock.Mock(return_value=[])
+        scraper = DailyInboundScraper(browser, profile=TRUCK_DAILY_INBOUND_PROFILE)
+
+        self.assertTrue(scraper._detail_sheet_closed())
+        detail_call = browser._visible_elements.call_args_list[0]
+        self.assertIn("/app/inbound-booking/truck/detail", detail_call.args[1])
 
     def test_fresh_result_requires_dom_change_or_successful_query_request(self) -> None:
         scraper = DailyInboundScraper(_Browser())

@@ -9,7 +9,13 @@ from PySide6.QtCore import QThread, Signal
 
 from Modules.Common.ErrorReport import FailureDetails
 from Modules.Shipments.DailyInbound import MilkrunProductRow
-from Modules.WMS.ProductMemory import ProductMemory, ProductMemoryRecord, normalize_product_name, normalize_sku_id
+from Modules.WMS.ProductMemory import (
+    AUTOMATIC_CATEGORIES,
+    ProductMemory,
+    ProductMemoryRecord,
+    normalize_product_name,
+    normalize_sku_id,
+)
 from Modules.WMS.ProductWeightCrawler import ProductWeightCrawler
 
 
@@ -45,6 +51,7 @@ class ProductWeightWorker(QThread):
         wms_password: str,
         *,
         evidence_dir: str | Path,
+        quantity_label: str = "박스",
         crawler_factory: Callable[..., ProductWeightCrawler] = ProductWeightCrawler,
     ) -> None:
         super().__init__()
@@ -54,6 +61,7 @@ class ProductWeightWorker(QThread):
         self.wms_id = str(wms_id or "")
         self.wms_password = str(wms_password or "")
         self.evidence_dir = Path(evidence_dir)
+        self.quantity_label = str(quantity_label or "박스")
         self.crawler_factory = crawler_factory
         self.stop_event = threading.Event()
         self.crawler: ProductWeightCrawler | None = None
@@ -82,17 +90,36 @@ class ProductWeightWorker(QThread):
                     misses.append(product)
                     continue
                 cache_hits += 1
+                if record.category_override in AUTOMATIC_CATEGORIES:
+                    # Manual light/heavy values belong to the previous display.
+                    # Clear them before calculation so an invalid current pallet
+                    # count cannot leave a stale category visible. High-stack is
+                    # the only classification that intentionally persists.
+                    cleared = memory.set_manual_category(record.sku_id, None)
+                    if cleared is not None:
+                        record = cleared
+                calculation_updated = False
                 try:
                     record = memory.update_calculation(
                         product.sku_id,
                         product.box_count,
                         product.pallet_count,
                     )
+                    calculation_updated = True
                 except (TypeError, ValueError):
                     # The WMS weight remains a valid cache hit even if today's
                     # shipment counts cannot produce a pallet calculation.
                     pass
-                self.log_updated.emit(f"SKU {record.sku_id}는 저장된 WMS 무게를 사용합니다.")
+                if calculation_updated:
+                    self.log_updated.emit(
+                        f"SKU {record.sku_id}는 저장된 WMS 무게로 "
+                        f"현재 팔렛트당 {self.quantity_label} 수를 재계산했습니다."
+                    )
+                else:
+                    self.log_updated.emit(
+                        f"SKU {record.sku_id}는 저장된 WMS 무게를 사용하지만 "
+                        f"현재 팔렛트당 {self.quantity_label} 수는 계산하지 못했습니다."
+                    )
                 self.record_ready.emit(record, True)
 
             if not misses:

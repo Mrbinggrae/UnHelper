@@ -6,18 +6,39 @@ from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
+from selenium.webdriver.common.by import By
+
 from Modules.Shipments.MilkrunDownloader import (
     HistoryEntry,
     MilkrunDownloadRequest,
     MilkrunDownloader,
 )
+from Modules.Shipments.TruckDownloader import (
+    TruckDownloadRequest,
+    TruckDownloader,
+)
 
 
 class MilkrunDownloaderTests(unittest.TestCase):
+    def test_milkrun_and_truck_resolve_distinct_date_ranges(self) -> None:
+        today = date(2026, 8, 8)
+
+        self.assertEqual(
+            MilkrunDownloader._resolve_date_range(today),
+            (date(2026, 8, 7), today),
+        )
+        self.assertEqual(TruckDownloader._resolve_date_range(today), (today, today))
+
     def test_reason_uses_yesterday_today_format(self) -> None:
         self.assertEqual(
             MilkrunDownloader.format_reason(date(2026, 8, 7), date(2026, 8, 8)),
             "08.07-08.08",
+        )
+
+    def test_truck_reason_uses_today_only_format(self) -> None:
+        self.assertEqual(
+            TruckDownloader.format_reason(date(2026, 8, 8), date(2026, 8, 8)),
+            "08.08",
         )
 
     def test_material_date_text_supports_korean_and_numeric_values(self) -> None:
@@ -84,6 +105,99 @@ class MilkrunDownloaderTests(unittest.TestCase):
             {"https://shipments.coupang.net/ibs/csv-donwload?uuid=old"},
         )
         self.assertEqual(selected.download_href, "https://shipments.coupang.net/ibs/csv-donwload?uuid=new")
+
+    def test_truck_history_selection_ignores_milkrun_with_same_reason(self) -> None:
+        started = datetime(2026, 8, 8, 15, 13, 59)
+        entries = [
+            HistoryEntry(
+                None,
+                "밀크런 입고예약 목록",
+                "다운로드 준비완료",
+                "08.08",
+                datetime(2026, 8, 8, 15, 14),
+                5,
+                "https://shipments.coupang.net/ibs/csv-donwload?uuid=milkrun",
+            ),
+            HistoryEntry(
+                None,
+                "트럭 입고예약 목록",
+                "다운로드 준비중",
+                "08.08",
+                datetime(2026, 8, 8, 15, 13),
+                2,
+                "https://shipments.coupang.net/ibs/csv-donwload?uuid=truck",
+            ),
+        ]
+
+        selected = TruckDownloader.choose_latest_history_entry(entries, "08.08", started)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.download_type, "트럭 입고예약 목록")
+        self.assertEqual(selected.download_href, "https://shipments.coupang.net/ibs/csv-donwload?uuid=truck")
+
+    def test_truck_opens_exact_booking_list_link(self) -> None:
+        downloader = TruckDownloader(Path("chromedriver.exe"), log=lambda _message: None)
+        expected_xpath = (
+            "//a[@href='/app/inbound-booking/truck/list' "
+            "and .//span[normalize-space()='트럭 입고예약 목록']]"
+        )
+
+        with (
+            mock.patch.object(downloader, "_click_locator") as click_locator,
+            mock.patch.object(downloader, "_wait_document_ready"),
+            mock.patch.object(downloader, "_wait"),
+        ):
+            downloader._open_booking_list()
+
+        self.assertEqual(click_locator.call_count, 2)
+        self.assertEqual(
+            click_locator.call_args_list[1],
+            mock.call(
+                By.XPATH,
+                expected_xpath,
+                "트럭 입고예약 목록",
+                timeout=60,
+            ),
+        )
+
+    def test_center_selection_prefers_center_code_control(self) -> None:
+        downloader = MilkrunDownloader(Path("chromedriver.exe"), log=lambda _message: None)
+        center_select = mock.Mock()
+        center_select.get_attribute.return_value = "false"
+        center_select.text = "안산2"
+        center_option = mock.Mock()
+        fake_driver = mock.Mock()
+        fake_driver.find_elements.return_value = [center_option]
+        downloader.driver = fake_driver
+
+        def visible_elements(_by, selector):
+            if selector == "mat-select[formcontrolname='centerCode']":
+                return [center_select]
+            if selector == "div[role='listbox'] mat-option":
+                return [center_option]
+            if selector == "div[role='listbox']":
+                return []
+            return []
+
+        with (
+            mock.patch.object(downloader, "_visible_elements", side_effect=visible_elements) as visible,
+            mock.patch.object(
+                downloader,
+                "_wait",
+                side_effect=lambda _timeout, condition, _label: condition(),
+            ),
+            mock.patch.object(downloader, "_click_element"),
+        ):
+            downloader._select_center("안산2")
+
+        self.assertEqual(
+            visible.call_args_list[0],
+            mock.call(By.CSS_SELECTOR, "mat-select[formcontrolname='centerCode']"),
+        )
+        self.assertNotIn(
+            mock.call(By.CSS_SELECTOR, "mat-select[role='combobox'], mat-select"),
+            visible.call_args_list,
+        )
 
     def test_wait_for_download_rejects_unrelated_file_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -190,7 +304,7 @@ class MilkrunDownloaderTests(unittest.TestCase):
 
             no_op_methods = (
                 "_open_and_wait_for_login",
-                "_open_milkrun_list",
+                "_open_booking_list",
                 "_set_date_range",
                 "_select_center",
                 "_click_button_text",
@@ -228,6 +342,52 @@ class MilkrunDownloaderTests(unittest.TestCase):
             finally:
                 for patcher in reversed(patches):
                     patcher.stop()
+
+    def test_truck_run_uses_today_for_calendar_reason_and_csv_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            downloader = TruckDownloader(root / "chromedriver.exe", log=lambda _message: None)
+            fake_driver = object()
+
+            def create_staged_file(staging_dir: Path, _before) -> Path:
+                staged = staging_dir / "TRUCK_BOOKING_LIST_20260808.csv"
+                staged.write_text("reservation,value\n3370492,1\n", encoding="utf-8")
+                return staged
+
+            with (
+                mock.patch.object(downloader, "_build_driver", return_value=fake_driver),
+                mock.patch.object(downloader, "_open_and_wait_for_login"),
+                mock.patch.object(downloader, "_open_booking_list"),
+                mock.patch.object(downloader, "_set_date_range") as set_date_range,
+                mock.patch.object(downloader, "_select_center"),
+                mock.patch.object(downloader, "_result_table_signature", return_value=""),
+                mock.patch.object(downloader, "_click_button_text"),
+                mock.patch.object(downloader, "_wait_for_query_complete"),
+                mock.patch.object(downloader, "_wait_for_text_download_button"),
+                mock.patch.object(downloader, "_click_text_download"),
+                mock.patch.object(downloader, "_snapshot_history_download_hrefs", return_value=set()),
+                mock.patch.object(downloader, "_submit_download_reason") as submit_reason,
+                mock.patch.object(downloader, "_close_request_confirmation"),
+                mock.patch.object(downloader, "_open_download_history"),
+                mock.patch.object(downloader, "_download_snapshot", return_value={}),
+                mock.patch.object(downloader, "_download_latest_history_file"),
+                mock.patch.object(downloader, "_wait_for_download", side_effect=create_staged_file),
+                mock.patch.object(downloader, "close") as close,
+            ):
+                result = downloader.run(
+                    TruckDownloadRequest(download_dir=root, today=date(2026, 8, 8)),
+                    keep_browser_open=True,
+                )
+
+            set_date_range.assert_called_once_with(date(2026, 8, 8), date(2026, 8, 8))
+            submit_reason.assert_called_once_with("08.08")
+            self.assertEqual(result.reason, "08.08")
+            self.assertEqual(result.file_path.name, "TRUCK_BOOKING_LIST_20260808.csv")
+            self.assertIs(downloader.driver, fake_driver)
+            close.assert_not_called()
+            self.assertFalse(
+                any(path.name.startswith(downloader.STAGING_PREFIX) for path in root.iterdir())
+            )
 
 
 if __name__ == "__main__":

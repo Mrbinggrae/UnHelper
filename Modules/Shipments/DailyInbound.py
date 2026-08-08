@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
 
-_DISPATCH_NUMBER_PATTERN = re.compile(r"^M?(\d{5,20})$", re.IGNORECASE)
+_BOOKING_NUMBER_PATTERN = re.compile(r"^([MT])?(\d{5,20})$", re.IGNORECASE)
+_SUPPORTED_BOOKING_PREFIXES = frozenset({"M", "T"})
 _VENDOR_CODE_SUFFIX = re.compile(r"\s*\(\s*A[0-9A-Z_-]+\s*\)\s*$", re.IGNORECASE)
 
 
@@ -20,8 +21,19 @@ class MilkrunProductRow:
     dispatch_number: str = ""
 
 
-def normalize_dispatch_number(value: Any) -> str:
-    """Return the canonical ``M<digits>`` key for Milkrun schedule cards."""
+def normalize_booking_number(value: Any, *, prefix: str) -> str:
+    """Return a source booking number as an exact prefixed schedule key.
+
+    Downloaded source files may contain bare numbers or a key that already has
+    the expected prefix.  A key carrying another booking type's prefix is
+    rejected so an ``M`` Milkrun and ``T`` Truck booking with the same digits
+    can never be treated as the same schedule card.
+    """
+
+    expected_prefix = str(prefix or "").strip().upper()
+    if expected_prefix not in _SUPPORTED_BOOKING_PREFIXES:
+        raise ValueError(f"지원하지 않는 입고 예약 접두사입니다: {prefix!r}")
+
     if value is None or isinstance(value, bool):
         return ""
     if isinstance(value, int):
@@ -33,29 +45,63 @@ def normalize_dispatch_number(value: Any) -> str:
 
     candidate = candidate.strip().upper()
     candidate = re.sub(r"[\s,]+", "", candidate)
-    if candidate.endswith(".0") and re.fullmatch(r"M?\d+", candidate[:-2]):
+    if candidate.endswith(".0") and re.fullmatch(r"[MT]?\d+", candidate[:-2]):
         candidate = candidate[:-2]
-    match = _DISPATCH_NUMBER_PATTERN.fullmatch(candidate)
-    return f"M{match.group(1)}" if match else ""
+    match = _BOOKING_NUMBER_PATTERN.fullmatch(candidate)
+    if not match:
+        return ""
+    source_prefix, digits = match.groups()
+    if source_prefix and source_prefix.upper() != expected_prefix:
+        return ""
+    return f"{expected_prefix}{digits}"
+
+
+def normalize_dispatch_number(value: Any) -> str:
+    """Return the canonical ``M<digits>`` key for a Milkrun source value."""
+
+    return normalize_booking_number(value, prefix="M")
+
+
+def normalize_truck_reservation_number(value: Any) -> str:
+    """Return the canonical ``T<digits>`` key for a Truck source value."""
+
+    return normalize_booking_number(value, prefix="T")
+
+
+def normalize_booking_card_number(value: Any, *, prefix: str) -> str:
+    """Accept only a card label that explicitly carries ``prefix``."""
+
+    expected_prefix = str(prefix or "").strip().upper()
+    if expected_prefix not in _SUPPORTED_BOOKING_PREFIXES:
+        raise ValueError(f"지원하지 않는 입고 예약 접두사입니다: {prefix!r}")
+    if not isinstance(value, str):
+        return ""
+    candidate = re.sub(r"[\s,]+", "", value.strip().upper())
+    if not candidate.startswith(expected_prefix):
+        return ""
+    return normalize_booking_number(candidate, prefix=expected_prefix)
 
 
 def normalize_milkrun_card_number(value: Any) -> str:
     """Accept only a schedule-card label that explicitly starts with ``M``."""
 
-    if not isinstance(value, str):
-        return ""
-    candidate = re.sub(r"[\s,]+", "", value.strip().upper())
-    if not candidate.startswith("M"):
-        return ""
-    return normalize_dispatch_number(candidate)
+    return normalize_booking_card_number(value, prefix="M")
 
 
-def extract_dispatch_numbers(
+def normalize_truck_card_number(value: Any) -> str:
+    """Accept only a schedule-card label that explicitly starts with ``T``."""
+
+    return normalize_booking_card_number(value, prefix="T")
+
+
+def extract_booking_numbers(
     rows: Iterable[Sequence[Any]],
     *,
-    source_column: int = 1,
+    source_column: int,
+    prefix: str,
 ) -> tuple[str, ...]:
-    """Read unique dispatch numbers from the downloaded first sheet's A column."""
+    """Read unique booking numbers from a one-based source column."""
+
     if source_column < 1:
         raise ValueError("source_column must be 1 or greater")
 
@@ -65,11 +111,31 @@ def extract_dispatch_numbers(
     for row in rows:
         if len(row) <= index:
             continue
-        dispatch_number = normalize_dispatch_number(row[index])
-        if dispatch_number and dispatch_number not in seen:
-            seen.add(dispatch_number)
-            result.append(dispatch_number)
+        booking_number = normalize_booking_number(row[index], prefix=prefix)
+        if booking_number and booking_number not in seen:
+            seen.add(booking_number)
+            result.append(booking_number)
     return tuple(result)
+
+
+def extract_dispatch_numbers(
+    rows: Iterable[Sequence[Any]],
+    *,
+    source_column: int = 1,
+) -> tuple[str, ...]:
+    """Read unique dispatch numbers from the downloaded first sheet's A column."""
+
+    return extract_booking_numbers(rows, source_column=source_column, prefix="M")
+
+
+def extract_truck_reservation_numbers(
+    rows: Iterable[Sequence[Any]],
+    *,
+    source_column: int = 3,
+) -> tuple[str, ...]:
+    """Read unique Truck reservation keys from the downloaded C column."""
+
+    return extract_booking_numbers(rows, source_column=source_column, prefix="T")
 
 
 def _clean_text(value: Any) -> str:
@@ -84,6 +150,7 @@ def parse_detail_table_cells(
     rows: Iterable[Sequence[Any]],
     *,
     dispatch_number: str = "",
+    booking_prefix: str = "M",
 ) -> tuple[MilkrunProductRow, ...]:
     """Parse the detail tbody, including five-cell rows continued by rowspan."""
     current_group: tuple[str, str, str, str] | None = None
@@ -120,7 +187,10 @@ def parse_detail_table_cells(
                 box_count=current_group[3],
                 sku_id=sku_id,
                 sku_name=sku_name,
-                dispatch_number=normalize_dispatch_number(dispatch_number),
+                dispatch_number=normalize_booking_number(
+                    dispatch_number,
+                    prefix=booking_prefix,
+                ),
             )
         )
 

@@ -68,6 +68,8 @@ class MilkrunDownloader:
     )
     SCHEDULE_HREF = "/app"
     MILKRUN_LIST_HREF = "/app/inbound-booking/milkrun/list"
+    BOOKING_LIST_HREF = MILKRUN_LIST_HREF
+    BOOKING_LIST_LABEL = "밀크런 입고예약 목록"
     HISTORY_HREF = "/app/csv-download/history"
     DOWNLOAD_HREF_FRAGMENT = "/ibs/csv-donwload?"
     READY_STATUS = "다운로드 준비완료"
@@ -97,8 +99,8 @@ class MilkrunDownloader:
         *,
         keep_browser_open: bool = False,
     ) -> MilkrunDownloadResult:
-        end_date = request.today or date.today()
-        start_date = end_date - timedelta(days=1)
+        target_date = request.today or date.today()
+        start_date, end_date = self._resolve_date_range(target_date)
         reason = self.format_reason(start_date, end_date)
         download_dir = Path(request.download_dir).expanduser().resolve()
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +112,7 @@ class MilkrunDownloader:
         try:
             self.driver = self._build_driver(staging_dir)
             self._open_and_wait_for_login()
-            self._open_milkrun_list()
+            self._open_booking_list()
             self._set_date_range(start_date, end_date)
             self._select_center(request.center_name)
             before_query = self._result_table_signature()
@@ -166,6 +168,10 @@ class MilkrunDownloader:
     @staticmethod
     def format_reason(start_date: date, end_date: date) -> str:
         return f"{start_date:%m.%d}-{end_date:%m.%d}"
+
+    @classmethod
+    def _resolve_date_range(cls, target_date: date) -> tuple[date, date]:
+        return target_date - timedelta(days=1), target_date
 
     @staticmethod
     def parse_material_date_text(value: str) -> tuple[int, int, int] | None:
@@ -260,8 +266,8 @@ class MilkrunDownloader:
     def _login_ready(self) -> bool:
         xpaths = [
             "//a[@href='/app' and .//span[normalize-space()='입고 스케줄']]",
-            "//a[@href='/app/inbound-booking/milkrun/list' "
-            "and .//span[normalize-space()='밀크런 입고예약 목록']]",
+            f"//a[@href='{self.BOOKING_LIST_HREF}' "
+            f"and .//span[normalize-space()='{self.BOOKING_LIST_LABEL}']]",
         ]
         for xpath in xpaths:
             try:
@@ -271,7 +277,7 @@ class MilkrunDownloader:
                 continue
         return False
 
-    def _open_milkrun_list(self) -> None:
+    def _open_booking_list(self) -> None:
         self.log("입고 스케줄 메뉴를 클릭합니다.")
         self._click_locator(
             By.XPATH,
@@ -281,12 +287,12 @@ class MilkrunDownloader:
         )
         self._wait_document_ready(60)
 
-        self.log("밀크런 입고예약 목록을 클릭합니다.")
+        self.log(f"{self.BOOKING_LIST_LABEL}을 클릭합니다.")
         self._click_locator(
             By.XPATH,
-            "//a[@href='/app/inbound-booking/milkrun/list' "
-            "and .//span[normalize-space()='밀크런 입고예약 목록']]",
-            "밀크런 입고예약 목록",
+            f"//a[@href='{self.BOOKING_LIST_HREF}' "
+            f"and .//span[normalize-space()='{self.BOOKING_LIST_LABEL}']]",
+            self.BOOKING_LIST_LABEL,
             timeout=60,
         )
         self._wait_document_ready(60)
@@ -317,7 +323,7 @@ class MilkrunDownloader:
             self._wait_for_calendar()
         self._select_calendar_date(end_date)
 
-        self._wait(15, lambda: self._date_range_matches(start_date, end_date), "어제/오늘 날짜 범위 반영")
+        self._wait(15, lambda: self._date_range_matches(start_date, end_date), "조회 날짜 범위 반영")
 
     def _wait_for_calendar(self) -> None:
         self._wait(
@@ -421,7 +427,12 @@ class MilkrunDownloader:
 
     def _select_center(self, center_name: str) -> None:
         self.log(f"물류 센터에서 '{center_name}'를 선택합니다.")
-        selects = self._visible_elements(By.CSS_SELECTOR, "mat-select[role='combobox'], mat-select")
+        selects = self._visible_elements(
+            By.CSS_SELECTOR,
+            "mat-select[formcontrolname='centerCode']",
+        )
+        if not selects:
+            selects = self._visible_elements(By.CSS_SELECTOR, "mat-select[role='combobox'], mat-select")
         if not selects:
             raise RuntimeError("물류 센터 선택 목록을 찾지 못했습니다.")
 

@@ -86,7 +86,7 @@ class ProductWeightWorkerTests(unittest.TestCase):
             memory.upsert_measurement("123", "상품 A/B", "1000", "80", "2")
             memory.set_manual_category("123", "고단")
             product = MilkrunProductRow("거래처", "M1", "1", "2", "123", "상품 A/B")
-            worker = self._worker(root, (product,), wms_id="", password="")
+            worker = self._worker(root, (product,))
             records = []
             worker.record_ready.connect(lambda record, cache_hit: records.append((record, cache_hit)))
 
@@ -96,6 +96,54 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertTrue(records[0][1])
             self.assertEqual(records[0][0].boxes_per_pallet, Decimal("2"))
             self.assertEqual(records[0][0].category_override, "고단")
+
+    def test_cache_hit_recalculates_category_without_wms_and_keeps_only_high_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = ProductMemory(root / "memory.json")
+            memory.upsert_measurement("123", "상품 A/B", "1000", "300", "1")
+            memory.set_manual_category("123", "중량")
+            product = MilkrunProductRow("거래처", "M1", "1", "2", "123", "상품 A/B")
+            worker = self._worker(root, (product,), wms_id="", password="")
+            records = []
+            logs = []
+            worker.record_ready.connect(lambda record, cache_hit: records.append((record, cache_hit)))
+            worker.log_updated.connect(logs.append)
+
+            worker.run()
+
+            self.assertEqual(FakeCrawler.instances, [])
+            self.assertEqual(len(records), 1)
+            record, cache_hit = records[0]
+            self.assertTrue(cache_hit)
+            self.assertEqual(record.boxes_per_pallet, Decimal("2"))
+            self.assertEqual(record.automatic_category, "경량")
+            self.assertIsNone(record.category_override)
+            self.assertTrue(any("저장된 WMS 무게" in line for line in logs))
+
+    def test_invalid_current_pallet_counts_still_use_cached_weight_without_opening_wms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = ProductMemory(root / "memory.json")
+            memory.upsert_measurement(
+                "123", "상품", "1000", "2", "1"
+            )
+            memory.set_manual_category("123", "중량")
+            product = MilkrunProductRow("거래처", "M1", "0", "2", "123", "상품")
+            worker = self._worker(root, (product,))
+            records = []
+            logs = []
+            worker.record_ready.connect(lambda record, cache_hit: records.append((record, cache_hit)))
+            worker.log_updated.connect(logs.append)
+
+            worker.run()
+
+            self.assertEqual(FakeCrawler.instances, [])
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0][1])
+            self.assertIsNone(records[0][0].category_override)
+            self.assertIsNone(ProductMemory(root / "memory.json").get("123").category_override)
+            self.assertTrue(any("계산하지 못했습니다" in line for line in logs))
 
     def test_duplicate_sku_is_looked_up_once_and_saved_with_daily_full_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

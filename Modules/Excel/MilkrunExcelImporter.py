@@ -237,8 +237,13 @@ class MilkrunExcelImporter:
             rows = len(values)
             columns = max((len(row) for row in values), default=0)
             if rows > self.MAX_ROWS:
+                size_description = (
+                    "입고일이 어제인 행을 제외한 데이터"
+                    if exclude_arrival_date is not None
+                    else "반영할 다운로드 데이터"
+                )
                 raise ExcelImportError(
-                    "입고일이 어제인 행을 제외한 데이터가 대상 범위보다 큽니다. "
+                    f"{size_description}가 대상 범위보다 큽니다. "
                     "기존 값을 지우지 않았습니다.\n"
                     f"반영 대상: {rows}행 × {columns}열 / "
                     f"대상: {self.MAX_ROWS}행 × {self.MAX_COLUMNS}열"
@@ -247,12 +252,10 @@ class MilkrunExcelImporter:
                 raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
 
             normalized_values = self._rectangularize(values, columns)
-            dispatch_numbers = extract_dispatch_numbers(normalized_values)
-            if exclude_arrival_date is not None and rows > 1 and not dispatch_numbers:
-                raise ExcelImportError(
-                    "오늘 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
-                    "기존 값을 지우지 않았습니다."
-                )
+            dispatch_numbers, import_metadata = self._extract_import_metadata(
+                normalized_values,
+                exclude_arrival_date=exclude_arrival_date,
+            )
             clear_range = self._run_excel_com_operation(
                 excel,
                 lambda: sheet.Range(self.CLEAR_RANGE),
@@ -341,7 +344,7 @@ class MilkrunExcelImporter:
                     ) from write_error
                 raise
 
-            return MilkrunExcelImportResult(
+            return self._build_import_result(
                 source_file=source_path,
                 target_workbook=target_path,
                 sheet_name=self.TARGET_SHEET,
@@ -349,6 +352,7 @@ class MilkrunExcelImporter:
                 columns=columns,
                 dispatch_numbers=dispatch_numbers,
                 filtered_rows=filtered_rows,
+                import_metadata=import_metadata,
             )
         except (ExcelImportCancelled, ExcelImportError):
             raise
@@ -380,6 +384,49 @@ class MilkrunExcelImporter:
                     pythoncom.CoUninitialize()
                 except Exception:
                     pass
+
+    def _extract_import_metadata(
+        self,
+        values: tuple[tuple[Any, ...], ...],
+        *,
+        exclude_arrival_date: date | None,
+    ) -> tuple[tuple[str, ...], Any]:
+        """Validate Milkrun lookup keys and return optional result metadata.
+
+        Subclasses can override this hook for another inbound-booking format
+        while sharing the source checks, COM mutation, rollback, and save path.
+        """
+
+        dispatch_numbers = extract_dispatch_numbers(values)
+        if exclude_arrival_date is not None and len(values) > 1 and not dispatch_numbers:
+            raise ExcelImportError(
+                "오늘 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
+                "기존 값을 지우지 않았습니다."
+            )
+        return dispatch_numbers, None
+
+    def _build_import_result(
+        self,
+        *,
+        source_file: Path,
+        target_workbook: Path,
+        sheet_name: str,
+        rows: int,
+        columns: int,
+        dispatch_numbers: tuple[str, ...],
+        filtered_rows: int,
+        import_metadata: Any,
+    ) -> MilkrunExcelImportResult:
+        del import_metadata
+        return MilkrunExcelImportResult(
+            source_file=source_file,
+            target_workbook=target_workbook,
+            sheet_name=sheet_name,
+            rows=rows,
+            columns=columns,
+            dispatch_numbers=dispatch_numbers,
+            filtered_rows=filtered_rows,
+        )
 
     def _load_com_modules(self) -> tuple[Any, Any]:
         if self._pythoncom is not None and self._com_client is not None:

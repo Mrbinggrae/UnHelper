@@ -20,8 +20,8 @@ from selenium.webdriver.remote.webelement import WebElement
 
 from .DailyInbound import (
     MilkrunProductRow,
-    normalize_dispatch_number,
-    normalize_milkrun_card_number,
+    normalize_booking_card_number,
+    normalize_booking_number,
     parse_detail_table_cells,
 )
 
@@ -44,6 +44,42 @@ class DailyInboundError(RuntimeError):
         self.failure_url = failure_url
 
 
+@dataclass(frozen=True, slots=True)
+class DailyInboundProfile:
+    """Source-specific rules for exact daily-schedule card matching."""
+
+    display_name: str
+    booking_prefix: str
+    number_label: str
+    source_number_label: str
+    detail_href_fragment: str
+
+    def __post_init__(self) -> None:
+        prefix = self.booking_prefix.strip().upper()
+        if prefix not in {"M", "T"}:
+            raise ValueError(f"지원하지 않는 일별 입고 접두사입니다: {self.booking_prefix!r}")
+        if not self.detail_href_fragment.startswith("/app/inbound-booking/"):
+            raise ValueError("예약 상세 주소 형식이 올바르지 않습니다.")
+        object.__setattr__(self, "booking_prefix", prefix)
+
+
+MILKRUN_DAILY_INBOUND_PROFILE = DailyInboundProfile(
+    display_name="Milkrun",
+    booking_prefix="M",
+    number_label="배차번호",
+    source_number_label="A열 배차번호",
+    detail_href_fragment="/app/inbound-booking/milkrun/detail",
+)
+
+TRUCK_DAILY_INBOUND_PROFILE = DailyInboundProfile(
+    display_name="트럭",
+    booking_prefix="T",
+    number_label="예약번호",
+    source_number_label="C열 예약번호",
+    detail_href_fragment="/app/inbound-booking/truck/detail",
+)
+
+
 @dataclass(frozen=True)
 class DailyInboundResult:
     products: tuple[MilkrunProductRow, ...]
@@ -54,17 +90,19 @@ class DailyInboundResult:
 
 class DailyInboundScraper:
     DAILY_SCHEDULE_HREF = "/app/inbound-schedule"
-    DETAIL_HREF_FRAGMENT = "/app/inbound-booking/milkrun/detail"
+    DETAIL_HREF_FRAGMENT = MILKRUN_DAILY_INBOUND_PROFILE.detail_href_fragment
 
     def __init__(
         self,
         browser: MilkrunDownloader,
         *,
         evidence_dir: str | Path | None = None,
+        profile: DailyInboundProfile = MILKRUN_DAILY_INBOUND_PROFILE,
     ):
         self.browser = browser
         self.log = browser.log
         self.evidence_dir = Path(evidence_dir).expanduser() if evidence_dir else None
+        self.profile = profile
 
     def run(
         self,
@@ -76,7 +114,8 @@ class DailyInboundScraper:
         requested = self._unique_dispatches(dispatch_numbers)
         if not requested:
             raise DailyInboundError(
-                "다운로드 첫 시트의 A열에서 조회할 Milkrun 배차번호를 찾지 못했습니다. "
+                f"다운로드 첫 시트의 {self.profile.source_number_label}에서 조회할 "
+                f"{self.profile.display_name} 예약번호를 찾지 못했습니다. "
                 "Excel 값 반영은 완료되었지만 일별 입고 상세 조회는 진행하지 않았습니다."
             )
 
@@ -95,17 +134,23 @@ class DailyInboundScraper:
             matching_count = len(self._matching_slots(dispatch_number))
             if matching_count == 0:
                 unmatched.append(dispatch_number)
-                self.log(f"일별 입고 카드에서 배차번호 {dispatch_number}를 찾지 못했습니다.")
+                self.log(
+                    f"일별 입고 카드에서 {self.profile.number_label} "
+                    f"{dispatch_number}를 찾지 못했습니다."
+                )
                 continue
 
-            self.log(f"배차번호 {dispatch_number}의 상세 상품을 조회합니다.")
+            self.log(
+                f"{self.profile.number_label} {dispatch_number}의 상세 상품을 조회합니다."
+            )
             matched.append(dispatch_number)
             for match_index in range(matching_count):
                 self.browser._check_cancelled()
                 cards = self._matching_slots(dispatch_number)
                 if match_index >= len(cards):
                     raise DailyInboundError(
-                        f"배차번호 {dispatch_number} 카드가 조회 중 변경되었습니다. 다시 실행해 주세요."
+                        f"{self.profile.number_label} {dispatch_number} 카드가 "
+                        "조회 중 변경되었습니다. 다시 실행해 주세요."
                     )
                 try:
                     rows = self._open_detail_and_read(cards[match_index], dispatch_number)
@@ -114,7 +159,7 @@ class DailyInboundScraper:
                         raise
                     failure_url = str(getattr(exc, "failure_url", "")) or self._safe_current_url()
                     raise DailyInboundError(
-                        f"배차번호 {dispatch_number} 상세 조회에 실패했습니다.\n"
+                        f"{self.profile.number_label} {dispatch_number} 상세 조회에 실패했습니다.\n"
                         f"실패 주소: {failure_url}\n{exc}",
                         evidence_captured=bool(
                             getattr(exc, "evidence_captured", False)
@@ -130,7 +175,7 @@ class DailyInboundScraper:
             missing = ", ".join(unmatched or requested)
             raise DailyInboundError(
                 "오늘 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
-                f"미조회 배차번호: {missing}"
+                f"미조회 {self.profile.number_label}: {missing}"
             )
 
         self.log(f"일별 입고 상세 {len(products)}개 상품을 수집했습니다.")
@@ -141,12 +186,14 @@ class DailyInboundScraper:
             unmatched_dispatches=tuple(unmatched),
         )
 
-    @staticmethod
-    def _unique_dispatches(values: Iterable[str]) -> tuple[str, ...]:
+    def _unique_dispatches(self, values: Iterable[str]) -> tuple[str, ...]:
         seen: set[str] = set()
         result: list[str] = []
         for value in values:
-            normalized = normalize_dispatch_number(value)
+            normalized = normalize_booking_number(
+                value,
+                prefix=self.profile.booking_prefix,
+            )
             if normalized and normalized not in seen:
                 seen.add(normalized)
                 result.append(normalized)
@@ -326,7 +373,10 @@ class DailyInboundScraper:
                     labels = card.find_elements(By.CSS_SELECTOR, "b")
                     if (
                         labels
-                        and normalize_milkrun_card_number(labels[0].text)
+                        and normalize_booking_card_number(
+                            labels[0].text,
+                            prefix=self.profile.booking_prefix,
+                        )
                         == dispatch_number
                     ):
                         matches.append(card)
@@ -341,12 +391,18 @@ class DailyInboundScraper:
     def _slot_signature(self) -> tuple[str, ...]:
         try:
             return tuple(
-                normalize_milkrun_card_number(element.text)
+                normalize_booking_card_number(
+                    element.text,
+                    prefix=self.profile.booking_prefix,
+                )
                 for element in self.browser._driver.find_elements(
                     By.CSS_SELECTOR,
                     "div.booking-slot b",
                 )
-                if normalize_milkrun_card_number(element.text)
+                if normalize_booking_card_number(
+                    element.text,
+                    prefix=self.profile.booking_prefix,
+                )
             )
         except (StaleElementReferenceException, WebDriverException):
             return ()
@@ -601,11 +657,13 @@ class DailyInboundScraper:
         handles_before = set(self.browser._driver.window_handles)
         created_handles: set[str] = set()
         try:
-            self.browser._click_element(card, f"배차번호 {dispatch_number} 카드")
+            self.browser._click_element(
+                card,
+                f"{self.profile.number_label} {dispatch_number} 카드",
+            )
             link = self.browser._first_visible(
                 By.XPATH,
-                "//a[@target='_blank' and contains(@href,'/app/inbound-booking/milkrun/detail')]"
-                "[.//em[normalize-space()='선택한 Slot의 예약정보를 조회합니다.']]",
+                self._detail_link_xpath(),
                 timeout=20,
             )
             href = link.get_attribute("href") or ""
@@ -637,13 +695,14 @@ class DailyInboundScraper:
             self.browser._wait_document_ready(60)
             self.browser._wait(
                 60,
-                lambda: self.DETAIL_HREF_FRAGMENT in self._safe_current_url(),
-                "밀크런 예약 상세 화면",
+                lambda: self.profile.detail_href_fragment in self._safe_current_url(),
+                f"{self.profile.display_name} 예약 상세 화면",
             )
             logical_rows = self._wait_for_detail_rows()
             products = parse_detail_table_cells(
                 logical_rows,
                 dispatch_number=dispatch_number,
+                booking_prefix=self.profile.booking_prefix,
             )
             if not products:
                 raise DailyInboundError("예약 상세 표의 SKU 열을 읽지 못했습니다. 사이트 표 구조를 확인해 주세요.")
@@ -678,6 +737,13 @@ class DailyInboundScraper:
                         self.log(f"예약 상세 선택창 정리 경고: {cleanup_error}")
             except (NoSuchWindowException, WebDriverException):
                 pass
+
+    def _detail_link_xpath(self) -> str:
+        return (
+            "//a[@target='_blank' and "
+            f"contains(@href,'{self.profile.detail_href_fragment}')]"
+            "[.//em[normalize-space()='선택한 Slot의 예약정보를 조회합니다.']]"
+        )
 
     def _wait_for_detail_rows(self) -> tuple[tuple[str, ...], ...]:
         previous: tuple[tuple[str, ...], ...] | None = None
@@ -776,7 +842,7 @@ class DailyInboundScraper:
     def _detail_sheet_closed(self) -> bool:
         detail_links = self.browser._visible_elements(
             By.XPATH,
-            "//a[contains(@href,'/app/inbound-booking/milkrun/detail')]"
+            f"//a[contains(@href,'{self.profile.detail_href_fragment}')]"
             "[.//em[normalize-space()='선택한 Slot의 예약정보를 조회합니다.']]",
         )
         backdrops = self.browser._visible_elements(By.CSS_SELECTOR, ".cdk-overlay-backdrop")

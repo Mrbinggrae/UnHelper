@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +45,10 @@ from Modules.Excel.MilkrunExcelImporter import (
     MilkrunExcelImportResult,
     MilkrunExcelImporter,
 )
+from Modules.Excel.TruckExcelImporter import (
+    TruckExcelImportResult,
+    TruckExcelImporter,
+)
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
 from Modules.Shipments.MilkrunDownloader import (
@@ -52,10 +56,15 @@ from Modules.Shipments.MilkrunDownloader import (
     MilkrunDownloadRequest,
     MilkrunDownloader,
 )
+from Modules.Shipments.TruckDownloader import (
+    TruckDownloadRequest,
+    TruckDownloader,
+)
 from Modules.Shipments.DailyInboundScraper import (
     DailyInboundError,
     DailyInboundResult,
     DailyInboundScraper,
+    TRUCK_DAILY_INBOUND_PROFILE,
 )
 from Modules.WMS.ProductMemory import (
     MANUAL_CATEGORIES,
@@ -75,8 +84,9 @@ from Modules.WMS.ProductWeightWorker import (
 
 @dataclass(frozen=True)
 class MilkrunPipelineResult:
-    excel: MilkrunExcelImportResult
+    excel: MilkrunExcelImportResult | TruckExcelImportResult
     daily_inbound: DailyInboundResult
+    booking_type: str = "milkrun"
 
 
 class MilkrunWorker(QThread):
@@ -90,14 +100,17 @@ class MilkrunWorker(QThread):
 
     def __init__(
         self,
-        request: MilkrunDownloadRequest,
+        request: MilkrunDownloadRequest | TruckDownloadRequest,
         driver_path: Path,
         target_workbook: Path,
+        *,
+        booking_type: str = "milkrun",
     ):
         super().__init__()
         self.request = request
         self.driver_path = driver_path
         self.target_workbook = target_workbook
+        self.booking_type = booking_type
         self.stop_event = threading.Event()
         self.downloader: MilkrunDownloader | None = None
 
@@ -105,13 +118,20 @@ class MilkrunWorker(QThread):
         download_result = None
         import_result = None
         try:
-            importer = MilkrunExcelImporter(log=self.log_updated.emit)
+            is_truck = self.booking_type == "truck"
+            booking_label = "트럭" if is_truck else "Milkrun"
+            importer = (
+                TruckExcelImporter(log=self.log_updated.emit)
+                if is_truck
+                else MilkrunExcelImporter(log=self.log_updated.emit)
+            )
             self.log_updated.emit("연결된 Excel 파일을 확인합니다.")
             importer.validate_workbook(self.target_workbook)
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
 
-            self.downloader = MilkrunDownloader(
+            downloader_class = TruckDownloader if is_truck else MilkrunDownloader
+            self.downloader = downloader_class(
                 self.driver_path,
                 log=self.log_updated.emit,
                 stop_event=self.stop_event,
@@ -120,17 +140,24 @@ class MilkrunWorker(QThread):
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
             self.log_updated.emit("다운로드 데이터를 연결된 Excel 파일에 반영합니다.")
-            import_result = importer.import_values(
-                download_result.file_path,
-                self.target_workbook,
-                cancel_requested=self.stop_event.is_set,
-                exclude_arrival_date=download_result.start_date,
-            )
+            if is_truck:
+                import_result = importer.import_values(
+                    download_result.file_path,
+                    self.target_workbook,
+                    cancel_requested=self.stop_event.is_set,
+                )
+            else:
+                import_result = importer.import_values(
+                    download_result.file_path,
+                    self.target_workbook,
+                    cancel_requested=self.stop_event.is_set,
+                    exclude_arrival_date=download_result.start_date,
+                )
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
             if import_result.rows == 1 and not import_result.dispatch_numbers:
                 self.log_updated.emit(
-                    "오늘 반영할 Milkrun 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
+                    f"오늘 반영할 {booking_label} 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
                 )
                 daily_result = DailyInboundResult(
                     products=(),
@@ -139,18 +166,33 @@ class MilkrunWorker(QThread):
                     unmatched_dispatches=(),
                 )
             else:
-                self.log_updated.emit(
-                    "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
-                )
+                if is_truck:
+                    self.log_updated.emit(
+                        "다운로드 첫 시트 C열의 예약번호를 T 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
+                    )
+                else:
+                    self.log_updated.emit(
+                        "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
+                    )
+                scraper_kwargs = {"evidence_dir": self.request.download_dir}
+                if is_truck:
+                    scraper_kwargs["profile"] = TRUCK_DAILY_INBOUND_PROFILE
                 daily_result = DailyInboundScraper(
                     self.downloader,
-                    evidence_dir=self.request.download_dir,
+                    **scraper_kwargs,
                 ).run(
                     import_result.dispatch_numbers,
                     center_name=self.request.center_name,
                     schedule_date=download_result.end_date,
                 )
-            self.completed.emit(MilkrunPipelineResult(import_result, daily_result))
+                if is_truck:
+                    daily_result = self._apply_truck_reservation_metrics(
+                        daily_result,
+                        import_result,
+                    )
+            self.completed.emit(
+                MilkrunPipelineResult(import_result, daily_result, self.booking_type)
+            )
         except (AutomationCancelled, ExcelImportCancelled) as exc:
             if import_result is not None:
                 self.detail_cancelled.emit(import_result, str(exc))
@@ -181,6 +223,42 @@ class MilkrunWorker(QThread):
 
     def request_cancel(self) -> None:
         self.stop_event.set()
+
+    def _apply_truck_reservation_metrics(
+        self,
+        daily_result: DailyInboundResult,
+        import_result: TruckExcelImportResult,
+    ) -> DailyInboundResult:
+        metrics = import_result.metrics_by_reservation
+        products = []
+        skus_by_reservation: dict[str, set[str]] = {}
+        for product in daily_result.products:
+            metric = metrics.get(product.dispatch_number)
+            if metric is None:
+                raise DailyInboundError(
+                    f"예약번호 {product.dispatch_number}의 유닛 수와 팔렛트 수를 "
+                    "다운로드 파일에서 찾지 못했습니다."
+                )
+            products.append(
+                replace(
+                    product,
+                    box_count=metric.unit_count,
+                    pallet_count=metric.pallet_count,
+                )
+            )
+            skus_by_reservation.setdefault(product.dispatch_number, set()).add(
+                str(product.sku_id).strip()
+            )
+
+        for reservation_number, sku_ids in skus_by_reservation.items():
+            if len(sku_ids) > 1:
+                raise DailyInboundError(
+                    f"예약번호 {reservation_number}에서 서로 다른 SKU {len(sku_ids)}개를 "
+                    "확인했습니다. 다운로드의 M/N열은 예약 단위 수량이므로 각 SKU의 "
+                    "팔렛트 무게를 정확히 계산할 수 없습니다. Excel 반영은 완료했지만 "
+                    "잘못된 중량 분류를 막기 위해 WMS 조회를 시작하지 않았습니다."
+                )
+        return replace(daily_result, products=tuple(products))
 
 
 class UpdateCheckWorker(QThread):
@@ -373,7 +451,7 @@ class SettingsDialog(QDialog):
         download_row.addWidget(browse)
         file_layout.addLayout(download_row)
 
-        excel_label = QLabel("Milkrun 데이터를 반영할 Excel 파일")
+        excel_label = QLabel("Milkrun·트럭 데이터를 반영할 Excel 파일")
         excel_label.setObjectName("FieldLabel")
         file_layout.addWidget(excel_label)
         excel_row = QHBoxLayout()
@@ -390,7 +468,8 @@ class SettingsDialog(QDialog):
         file_layout.addLayout(excel_row)
 
         excel_help = QLabel(
-            "다운로드 완료 후 Raw_밀크런!C1:P1000의 값만 지우고, C1부터 값으로 붙여넣습니다."
+            "Milkrun은 Raw_밀크런!C1:P1000, 트럭은 Raw_트럭!C1:U1000의 "
+            "값만 지운 뒤 각각 C1부터 값으로 붙여넣습니다."
         )
         excel_help.setWordWrap(True)
         excel_help.setObjectName("HelpText")
@@ -507,7 +586,7 @@ class SettingsDialog(QDialog):
         initial = current.parent if current.is_file() or current.suffix else current
         selected, _filter = QFileDialog.getOpenFileName(
             self,
-            "Milkrun Excel 파일 연결",
+            "입고 스케줄 Excel 파일 연결",
             str(initial),
             "Excel 통합 문서 (*.xlsx *.xlsm *.xlsb *.xls)",
         )
@@ -605,6 +684,12 @@ class MainWindow(QMainWindow):
         self.product_memory_file = product_memory_path()
         self.current_products = ()
         self.current_pipeline_result: MilkrunPipelineResult | None = None
+        self._products_by_booking: dict[str, tuple] = {"milkrun": (), "truck": ()}
+        self._pipeline_results_by_booking: dict[str, MilkrunPipelineResult | None] = {
+            "milkrun": None,
+            "truck": None,
+        }
+        self._active_booking_type = "milkrun"
         self._weight_records: dict[str, ProductMemoryRecord] = {}
         self._weight_failures: dict[str, SkuWeightFailure] = {}
         self._weight_row_errors: dict[str, str] = {}
@@ -709,12 +794,19 @@ class MainWindow(QMainWindow):
         self.raw_tabs = QTabWidget()
         self.raw_tabs.setObjectName("RawTabs")
         self.raw_tabs.tabBar().setObjectName("SubTabBar")
-        self.raw_tabs.addTab(self._placeholder("RAW 트럭 기능은 다음 단계에서 연결됩니다."), "트럭")
+        self.raw_tabs.addTab(self._build_raw_truck(), "트럭")
         self.raw_tabs.addTab(self._build_raw_milkrun(), "Milkrun")
         self.raw_tabs.setCurrentIndex(1)
         return self.raw_tabs
 
     def _build_raw_milkrun(self) -> QWidget:
+        return self._build_raw_booking_page("milkrun")
+
+    def _build_raw_truck(self) -> QWidget:
+        return self._build_raw_booking_page("truck")
+
+    def _build_raw_booking_page(self, booking_type: str) -> QWidget:
+        is_truck = booking_type == "truck"
         page = QWidget()
         page.setObjectName("Page")
         outer = QVBoxLayout(page)
@@ -724,10 +816,14 @@ class MainWindow(QMainWindow):
         section_row = QHBoxLayout()
         section_copy = QVBoxLayout()
         section_copy.setSpacing(1)
-        section_title = QLabel("Milkrun 데이터")
+        section_title = QLabel("트럭 데이터" if is_truck else "Milkrun 데이터")
         section_title.setObjectName("SectionTitle")
         section_description = QLabel(
-            "Shipments 예약 정보와 WMS 상품 무게를 오늘 입고 기준으로 정리합니다."
+            (
+                "오늘 트럭 예약과 WMS 상품 무게를 예약번호 기준으로 정리합니다."
+                if is_truck
+                else "Shipments 예약 정보와 WMS 상품 무게를 오늘 입고 기준으로 정리합니다."
+            )
         )
         section_description.setObjectName("SectionDescription")
         section_copy.addWidget(section_title)
@@ -741,10 +837,24 @@ class MainWindow(QMainWindow):
         data_layout = QVBoxLayout(data_card)
         data_layout.setContentsMargins(0, 0, 0, 0)
         data_layout.setSpacing(0)
-        self.raw_table = QTableWidget(0, 10)
-        self.raw_table.setObjectName("RawTable")
-        self.raw_table.setHorizontalHeaderLabels(
-            [
+        table = QTableWidget(0, 10)
+        table.setObjectName("RawTable")
+        table.setHorizontalHeaderLabels(
+            (
+                [
+                    "거래처 이름",
+                    "예약번호",
+                    "팔렛트 수",
+                    "유닛 수",
+                    "팔렛트당 유닛",
+                    "SKU ID",
+                    "SKU 명",
+                    "상품 무게(g)",
+                    "1팔렛트 무게(kg)",
+                    "분류",
+                ]
+                if is_truck
+                else [
                 "거래처 이름",
                 "밀크런 번호",
                 "팔렛트 수",
@@ -755,41 +865,55 @@ class MainWindow(QMainWindow):
                 "상품 무게(g)",
                 "1팔렛트 무게(kg)",
                 "분류",
-            ]
+                ]
+            )
         )
-        self.raw_table.setWordWrap(False)
-        self.raw_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.raw_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.raw_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.raw_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.verticalHeader().setVisible(False)
-        self.raw_table.verticalHeader().setDefaultSectionSize(42)
-        self.raw_table.horizontalHeader().setMinimumHeight(42)
-        self.raw_table.setAlternatingRowColors(True)
-        data_layout.addWidget(self.raw_table, 1)
+        table.setWordWrap(False)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 9):
+            table.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch
+                if column == 6
+                else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
+        table.setColumnWidth(9, 84)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(42)
+        table.horizontalHeader().setMinimumHeight(42)
+        table.setAlternatingRowColors(True)
+        data_layout.addWidget(table, 1)
         outer.addWidget(data_card, 1)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
-        self.get_data_button = QPushButton("데이터 얻기")
-        self.get_data_button.setObjectName("PrimaryButton")
-        self.get_data_button.setMinimumWidth(210)
-        self.get_data_button.clicked.connect(self.start_milkrun_download)
-        self.stop_button = QPushButton("작업 중지")
-        self.stop_button.setObjectName("StopButton")
-        self.stop_button.setVisible(False)
-        self.stop_button.clicked.connect(self.cancel_milkrun_download)
-        actions.addWidget(self.get_data_button)
-        actions.addWidget(self.stop_button)
+        get_button = QPushButton("데이터 얻기")
+        get_button.setObjectName("PrimaryButton")
+        get_button.setMinimumWidth(210)
+        get_button.clicked.connect(
+            self.start_truck_download if is_truck else self.start_milkrun_download
+        )
+        stop_button = QPushButton("작업 중지")
+        stop_button.setObjectName("StopButton")
+        stop_button.setVisible(False)
+        stop_button.clicked.connect(self.cancel_milkrun_download)
+        actions.addWidget(get_button)
+        actions.addWidget(stop_button)
         actions.addStretch(1)
         outer.addLayout(actions)
+
+        if is_truck:
+            self.truck_table = table
+            self.truck_get_data_button = get_button
+            self.truck_stop_button = stop_button
+        else:
+            # Keep the original public attribute names for the Milkrun tests and
+            # existing integrations while Truck owns a separate table/state.
+            self.raw_table = table
+            self.get_data_button = get_button
+            self.stop_button = stop_button
         return page
 
     @staticmethod
@@ -803,9 +927,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return page
 
+    def _table_for_booking(self, booking_type: str) -> QTableWidget:
+        return self.truck_table if booking_type == "truck" else self.raw_table
+
+    @staticmethod
+    def _booking_label(booking_type: str) -> str:
+        return "트럭" if booking_type == "truck" else "Milkrun"
+
     def start_milkrun_download(self) -> None:
+        self._start_booking_download("milkrun")
+
+    def start_truck_download(self) -> None:
+        self._start_booking_download("truck")
+
+    def _start_booking_download(self, booking_type: str) -> None:
         if self._automation_worker_running():
             return
+        is_truck = booking_type == "truck"
+        booking_label = "트럭" if is_truck else "Milkrun"
         driver = chromedriver_path()
         if not driver.is_file():
             QMessageBox.critical(self, "ChromeDriver 없음", f"ChromeDriver를 찾을 수 없습니다.\n{driver}")
@@ -816,12 +955,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Excel 파일 연결 필요",
-                "먼저 설정에서 Raw_밀크런 시트가 있는 Excel 파일을 연결해 주세요.",
+                "먼저 설정에서 Raw_밀크런 및 Raw_트럭 시트가 있는 Excel 파일을 연결해 주세요.",
             )
             self.show_settings()
             return
         try:
-            target_workbook = MilkrunExcelImporter.validate_target_path(configured_workbook)
+            if is_truck:
+                from Modules.Excel.TruckExcelImporter import TruckExcelImporter
+
+                target_workbook = TruckExcelImporter.validate_target_path(configured_workbook)
+            else:
+                target_workbook = MilkrunExcelImporter.validate_target_path(configured_workbook)
         except ExcelImportError as exc:
             QMessageBox.warning(self, "Excel 파일 확인", str(exc))
             return
@@ -829,9 +973,18 @@ class MainWindow(QMainWindow):
         download_dir = Path(
             str(self.settings.value("download_dir", str(default_download_dir())))
         ).expanduser()
-        request = MilkrunDownloadRequest(download_dir=download_dir, center_name="안산2")
+        if is_truck:
+            from Modules.Shipments.TruckDownloader import TruckDownloadRequest
+
+            request = TruckDownloadRequest(download_dir=download_dir, center_name="안산2")
+        else:
+            request = MilkrunDownloadRequest(download_dir=download_dir, center_name="안산2")
         self.log_view.clear()
-        self.raw_table.setRowCount(0)
+        table = self._table_for_booking(booking_type)
+        table.setRowCount(0)
+        self._active_booking_type = booking_type
+        self._products_by_booking[booking_type] = ()
+        self._pipeline_results_by_booking[booking_type] = None
         self.current_products = ()
         self.current_pipeline_result = None
         self._pending_weight_summary = None
@@ -839,10 +992,15 @@ class MainWindow(QMainWindow):
         self._pending_weight_cancel = ""
         self._credential_load_failure = None
         self._weight_finalize_pending = False
-        self.append_log("Milkrun 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
+        self.append_log(f"{booking_label} 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
         self.append_log(f"연결된 Excel: {target_workbook}")
         self._set_automation_working(True)
-        self.milkrun_worker = MilkrunWorker(request, driver, target_workbook)
+        self.milkrun_worker = MilkrunWorker(
+            request,
+            driver,
+            target_workbook,
+            booking_type=booking_type,
+        )
         self.milkrun_worker.log_updated.connect(self.append_log)
         self.milkrun_worker.completed.connect(self._on_milkrun_completed)
         self.milkrun_worker.excel_failed.connect(self._on_milkrun_excel_failed)
@@ -865,15 +1023,19 @@ class MainWindow(QMainWindow):
             self.append_log("작업 중지를 요청했습니다.")
             self.status_label.setText("작업 중지 중...")
             self.stop_button.setEnabled(False)
+            self.truck_stop_button.setEnabled(False)
 
     def _on_milkrun_completed(self, result) -> None:
         if self._closing_after_cancel:
             self.append_log("종료 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
             return
+        booking_type = getattr(result, "booking_type", self._active_booking_type)
+        self._active_booking_type = booking_type
         excel = result.excel
         daily = result.daily_inbound
         self.current_pipeline_result = result
-        self._populate_milkrun_products(daily.products)
+        self._pipeline_results_by_booking[booking_type] = result
+        self._populate_booking_products(daily.products, booking_type)
         self.append_log(f"다운로드 완료: {excel.source_file}")
         self.append_log(
             f"Excel 반영 완료: {excel.target_workbook} · {excel.sheet_name}!C1 · "
@@ -883,19 +1045,30 @@ class MainWindow(QMainWindow):
             self.append_log(f"입고일이 어제인 행 {excel.filtered_rows}개를 제외했습니다.")
         self.append_log(f"일별 입고 상세 표시 완료: {len(daily.products)}개 상품")
         if daily.unmatched_dispatches:
+            number_label = "예약번호" if booking_type == "truck" else "배차번호"
             self.append_log(
-                "오늘 카드에서 찾지 못한 배차번호: "
+                f"오늘 카드에서 찾지 못한 {number_label}: "
                 + ", ".join(daily.unmatched_dispatches)
             )
         self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
         self._start_weight_lookup(daily.products)
 
     def _populate_milkrun_products(self, products) -> None:
+        self._active_booking_type = "milkrun"
+        self._populate_booking_products(products, "milkrun")
+
+    def _populate_truck_products(self, products) -> None:
+        self._active_booking_type = "truck"
+        self._populate_booking_products(products, "truck")
+
+    def _populate_booking_products(self, products, booking_type: str) -> None:
         self.current_products = tuple(products)
+        self._products_by_booking[booking_type] = self.current_products
         self._weight_records.clear()
         self._weight_failures.clear()
         self._weight_row_errors.clear()
-        self.raw_table.setRowCount(len(self.current_products))
+        table = self._table_for_booking(booking_type)
+        table.setRowCount(len(self.current_products))
         for row_index, product in enumerate(self.current_products):
             try:
                 boxes_per_pallet = self._format_decimal(
@@ -906,7 +1079,7 @@ class MainWindow(QMainWindow):
                 boxes_per_pallet = "-"
             values = (
                 product.vendor_name,
-                product.milkrun_number,
+                product.dispatch_number if booking_type == "truck" else product.milkrun_number,
                 product.pallet_count,
                 product.box_count,
                 boxes_per_pallet,
@@ -920,16 +1093,19 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column_index in (0, 6):
                     item.setToolTip(str(value))
-                self.raw_table.setItem(row_index, column_index, item)
+                table.setItem(row_index, column_index, item)
             category_button = QPushButton("?")
             category_button.setObjectName("CategoryButton")
             category_button.setProperty("classification", "?")
             category_button.setEnabled(False)
             category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
             category_button.clicked.connect(
-                lambda _checked=False, sku_id=product.sku_id: self._cycle_category(sku_id)
+                lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
+                    sku_id,
+                    kind,
+                )
             )
-            self.raw_table.setCellWidget(row_index, 9, category_button)
+            table.setCellWidget(row_index, 9, category_button)
 
     def _start_weight_lookup(self, products) -> None:
         if self.weight_worker and self.weight_worker.isRunning():
@@ -987,6 +1163,9 @@ class MainWindow(QMainWindow):
             credentials.wms_id,
             credentials.password,
             evidence_dir=download_dir,
+            quantity_label=(
+                "유닛" if self._active_booking_type == "truck" else "박스"
+            ),
         )
         self.weight_worker.log_updated.connect(self.append_log)
         self.weight_worker.record_ready.connect(self._on_weight_record_ready)
@@ -1002,13 +1181,20 @@ class MainWindow(QMainWindow):
 
     def _on_weight_record_ready(self, record: ProductMemoryRecord, cache_hit: bool) -> None:
         self._weight_records[record.sku_id] = record
-        self._render_weight_record(record)
+        self._render_weight_record(record, self._active_booking_type)
         source = "저장 정보" if cache_hit else "WMS"
         self.append_log(f"SKU {record.sku_id} 무게 반영: {source}")
 
-    def _render_weight_record(self, record: ProductMemoryRecord) -> None:
+    def _render_weight_record(
+        self,
+        record: ProductMemoryRecord,
+        booking_type: str | None = None,
+    ) -> None:
+        booking_type = booking_type or self._active_booking_type
+        products = self._products_by_booking.get(booking_type, ())
+        table = self._table_for_booking(booking_type)
         self._weight_row_errors.pop(record.sku_id, None)
-        for row_index, product in enumerate(self.current_products):
+        for row_index, product in enumerate(products):
             try:
                 row_sku = normalize_sku_id(product.sku_id)
             except ValueError:
@@ -1023,29 +1209,46 @@ class MainWindow(QMainWindow):
                     product.box_count,
                     product.pallet_count,
                 )
-                self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
+                self._set_table_text(
+                    row_index,
+                    4,
+                    self._format_decimal(boxes_per_pallet, 3),
+                    table=table,
+                )
             except (TypeError, ValueError) as exc:
-                self._set_table_text(row_index, 4, "-")
+                self._set_table_text(row_index, 4, "-", table=table)
                 error_text = str(exc)
+                if booking_type == "truck":
+                    error_text = error_text.replace("박스", "유닛")
                 self._weight_row_errors[record.sku_id] = error_text
 
             if record.weight_grams is not None:
-                self._set_table_text(row_index, 7, self._format_decimal(record.weight_grams))
+                self._set_table_text(
+                    row_index,
+                    7,
+                    self._format_decimal(record.weight_grams),
+                    table=table,
+                )
                 if not error_text:
                     _, pallet_weight_kg, automatic_category = calculate_pallet_measurement(
                         record.weight_grams,
                         product.box_count,
                         product.pallet_count,
                     )
-                    self._set_table_text(row_index, 8, self._format_decimal(pallet_weight_kg, 3))
+                    self._set_table_text(
+                        row_index,
+                        8,
+                        self._format_decimal(pallet_weight_kg, 3),
+                        table=table,
+                    )
                     category = record.category_override or automatic_category
                 else:
-                    self._set_table_text(row_index, 8, "-")
+                    self._set_table_text(row_index, 8, "-", table=table)
             else:
-                self._set_table_text(row_index, 7, "-")
-                self._set_table_text(row_index, 8, "-")
+                self._set_table_text(row_index, 7, "-", table=table)
+                self._set_table_text(row_index, 8, "-", table=table)
 
-            button = self.raw_table.cellWidget(row_index, 9)
+            button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 self._configure_category_button(
                     button,
@@ -1053,19 +1256,22 @@ class MainWindow(QMainWindow):
                     manual=record.category_override is not None,
                     enabled=not self._automation_worker_running(),
                     error_text=error_text,
+                    quantity_label="유닛" if booking_type == "truck" else "박스",
                 )
 
     def _on_weight_sku_failed(self, failure: SkuWeightFailure) -> None:
         self._weight_failures[failure.sku_id] = failure
         self.append_log(f"[WMS 조회 실패] SKU {failure.sku_id}: {failure.details.summary}")
-        for row_index, product in enumerate(self.current_products):
+        products = self._products_by_booking.get(self._active_booking_type, ())
+        table = self._table_for_booking(self._active_booking_type)
+        for row_index, product in enumerate(products):
             try:
                 matches = normalize_sku_id(product.sku_id) == normalize_sku_id(failure.sku_id)
             except ValueError:
                 matches = str(product.sku_id).strip() == failure.sku_id
             if not matches:
                 continue
-            button = self.raw_table.cellWidget(row_index, 9)
+            button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 button.setToolTip(failure.details.summary)
 
@@ -1104,12 +1310,14 @@ class MainWindow(QMainWindow):
         self._finalize_weight_lookup()
 
     def _finalize_weight_lookup(self) -> None:
+        booking_label = self._booking_label(self._active_booking_type)
+        number_label = "예약번호" if self._active_booking_type == "truck" else "배차번호"
         if self._pending_weight_cancel:
             self.status_label.setText("부분 완료 · WMS 무게 조회 취소")
             QMessageBox.information(
                 self,
                 "WMS 무게 조회 취소",
-                "Milkrun 다운로드, Excel 반영과 일별 입고 표시는 완료됐습니다.\n"
+                f"{booking_label} 다운로드, Excel 반영과 일별 입고 표시는 완료됐습니다.\n"
                 "이미 확인된 상품 무게는 저장됐으며 나머지는 다음 실행에서 다시 조회합니다.",
             )
             return
@@ -1137,7 +1345,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"부분 완료 · WMS/계산 오류 {len(problems)}건")
             failure = FailureDetails(
                 summary=(
-                    "Milkrun 다운로드, Excel 반영과 일별 입고 표시는 완료됐지만 "
+                    f"{booking_label} 다운로드, Excel 반영과 일별 입고 표시는 완료됐지만 "
                     f"상품 무게 확인 중 {len(problems)}건의 문제가 발생했습니다.\n\n"
                     + "\n".join(problems[:20])
                 ),
@@ -1146,7 +1354,7 @@ class MainWindow(QMainWindow):
             self._show_error_dialog(
                 "WMS 상품 무게 조회 일부 실패",
                 failure,
-                category="Milkrun WMS 무게 조회",
+                category=f"{booking_label} WMS 무게 조회",
             )
             return
 
@@ -1160,27 +1368,32 @@ class MainWindow(QMainWindow):
         )
         self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
         message = (
-            "Milkrun 다운로드, Excel 값 반영, 일별 입고 상세와 WMS 무게 분류를 완료했습니다.\n\n"
+            f"{booking_label} 다운로드, Excel 값 반영, 일별 입고 상세와 WMS 무게 분류를 완료했습니다.\n\n"
             f"표시 상품: {product_count}개\n"
             f"저장된 무게 사용: {cache_hits}개\n"
             f"WMS 신규 조회: {wms_successes}개"
         )
         if unmatched:
-            message += "\n\n오늘 카드에서 찾지 못한 배차번호: " + ", ".join(unmatched)
-            QMessageBox.warning(self, "Milkrun 작업 완료", message)
+            message += f"\n\n오늘 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
+            QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
         else:
-            QMessageBox.information(self, "Milkrun 작업 완료", message)
+            QMessageBox.information(self, f"{booking_label} 작업 완료", message)
 
-    def _cycle_category(self, sku_value: object) -> None:
+    def _cycle_category(
+        self,
+        sku_value: object,
+        booking_type: str | None = None,
+    ) -> None:
         if self._automation_worker_running():
             return
+        booking_type = booking_type or self._active_booking_type
         try:
             sku_id = normalize_sku_id(sku_value)
             memory = ProductMemory(self.product_memory_file)
             record = memory.get(sku_id)
             override = record.category_override if record is not None else None
             product_name = ""
-            for product in self.current_products:
+            for product in self._products_by_booking.get(booking_type, ()):
                 try:
                     product_sku_id = normalize_sku_id(product.sku_id)
                 except ValueError:
@@ -1213,16 +1426,25 @@ class MainWindow(QMainWindow):
 
         if updated is None:
             self._weight_records.pop(sku_id, None)
-            self._render_unknown_sku(sku_id)
+            for kind in ("milkrun", "truck"):
+                self._render_unknown_sku(sku_id, kind)
             self.append_log(f"SKU {sku_id} 수동 분류를 해제했습니다.")
         else:
             self._weight_records[sku_id] = updated
-            self._render_weight_record(updated)
+            for kind in ("milkrun", "truck"):
+                self._render_weight_record(updated, kind)
             source = "자동" if updated.category_override is None else "수동"
             self.append_log(f"SKU {sku_id} 분류 변경: {updated.effective_category or '?'} ({source})")
 
-    def _render_unknown_sku(self, sku_id: str) -> None:
-        for row_index, product in enumerate(self.current_products):
+    def _render_unknown_sku(
+        self,
+        sku_id: str,
+        booking_type: str | None = None,
+    ) -> None:
+        booking_type = booking_type or self._active_booking_type
+        products = self._products_by_booking.get(booking_type, ())
+        table = self._table_for_booking(booking_type)
+        for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
                     continue
@@ -1233,32 +1455,45 @@ class MainWindow(QMainWindow):
                     product.box_count,
                     product.pallet_count,
                 )
-                self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
+                self._set_table_text(
+                    row_index,
+                    4,
+                    self._format_decimal(boxes_per_pallet, 3),
+                    table=table,
+                )
             except (TypeError, ValueError):
-                self._set_table_text(row_index, 4, "-")
-            self._set_table_text(row_index, 7, "-")
-            self._set_table_text(row_index, 8, "-")
-            button = self.raw_table.cellWidget(row_index, 9)
+                self._set_table_text(row_index, 4, "-", table=table)
+            self._set_table_text(row_index, 7, "-", table=table)
+            self._set_table_text(row_index, 8, "-", table=table)
+            button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 self._configure_category_button(button, "?", manual=False, enabled=True)
 
-    def _displayed_category_for_sku(self, sku_id: str) -> str:
-        for row_index, product in enumerate(self.current_products):
+    def _displayed_category_for_sku(
+        self,
+        sku_id: str,
+        booking_type: str | None = None,
+    ) -> str:
+        booking_type = booking_type or self._active_booking_type
+        products = self._products_by_booking.get(booking_type, ())
+        table = self._table_for_booking(booking_type)
+        for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
                     continue
             except ValueError:
                 continue
-            button = self.raw_table.cellWidget(row_index, 9)
+            button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 return button.text()
         return "?"
 
     def _set_category_buttons_enabled(self, enabled: bool) -> None:
-        for row_index in range(self.raw_table.rowCount()):
-            button = self.raw_table.cellWidget(row_index, 9)
-            if isinstance(button, QPushButton):
-                button.setEnabled(enabled)
+        for table in (self.raw_table, self.truck_table):
+            for row_index in range(table.rowCount()):
+                button = table.cellWidget(row_index, 9)
+                if isinstance(button, QPushButton):
+                    button.setEnabled(enabled)
 
     @staticmethod
     def _configure_category_button(
@@ -1268,6 +1503,7 @@ class MainWindow(QMainWindow):
         manual: bool,
         enabled: bool,
         error_text: str = "",
+        quantity_label: str = "박스",
     ) -> None:
         display = category if category in MANUAL_CATEGORIES else "?"
         button.setText(display)
@@ -1275,20 +1511,33 @@ class MainWindow(QMainWindow):
         button.setEnabled(enabled)
         if error_text:
             tooltip = f"팔렛트 무게 계산 오류: {error_text}\n클릭해 수동 분류할 수 있습니다."
+        elif manual and display == "고단":
+            tooltip = "고단 수동 분류입니다. 이후 데이터 조회에서도 유지됩니다."
         elif manual:
-            tooltip = "수동 분류입니다. 클릭하면 다음 분류로 변경됩니다."
+            tooltip = (
+                "현재 표시의 수동 분류입니다. 다음 데이터 조회에서는 "
+                f"팔렛트당 {quantity_label} 수로 경량/중량을 다시 계산합니다."
+            )
         else:
             tooltip = "무게 기준 자동 분류입니다. 클릭하면 수동 분류로 변경됩니다."
         button.setToolTip(tooltip)
         button.style().unpolish(button)
         button.style().polish(button)
 
-    def _set_table_text(self, row: int, column: int, value: str) -> None:
-        item = self.raw_table.item(row, column)
+    def _set_table_text(
+        self,
+        row: int,
+        column: int,
+        value: str,
+        *,
+        table: QTableWidget | None = None,
+    ) -> None:
+        table = table or self._table_for_booking(self._active_booking_type)
+        item = table.item(row, column)
         if item is None:
             item = QTableWidgetItem()
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self.raw_table.setItem(row, column, item)
+            table.setItem(row, column, item)
         item.setText(value)
 
     @staticmethod
@@ -1298,10 +1547,15 @@ class MainWindow(QMainWindow):
 
     def _on_milkrun_failed(self, failure: FailureDetails | object) -> None:
         details = FailureDetails.coerce(failure)
+        booking_label = self._booking_label(self._active_booking_type)
         self.append_log(f"[오류] {details.summary}")
         self.status_label.setText("작업 실패")
         if not self._closing_after_cancel:
-            self._show_error_dialog("Milkrun 작업 실패", details, category="Milkrun 자동화")
+            self._show_error_dialog(
+                f"{booking_label} 작업 실패",
+                details,
+                category=f"{booking_label} 자동화",
+            )
 
     def _on_milkrun_excel_failed(
         self,
@@ -1309,18 +1563,23 @@ class MainWindow(QMainWindow):
         failure: FailureDetails | object,
     ) -> None:
         details = FailureDetails.coerce(failure)
+        booking_label = self._booking_label(self._active_booking_type)
         self.append_log(f"다운로드 완료: {downloaded_file}")
         self.append_log(f"[Excel 반영 오류] {details.summary}")
         self.status_label.setText("부분 완료 · Excel 반영 실패")
         if not self._closing_after_cancel:
             partial_failure = FailureDetails(
                 summary=(
-                    "Milkrun 파일은 정상적으로 내려받았지만 연결된 Excel에 반영하지 못했습니다.\n"
+                    f"{booking_label} 파일은 정상적으로 내려받았지만 연결된 Excel에 반영하지 못했습니다.\n"
                     f"다운로드 파일: {downloaded_file}\n\n{details.summary}"
                 ),
                 detail=f"다운로드 파일: {downloaded_file}\n\n{details.detail}",
             )
-            self._show_error_dialog("Excel 반영 실패", partial_failure, category="Milkrun Excel 반영")
+            self._show_error_dialog(
+                "Excel 반영 실패",
+                partial_failure,
+                category=f"{booking_label} Excel 반영",
+            )
 
     def _on_milkrun_detail_failed(
         self,
@@ -1328,6 +1587,7 @@ class MainWindow(QMainWindow):
         failure: FailureDetails | object,
     ) -> None:
         details = FailureDetails.coerce(failure)
+        booking_label = self._booking_label(self._active_booking_type)
         if import_result is not None:
             self.append_log(
                 f"Excel 반영 완료: {import_result.target_workbook} · "
@@ -1337,7 +1597,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("부분 완료 · Excel 반영 완료 · 일별 상세 실패")
         if not self._closing_after_cancel:
             prefix = (
-                "Milkrun 파일 다운로드와 Excel 값 반영은 완료되었지만 "
+                f"{booking_label} 파일 다운로드와 Excel 값 반영은 완료되었지만 "
                 "일별 입고 상세를 가져오지 못했습니다."
             )
             partial_failure = FailureDetails(
@@ -1347,10 +1607,11 @@ class MainWindow(QMainWindow):
             self._show_error_dialog(
                 "일별 입고 상세 조회 실패",
                 partial_failure,
-                category="Milkrun 일별 입고 상세",
+                category=f"{booking_label} 일별 입고 상세",
             )
 
     def _on_milkrun_detail_cancelled(self, import_result, message: str) -> None:
+        booking_label = self._booking_label(self._active_booking_type)
         self.append_log(
             f"Excel 반영 완료: {import_result.target_workbook} · "
             f"{import_result.sheet_name}!C1 · {import_result.rows}행 × {import_result.columns}열"
@@ -1361,7 +1622,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "일별 입고 상세 조회 취소",
-                "작업을 중지했지만 그 전에 Milkrun 다운로드와 Excel 값 반영은 완료되었습니다.\n\n"
+                f"작업을 중지했지만 그 전에 {booking_label} 다운로드와 Excel 값 반영은 완료되었습니다.\n\n"
                 f"대상: {import_result.target_workbook}\n"
                 f"범위: {import_result.sheet_name}!C1 "
                 f"({import_result.rows}행 × {import_result.columns}열)\n\n"
@@ -1386,16 +1647,20 @@ class MainWindow(QMainWindow):
             self._finalize_weight_if_ready()
 
     def _automation_worker_running(self) -> bool:
-        return any(
-            worker is not None and worker.isRunning()
-            for worker in (self.milkrun_worker, self.weight_worker)
-        )
+        # Treat the worker as active until its queued ``finished`` slot clears
+        # the reference.  QThread.run() may already have returned while a
+        # preceding completed signal is still waiting in the GUI event queue;
+        # considering that gap idle could close the window and then start WMS
+        # from the delayed completion callback.
+        return self.milkrun_worker is not None or self.weight_worker is not None
 
     def _set_automation_working(self, working: bool) -> None:
         self.get_data_button.setEnabled(not working)
+        self.truck_get_data_button.setEnabled(not working)
         self.settings_button.setEnabled(not working)
-        self.stop_button.setVisible(working)
-        self.stop_button.setEnabled(working)
+        for button in (self.stop_button, self.truck_stop_button):
+            button.setVisible(working)
+            button.setEnabled(working)
         if working:
             self.status_label.setText("작업 중 · 로그인 화면이면 브라우저에서 직접 인증해 주세요")
         elif self.status_label.text().startswith("작업 중"):
@@ -1420,28 +1685,29 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _refresh_current_product_memory(self) -> None:
-        if not self.current_products:
+        if not any(self._products_by_booking.values()):
             return
         try:
             memory = ProductMemory(self.product_memory_file)
             self._weight_records.clear()
             self._weight_row_errors.clear()
-            seen: set[str] = set()
-            for product in self.current_products:
-                try:
-                    sku_id = normalize_sku_id(product.sku_id)
-                except ValueError:
-                    continue
-                if sku_id in seen:
-                    continue
-                seen.add(sku_id)
-                record = memory.get(sku_id)
-                if record is None:
-                    self._render_unknown_sku(sku_id)
-                    continue
-                self._weight_records[sku_id] = record
-                self._render_weight_record(record)
-            self.append_log("설정에서 변경한 상품 분류 메모리를 현재 표에 반영했습니다.")
+            for booking_type in ("milkrun", "truck"):
+                seen: set[str] = set()
+                for product in self._products_by_booking.get(booking_type, ()):
+                    try:
+                        sku_id = normalize_sku_id(product.sku_id)
+                    except ValueError:
+                        continue
+                    if sku_id in seen:
+                        continue
+                    seen.add(sku_id)
+                    record = memory.get(sku_id)
+                    if record is None:
+                        self._render_unknown_sku(sku_id, booking_type)
+                        continue
+                    self._weight_records[sku_id] = record
+                    self._render_weight_record(record, booking_type)
+            self.append_log("설정에서 변경한 상품 분류 메모리를 RAW 표에 반영했습니다.")
         except Exception as exc:
             self._show_error_dialog(
                 "상품 분류 새로고침 실패",
@@ -1546,7 +1812,7 @@ class MainWindow(QMainWindow):
     def _automation_blocks_update(self, *, notify: bool) -> bool:
         if not self._automation_worker_running():
             return False
-        message = "Milkrun/WMS 작업 중에는 업데이트를 표시하거나 적용할 수 없습니다."
+        message = "Shipments/WMS 작업 중에는 업데이트를 표시하거나 적용할 수 없습니다."
         self.append_log(message)
         if notify and not self._closing_after_workers:
             QMessageBox.warning(self, "작업 실행 중", message)
@@ -1629,7 +1895,7 @@ class MainWindow(QMainWindow):
     def _apply_downloaded_update(self, zip_path: str, info) -> None:
         if self._automation_blocks_update(notify=True):
             if hasattr(self, "update_status"):
-                self.update_status.setText("Milkrun/WMS 작업 완료 후 업데이트를 다시 적용해 주세요.")
+                self.update_status.setText("Shipments/WMS 작업 완료 후 업데이트를 다시 적용해 주세요.")
             if hasattr(self, "apply_update_button"):
                 self.apply_update_button.setEnabled(True)
             if hasattr(self, "update_later_button"):
@@ -1700,7 +1966,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "작업 중",
-                "진행 중인 Milkrun/WMS 작업을 중지하고 종료하시겠습니까?",
+                "진행 중인 Shipments/WMS 작업을 중지하고 종료하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

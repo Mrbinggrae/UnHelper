@@ -178,6 +178,15 @@ def _validated_override(value: Any) -> str | None:
     return value
 
 
+def _override_after_automatic_recalculation(
+    previous: ProductMemoryRecord | None,
+) -> str | None:
+    """Keep only the user classification that must survive new pallet inputs."""
+    if previous is not None and previous.category_override == HIGH_CATEGORY:
+        return HIGH_CATEGORY
+    return None
+
+
 def _record_to_json(record: ProductMemoryRecord) -> dict[str, Any]:
     return {
         "sku_id": record.sku_id,
@@ -405,7 +414,7 @@ class ProductMemory:
                 product_name=name or (previous.product_name if previous else ""),
                 weight_grams=weight,
                 automatic_category=automatic_category,
-                category_override=previous.category_override if previous else None,
+                category_override=_override_after_automatic_recalculation(previous),
                 boxes_per_pallet=boxes_per_pallet,
                 pallet_weight_kg=pallet_weight_kg,
                 measured_at=measured_timestamp,
@@ -437,7 +446,7 @@ class ProductMemory:
                 product_name=name or (previous.product_name if previous else ""),
                 weight_grams=weight,
                 automatic_category="",
-                category_override=previous.category_override if previous else None,
+                category_override=_override_after_automatic_recalculation(previous),
                 boxes_per_pallet=None,
                 pallet_weight_kg=None,
                 measured_at=measured_timestamp,
@@ -471,6 +480,7 @@ class ProductMemory:
                 boxes_per_pallet=boxes_per_pallet,
                 pallet_weight_kg=pallet_weight_kg,
                 automatic_category=automatic_category,
+                category_override=_override_after_automatic_recalculation(previous),
                 updated_at=_now_iso(),
             )
             new_records = dict(self._records)

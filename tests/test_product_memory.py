@@ -143,6 +143,49 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertEqual(recalculated.automatic_category, LIGHT_CATEGORY)
         self.assertEqual(recalculated.category_override, HIGH_CATEGORY)
 
+    def test_cached_weight_recalculation_clears_light_or_heavy_manual_override(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        memory.upsert_measurement("123", "상품", "1000", "300", "1")
+        memory.set_manual_category("123", HEAVY_CATEGORY)
+
+        recalculated = memory.update_calculation("123", "2", "1")
+
+        self.assertEqual(recalculated.boxes_per_pallet, Decimal("2"))
+        self.assertEqual(recalculated.pallet_weight_kg, Decimal("2"))
+        self.assertEqual(recalculated.automatic_category, LIGHT_CATEGORY)
+        self.assertIsNone(recalculated.category_override)
+        self.assertEqual(recalculated.effective_category, LIGHT_CATEGORY)
+
+    def test_new_measurement_and_weight_refresh_keep_only_high_manual_override(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        memory.set_manual_category("123", LIGHT_CATEGORY, "상품")
+
+        measured = memory.upsert_measurement("123", "상품", "1000", "300", "1")
+        self.assertIsNone(measured.category_override)
+        self.assertEqual(measured.effective_category, HEAVY_CATEGORY)
+
+        memory.set_manual_category("123", HEAVY_CATEGORY)
+        weight_only = memory.upsert_weight("123", "상품", "2000")
+        self.assertIsNone(weight_only.category_override)
+
+        memory.set_manual_category("123", HIGH_CATEGORY)
+        high = memory.upsert_weight("123", "상품", "3000")
+        self.assertEqual(high.category_override, HIGH_CATEGORY)
+
+    def test_legacy_light_or_heavy_override_json_remains_readable_until_next_calculation(self) -> None:
+        path = self.root / "memory.json"
+        memory = ProductMemory(path)
+        memory.upsert_measurement("123", "상품", "1000", "300", "1")
+        memory.set_manual_category("123", LIGHT_CATEGORY)
+
+        restored = ProductMemory(path).get("123")
+
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.category_override, LIGHT_CATEGORY)
+        recalculated = ProductMemory(path).update_calculation("123", "300", "1")
+        self.assertIsNone(recalculated.category_override)
+        self.assertEqual(recalculated.effective_category, HEAVY_CATEGORY)
+
     def test_weight_only_cache_survives_invalid_pallet_inputs_and_can_recalculate_later(self) -> None:
         path = self.root / "memory.json"
         memory = ProductMemory(path)

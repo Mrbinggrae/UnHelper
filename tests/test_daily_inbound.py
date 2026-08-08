@@ -3,9 +3,15 @@ from __future__ import annotations
 import unittest
 
 from Modules.Shipments.DailyInbound import (
+    extract_booking_numbers,
     extract_dispatch_numbers,
+    extract_truck_reservation_numbers,
+    normalize_booking_card_number,
+    normalize_booking_number,
     normalize_dispatch_number,
     normalize_milkrun_card_number,
+    normalize_truck_card_number,
+    normalize_truck_reservation_number,
     parse_detail_table_cells,
 )
 
@@ -36,6 +42,45 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(
             extract_dispatch_numbers((header, first, duplicate, second)),
             ("M3370492", "M3370510"),
+        )
+
+    def test_truck_source_and_card_numbers_use_an_exact_t_prefix(self) -> None:
+        for source in (" 3370492 ", "t3370492", "T3370492", "3,370,492", 3370492, 3370492.0):
+            with self.subTest(source=source):
+                self.assertEqual(normalize_truck_reservation_number(source), "T3370492")
+
+        for invalid in (True, "M3370492", "I3370492", "3370492/1", 3370492.5, "예약번호"):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(normalize_truck_reservation_number(invalid), "")
+
+        self.assertEqual(normalize_truck_card_number("T3370492"), "T3370492")
+        for non_t_card in ("3370492", "M3370492", "I3370492"):
+            with self.subTest(non_t_card=non_t_card):
+                self.assertEqual(normalize_truck_card_number(non_t_card), "")
+
+        self.assertEqual(normalize_booking_number("3370492", prefix="M"), "M3370492")
+        self.assertEqual(normalize_booking_number("3370492", prefix="T"), "T3370492")
+        self.assertEqual(normalize_booking_card_number("M3370492", prefix="M"), "M3370492")
+        self.assertEqual(normalize_booking_card_number("M3370492", prefix="T"), "")
+        with self.assertRaisesRegex(ValueError, "접두사"):
+            normalize_booking_number("3370492", prefix="I")
+
+    def test_extracts_unique_truck_reservations_from_source_c_column(self) -> None:
+        rows = (
+            ("센터", "날짜", "예약번호", "상태"),
+            ("안산2", "2026-08-08", "3370492", "확정"),
+            ("안산2", "2026-08-08", 3370492.0, "확정"),
+            ("안산2", "2026-08-08", "T3370510", "확정"),
+            ("안산2", "2026-08-08", "M9999999", "다른 유형"),
+        )
+
+        self.assertEqual(
+            extract_truck_reservation_numbers(rows),
+            ("T3370492", "T3370510"),
+        )
+        self.assertEqual(
+            extract_booking_numbers(rows, source_column=3, prefix="T"),
+            ("T3370492", "T3370510"),
         )
 
     def test_rowspan_detail_rows_inherit_vendor_and_counts(self) -> None:
@@ -97,6 +142,32 @@ class DailyInboundTests(unittest.TestCase):
 
         self.assertEqual(result[0].pallet_count, "1")
         self.assertEqual(result[0].box_count, "2")
+
+    def test_detail_parser_keeps_truck_reservation_lineage(self) -> None:
+        rows = (
+            (
+                "거래처 (A00001)",
+                "예약 상세 번호",
+                "3",
+                "120",
+                "shipment",
+                "",
+                "123",
+                "상품",
+                "barcode",
+                "120",
+            ),
+        )
+
+        result = parse_detail_table_cells(
+            rows,
+            dispatch_number="T3370492",
+            booking_prefix="T",
+        )
+
+        self.assertEqual(result[0].dispatch_number, "T3370492")
+        self.assertEqual(result[0].pallet_count, "3")
+        self.assertEqual(result[0].box_count, "120")
 
 
 if __name__ == "__main__":
