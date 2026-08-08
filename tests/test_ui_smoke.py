@@ -537,6 +537,8 @@ class MainWindowSmokeTests(unittest.TestCase):
             dialog = SettingsDialog(settings)
             try:
                 self.assertTrue(dialog.excel_path.isReadOnly())
+                self.assertFalse(hasattr(dialog, "base_date_mode"))
+                self.assertFalse(hasattr(dialog, "manual_base_date"))
                 dialog.excel_path.setText(str(target))
                 self.assertIsNotNone(dialog._persist())
                 self.assertEqual(
@@ -546,37 +548,43 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 dialog.close()
 
-    def test_settings_persists_auto_or_manual_base_date(self) -> None:
+    def test_main_window_persists_auto_or_manual_base_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             settings = QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat)
-            dialog = SettingsDialog(settings, memory_path=root / "memory.json")
+            window = MainWindow(smoke_test=True, settings=settings)
             try:
-                self.assertEqual(dialog.base_date_mode.currentData(), "auto")
-                self.assertFalse(dialog.manual_base_date.isEnabled())
+                self.assertEqual(window.base_date_mode.currentData(), "auto")
+                self.assertFalse(window.manual_base_date.isEnabled())
+                self.assertIsNone(window._configured_base_date())
 
-                dialog.base_date_mode.setCurrentIndex(1)
-                dialog.manual_base_date.setDate(QDate(2026, 8, 8))
-                self.assertTrue(dialog.manual_base_date.isEnabled())
-                self.assertIsNotNone(dialog._persist())
+                window.base_date_mode.setCurrentIndex(1)
+                window.manual_base_date.setDate(QDate(2026, 8, 8))
+                self.assertTrue(window.manual_base_date.isEnabled())
 
                 self.assertEqual(settings.value("base_date_mode"), "manual")
                 self.assertEqual(settings.value("manual_base_date"), "2026-08-08")
-            finally:
-                dialog.close()
-
-            window = MainWindow(smoke_test=True)
-            window.settings = settings
-            try:
                 self.assertEqual(window._configured_base_date(), date(2026, 8, 8))
-                settings.setValue("base_date_mode", "auto")
+
+                window._set_automation_working(True)
+                self.assertFalse(window.base_date_mode.isEnabled())
+                self.assertFalse(window.manual_base_date.isEnabled())
+                window._set_automation_working(False)
+                self.assertTrue(window.base_date_mode.isEnabled())
+                self.assertTrue(window.manual_base_date.isEnabled())
+
+                window.base_date_mode.setCurrentIndex(0)
+                self.assertEqual(settings.value("base_date_mode"), "auto")
                 self.assertIsNone(window._configured_base_date())
-                settings.setValue("base_date_mode", "manual")
-                settings.setValue("manual_base_date", "not-a-date")
-                with self.assertRaisesRegex(ValueError, "수동 기준일"):
-                    window._configured_base_date()
             finally:
                 window.close()
+
+            reopened = MainWindow(smoke_test=True, settings=settings)
+            try:
+                self.assertEqual(reopened.base_date_mode.currentData(), "auto")
+                self.assertEqual(reopened.manual_base_date.date(), QDate(2026, 8, 8))
+            finally:
+                reopened.close()
 
     def test_manual_base_date_reaches_milkrun_and_truck_start_button_requests(self) -> None:
         cases = (
@@ -610,8 +618,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 settings.setValue("manual_base_date", "2026-08-08")
                 settings.sync()
 
-                window = MainWindow(smoke_test=True)
-                window.settings = settings
+                window = MainWindow(smoke_test=True, settings=settings)
                 fake_worker = mock.Mock()
                 try:
                     with (
@@ -673,8 +680,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 settings.setValue("manual_base_date", raw_date)
                 settings.sync()
 
-                window = MainWindow(smoke_test=True)
-                window.settings = settings
+                window = MainWindow(smoke_test=True, settings=settings)
                 try:
                     with (
                         patch(
@@ -684,15 +690,21 @@ class MainWindowSmokeTests(unittest.TestCase):
                         patch(validator_path, return_value=workbook),
                         patch("Modules.GUI.MainWindow.MilkrunWorker") as worker_class,
                         patch.object(QMessageBox, "warning") as warning,
-                        patch.object(window, "show_settings") as show_settings,
                     ):
                         getattr(window, button_name).click()
 
                     worker_class.assert_not_called()
                     warning.assert_called_once()
                     self.assertEqual(warning.call_args.args[1], "기준일 확인")
-                    show_settings.assert_called_once_with()
+                    self.assertEqual(window.base_date_mode.currentData(), "invalid")
+                    self.assertIn("메인 화면", warning.call_args.args[2])
                     self.assertIsNone(window.milkrun_worker)
+
+                    window.base_date_mode.setCurrentIndex(
+                        window.base_date_mode.findData("auto")
+                    )
+                    self.assertEqual(window.base_date_mode.findData("invalid"), -1)
+                    self.assertEqual(settings.value("base_date_mode"), "auto")
                 finally:
                     window.milkrun_worker = None
                     window._closing_after_cancel = False

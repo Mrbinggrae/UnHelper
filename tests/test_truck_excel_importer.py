@@ -105,7 +105,8 @@ class TruckExcelImporterTests(unittest.TestCase):
     @staticmethod
     def _headers(count: int = 19) -> list[str]:
         headers = [f"열{index}" for index in range(1, max(count, 19) + 1)]
-        headers[2] = "예약번호"
+        headers[0] = "예약번호"
+        headers[2] = "주문타입"
         headers[12] = "유닛 수"
         headers[13] = "팔렛트 수"
         return headers[:count]
@@ -120,9 +121,9 @@ class TruckExcelImporterTests(unittest.TestCase):
         count: int = 19,
     ) -> list[object]:
         row: list[object] = [""] * count
-        row[0] = first_value
+        row[0] = reservation
         if count >= 3:
-            row[2] = reservation
+            row[2] = first_value
         if count >= 13:
             row[12] = units
         if count >= 14:
@@ -182,7 +183,8 @@ class TruckExcelImporterTests(unittest.TestCase):
             self.assertEqual(result.dispatch_numbers, ("T3370492", "T3370493"))
             self.assertEqual(sheet.clear_range.clear_count, 1)
             self.assertEqual(sheet.destination_coordinates, ((1, 3), (5, 21)))
-            self.assertEqual(sheet.destination.Value2[1][2], "3370492")
+            self.assertEqual(sheet.destination.Value2[1][0], "3370492")
+            self.assertEqual(sheet.destination.Value2[1][2], "첫 상품")
             self.assertEqual(workbook.save_count, 1)
 
             first = result.metrics_by_reservation["T3370492"]
@@ -232,7 +234,7 @@ class TruckExcelImporterTests(unittest.TestCase):
 
     def test_wrong_or_missing_required_headers_are_rejected_before_clear(self) -> None:
         cases = (
-            (2, "발주번호", "C열 예약번호"),
+            (0, "발주번호", "A열 예약번호"),
             (12, "박스 수", "M열 유닛 수"),
             (13, "수량", "N열 팔렛트 수"),
         )

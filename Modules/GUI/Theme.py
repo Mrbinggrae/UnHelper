@@ -52,6 +52,16 @@ QFrame#Footer {
     border: 0;
     border-top: 1px solid #1C2836;
 }
+QFrame#BaseDatePanel {
+    background: #111821;
+    border: 1px solid #253244;
+    border-radius: 9px;
+}
+QLabel#BaseDateLabel {
+    color: #A8B4C2;
+    font-size: 9.5pt;
+    font-weight: 700;
+}
 QFrame#DataCard, QFrame[card="true"] {
     background: #111821;
     border: 1px solid #253244;

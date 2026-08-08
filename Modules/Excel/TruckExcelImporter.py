@@ -69,7 +69,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
     CLEAR_RANGE = "C1:U1000"
     MAX_COLUMNS = 19
 
-    RESERVATION_COLUMN = 3
+    RESERVATION_COLUMN = 1
     UNIT_COUNT_COLUMN = 13
     PALLET_COUNT_COLUMN = 14
     MIN_REQUIRED_COLUMNS = PALLET_COUNT_COLUMN
@@ -117,7 +117,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
             header,
             self.RESERVATION_COLUMN,
             frozenset({self.RESERVATION_HEADER}),
-            "C열 예약번호",
+            "A열 예약번호",
         )
         self._validate_header(
             header,
@@ -144,7 +144,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
                 current_reservation = normalize_truck_reservation_number(raw_reservation)
                 if not current_reservation:
                     raise ExcelImportError(
-                        f"트럭 다운로드 데이터 {row_number}행의 C열 예약번호를 확인할 수 없습니다. "
+                        f"트럭 다운로드 데이터 {row_number}행의 A열 예약번호를 확인할 수 없습니다. "
                         "기존 값을 지우지 않았습니다."
                     )
                 if current_reservation not in source_rows_by_reservation:
@@ -154,7 +154,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
                 continue
             elif not current_reservation:
                 raise ExcelImportError(
-                    f"트럭 다운로드 데이터 {row_number}행의 C열 예약번호가 비어 있어 "
+                    f"트럭 다운로드 데이터 {row_number}행의 A열 예약번호가 비어 있어 "
                     "직전 예약 데이터에 연결할 수 없습니다. 기존 값을 지우지 않았습니다."
                 )
 

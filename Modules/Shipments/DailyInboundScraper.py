@@ -75,7 +75,7 @@ TRUCK_DAILY_INBOUND_PROFILE = DailyInboundProfile(
     display_name="트럭",
     booking_prefix="T",
     number_label="예약번호",
-    source_number_label="C열 예약번호",
+    source_number_label="A열 예약번호",
     detail_href_fragment="/app/inbound-booking/truck/detail",
 )
 

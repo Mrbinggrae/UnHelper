@@ -171,7 +171,7 @@ class MilkrunWorker(QThread):
             else:
                 if is_truck:
                     self.log_updated.emit(
-                        "다운로드 첫 시트 C열의 예약번호를 T 접두사로 변환해 기준일 일별 입고 상세를 조회합니다."
+                        "다운로드 첫 시트 A열의 예약번호를 T 접두사로 변환해 기준일 일별 입고 상세를 조회합니다."
                     )
                 else:
                     self.log_updated.emit(
@@ -467,37 +467,6 @@ class SettingsDialog(QDialog):
         download_row.addWidget(browse)
         file_layout.addLayout(download_row)
 
-        base_date_label = QLabel("조회 기준일")
-        base_date_label.setObjectName("FieldLabel")
-        file_layout.addWidget(base_date_label)
-        base_date_row = QHBoxLayout()
-        self.base_date_mode = QComboBox()
-        self.base_date_mode.addItem("자동 (실행일)", "auto")
-        self.base_date_mode.addItem("수동", "manual")
-        saved_mode = str(self.settings.value("base_date_mode", "auto")).strip().lower()
-        self.base_date_mode.setCurrentIndex(1 if saved_mode == "manual" else 0)
-        self.manual_base_date = QDateEdit()
-        self.manual_base_date.setCalendarPopup(True)
-        self.manual_base_date.setDisplayFormat("yyyy-MM-dd")
-        saved_date = QDate.fromString(
-            str(self.settings.value("manual_base_date", "")),
-            Qt.DateFormat.ISODate,
-        )
-        self.manual_base_date.setDate(saved_date if saved_date.isValid() else QDate.currentDate())
-        self.base_date_mode.currentIndexChanged.connect(self._sync_base_date_controls)
-        base_date_row.addWidget(self.base_date_mode)
-        base_date_row.addWidget(self.manual_base_date)
-        base_date_row.addStretch(1)
-        file_layout.addLayout(base_date_row)
-        base_date_help = QLabel(
-            "자동은 작업 시작일을 사용합니다. 수동 기준일을 선택하면 "
-            "Milkrun은 기준일 전날~기준일, 트럭은 기준일 하루만 조회합니다."
-        )
-        base_date_help.setWordWrap(True)
-        base_date_help.setObjectName("HelpText")
-        file_layout.addWidget(base_date_help)
-        self._sync_base_date_controls()
-
         excel_label = QLabel("Milkrun·트럭 데이터를 반영할 Excel 파일")
         excel_label.setObjectName("FieldLabel")
         file_layout.addWidget(excel_label)
@@ -640,9 +609,6 @@ class SettingsDialog(QDialog):
         if selected:
             self.excel_path.setText(selected)
 
-    def _sync_base_date_controls(self) -> None:
-        self.manual_base_date.setEnabled(self.base_date_mode.currentData() == "manual")
-
     def _persist(self) -> tuple[bool, bool] | None:
         previous_beta = self.settings.value("use_prerelease", False, type=bool)
         next_beta = self.beta_checkbox.isChecked()
@@ -666,11 +632,6 @@ class SettingsDialog(QDialog):
             return None
         self.settings.setValue("download_dir", path)
         self.settings.setValue("milkrun_excel_path", excel_path)
-        self.settings.setValue("base_date_mode", self.base_date_mode.currentData())
-        self.settings.setValue(
-            "manual_base_date",
-            self.manual_base_date.date().toString(Qt.DateFormat.ISODate),
-        )
         self.settings.setValue("use_prerelease", next_beta)
         self.settings.sync()
         return previous_beta != next_beta, next_beta
@@ -729,11 +690,17 @@ class SettingsDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, smoke_test: bool = False):
+    def __init__(
+        self,
+        smoke_test: bool = False,
+        *,
+        settings: QSettings | None = None,
+    ):
         super().__init__()
         self.setObjectName("MainWindow")
         self.smoke_test = smoke_test
-        self.settings = QSettings("Mrbinggrae", "UnHelper")
+        self.settings = settings if settings is not None else QSettings("Mrbinggrae", "UnHelper")
+        self._base_date_load_error = ""
         self.milkrun_worker: MilkrunWorker | None = None
         self.weight_worker: ProductWeightWorker | None = None
         self.product_memory_file = product_memory_path()
@@ -801,6 +768,35 @@ class MainWindow(QMainWindow):
         title_col.addWidget(version)
         header_layout.addLayout(title_col)
         header_layout.addStretch(1)
+
+        base_date_panel = QFrame()
+        base_date_panel.setObjectName("BaseDatePanel")
+        base_date_layout = QHBoxLayout(base_date_panel)
+        base_date_layout.setContentsMargins(10, 5, 10, 5)
+        base_date_layout.setSpacing(8)
+        base_date_label = QLabel("기준일")
+        base_date_label.setObjectName("BaseDateLabel")
+        self.base_date_mode = QComboBox()
+        self.base_date_mode.setObjectName("BaseDateMode")
+        self.base_date_mode.addItem("자동 (실행일)", "auto")
+        self.base_date_mode.addItem("수동", "manual")
+        self.base_date_mode.setMinimumWidth(122)
+        self.manual_base_date = QDateEdit()
+        self.manual_base_date.setObjectName("ManualBaseDate")
+        self.manual_base_date.setCalendarPopup(True)
+        self.manual_base_date.setDisplayFormat("yyyy-MM-dd")
+        self.manual_base_date.setMinimumWidth(112)
+        self.manual_base_date.setToolTip(
+            "Milkrun은 기준일 전날~기준일, 트럭은 기준일 하루만 조회합니다."
+        )
+        self._load_base_date_controls()
+        self.base_date_mode.currentIndexChanged.connect(self._on_base_date_changed)
+        self.manual_base_date.dateChanged.connect(self._on_base_date_changed)
+        base_date_layout.addWidget(base_date_label)
+        base_date_layout.addWidget(self.base_date_mode)
+        base_date_layout.addWidget(self.manual_base_date)
+        header_layout.addWidget(base_date_panel)
+
         self.settings_button = QPushButton("설정")
         self.settings_button.setObjectName("SettingsButton")
         self.settings_button.setFixedSize(82, 40)
@@ -999,23 +995,67 @@ class MainWindow(QMainWindow):
     def start_truck_download(self) -> None:
         self._start_booking_download("truck")
 
+    def _load_base_date_controls(self) -> None:
+        saved_mode = str(self.settings.value("base_date_mode", "auto")).strip().lower()
+        saved_date = QDate.fromString(
+            str(self.settings.value("manual_base_date", "")),
+            Qt.DateFormat.ISODate,
+        )
+        invalid_mode = saved_mode not in {"auto", "manual"}
+        invalid_manual_date = saved_mode == "manual" and not saved_date.isValid()
+        if invalid_mode or invalid_manual_date:
+            self.base_date_mode.addItem("선택 필요", "invalid")
+            self.base_date_mode.setCurrentIndex(self.base_date_mode.count() - 1)
+            self._base_date_load_error = (
+                "저장된 기준일 선택 방식을 읽을 수 없습니다. "
+                if invalid_mode
+                else "저장된 수동 기준일을 읽을 수 없습니다. "
+            ) + "메인 화면에서 자동 또는 수동 기준일을 다시 선택해 주세요."
+        else:
+            self.base_date_mode.setCurrentIndex(1 if saved_mode == "manual" else 0)
+        self.manual_base_date.setDate(
+            saved_date if saved_date.isValid() else QDate.currentDate()
+        )
+        self._sync_base_date_controls()
+
+    def _on_base_date_changed(self, *_args) -> None:
+        mode = self.base_date_mode.currentData()
+        self._sync_base_date_controls()
+        if mode not in {"auto", "manual"}:
+            return
+        self._base_date_load_error = ""
+        invalid_index = self.base_date_mode.findData("invalid")
+        if invalid_index >= 0:
+            self.base_date_mode.blockSignals(True)
+            self.base_date_mode.removeItem(invalid_index)
+            self.base_date_mode.blockSignals(False)
+        self.settings.setValue("base_date_mode", mode)
+        self.settings.setValue(
+            "manual_base_date",
+            self.manual_base_date.date().toString(Qt.DateFormat.ISODate),
+        )
+        self.settings.sync()
+
+    def _sync_base_date_controls(self) -> None:
+        working = self._automation_worker_running()
+        self.base_date_mode.setEnabled(not working)
+        self.manual_base_date.setEnabled(
+            not working and self.base_date_mode.currentData() == "manual"
+        )
+
     def _configured_base_date(self) -> date | None:
-        mode = str(self.settings.value("base_date_mode", "auto")).strip().lower()
+        mode = self.base_date_mode.currentData()
         if mode not in {"auto", "manual"}:
             raise ValueError(
-                "저장된 기준일 선택 방식을 읽을 수 없습니다. "
-                "설정에서 자동 또는 수동을 다시 선택해 주세요."
+                self._base_date_load_error
+                or "메인 화면에서 자동 또는 수동 기준일을 선택해 주세요."
             )
         if mode == "auto":
             return None
-        raw_base_date = str(self.settings.value("manual_base_date", "")).strip()
-        try:
-            return date.fromisoformat(raw_base_date)
-        except ValueError as exc:
-            raise ValueError(
-                "저장된 수동 기준일을 읽을 수 없습니다. "
-                "설정에서 기준일을 다시 선택해 주세요."
-            ) from exc
+        selected = self.manual_base_date.date()
+        if not selected.isValid():
+            raise ValueError("메인 화면에서 올바른 수동 기준일을 선택해 주세요.")
+        return date(selected.year(), selected.month(), selected.day())
 
     def _start_booking_download(self, booking_type: str) -> None:
         if self._automation_worker_running():
@@ -1054,7 +1094,7 @@ class MainWindow(QMainWindow):
             base_date = self._configured_base_date()
         except ValueError as exc:
             QMessageBox.warning(self, "기준일 확인", str(exc))
-            self.show_settings()
+            self.base_date_mode.setFocus()
             return
         if is_truck:
             from Modules.Shipments.TruckDownloader import TruckDownloadRequest
@@ -2094,6 +2134,10 @@ class MainWindow(QMainWindow):
         self.get_data_button.setEnabled(not working)
         self.truck_get_data_button.setEnabled(not working)
         self.settings_button.setEnabled(not working)
+        self.base_date_mode.setEnabled(not working)
+        self.manual_base_date.setEnabled(
+            not working and self.base_date_mode.currentData() == "manual"
+        )
         for button in (self.stop_button, self.truck_stop_button):
             button.setVisible(working)
             button.setEnabled(working)

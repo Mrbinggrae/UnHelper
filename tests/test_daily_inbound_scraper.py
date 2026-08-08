@@ -147,7 +147,7 @@ class DailyInboundScraperTests(unittest.TestCase):
                 center_name="안산2",
                 schedule_date=date(2026, 8, 8),
             )
-        self.assertIn("C열 예약번호", str(raised.exception))
+        self.assertIn("A열 예약번호", str(raised.exception))
         self.assertIn("트럭", str(raised.exception))
 
     def test_distinct_display_rows_are_not_deduplicated_by_sku_alone(self) -> None:

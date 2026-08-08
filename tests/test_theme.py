@@ -49,6 +49,9 @@ class DarkThemeTests(unittest.TestCase):
             self.assertEqual(window.log_view.objectName(), "LogView")
             self.assertEqual(window.settings_button.objectName(), "SettingsButton")
             self.assertEqual(window.settings_button.height(), 40)
+            self.assertIsNotNone(window.findChild(QFrame, "BaseDatePanel"))
+            self.assertEqual(window.base_date_mode.objectName(), "BaseDateMode")
+            self.assertEqual(window.manual_base_date.objectName(), "ManualBaseDate")
             self.assertIsNotNone(window.findChild(QFrame, "DataCard"))
             self.assertFalse(window.grab().isNull())
         finally:
