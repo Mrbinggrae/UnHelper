@@ -434,6 +434,46 @@ class ProductMemory:
         measured_at: str | None = None,
     ) -> ProductMemoryRecord:
         """Persist a successful WMS measurement before pallet inputs are usable."""
+        return self._upsert_weight(
+            sku_id,
+            product_name,
+            weight_grams,
+            measured_at=measured_at,
+            preserve_existing_state=False,
+        )
+
+    def upsert_weight_only(
+        self,
+        sku_id: Any,
+        product_name: Any,
+        weight_grams: Any,
+        *,
+        measured_at: str | None = None,
+    ) -> ProductMemoryRecord:
+        """Update WMS weight without changing existing classification/calculation state.
+
+        A multi-SKU Truck reservation cannot safely attach a reservation-level
+        unit/pallet calculation to each individual SKU. Existing global SKU
+        classifications therefore remain untouched; a brand-new SKU is stored
+        as a weight-only record.
+        """
+        return self._upsert_weight(
+            sku_id,
+            product_name,
+            weight_grams,
+            measured_at=measured_at,
+            preserve_existing_state=True,
+        )
+
+    def _upsert_weight(
+        self,
+        sku_id: Any,
+        product_name: Any,
+        weight_grams: Any,
+        *,
+        measured_at: str | None,
+        preserve_existing_state: bool,
+    ) -> ProductMemoryRecord:
         key = normalize_sku_id(sku_id)
         name = normalize_product_name(product_name)
         weight = _positive_decimal(weight_grams, "상품 무게(g)")
@@ -441,14 +481,40 @@ class ProductMemory:
 
         with self._lock:
             previous = self._records.get(key)
+            if (
+                preserve_existing_state
+                and previous is not None
+                and previous.boxes_per_pallet is not None
+                and previous.weight_grams != weight
+            ):
+                raise ValueError(
+                    f"SKU {key}의 기존 팔렛트 계산값을 유지하면서 WMS 무게를 "
+                    "변경할 수 없습니다. 계산값을 먼저 다시 산출해야 합니다."
+                )
             record = ProductMemoryRecord(
                 sku_id=key,
                 product_name=name or (previous.product_name if previous else ""),
                 weight_grams=weight,
-                automatic_category="",
-                category_override=_override_after_automatic_recalculation(previous),
-                boxes_per_pallet=None,
-                pallet_weight_kg=None,
+                automatic_category=(
+                    previous.automatic_category
+                    if preserve_existing_state and previous is not None
+                    else ""
+                ),
+                category_override=(
+                    previous.category_override
+                    if preserve_existing_state and previous is not None
+                    else _override_after_automatic_recalculation(previous)
+                ),
+                boxes_per_pallet=(
+                    previous.boxes_per_pallet
+                    if preserve_existing_state and previous is not None
+                    else None
+                ),
+                pallet_weight_kg=(
+                    previous.pallet_weight_kg
+                    if preserve_existing_state and previous is not None
+                    else None
+                ),
                 measured_at=measured_timestamp,
                 updated_at=_now_iso(),
             )

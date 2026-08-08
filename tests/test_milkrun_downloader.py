@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import unittest
+import sys
 import tempfile
+import unittest
 from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
@@ -11,15 +12,84 @@ from selenium.webdriver.common.by import By
 from Modules.Shipments.MilkrunDownloader import (
     HistoryEntry,
     MilkrunDownloadRequest,
+    MilkrunDownloadResult,
     MilkrunDownloader,
 )
 from Modules.Shipments.TruckDownloader import (
     TruckDownloadRequest,
+    TruckDownloadResult,
     TruckDownloader,
 )
 
 
 class MilkrunDownloaderTests(unittest.TestCase):
+    def test_request_defaults_base_date_to_the_execution_date(self) -> None:
+        expected = date(2026, 8, 9)
+
+        class FrozenDate(date):
+            @classmethod
+            def today(cls) -> date:
+                return expected
+
+        module = sys.modules[MilkrunDownloadRequest.__module__]
+        with mock.patch.object(module, "date", FrozenDate):
+            self.assertEqual(
+                MilkrunDownloadRequest(Path("downloads")).resolve_base_date(),
+                expected,
+            )
+            self.assertEqual(
+                TruckDownloadRequest(Path("downloads")).resolve_base_date(),
+                expected,
+            )
+
+    def test_request_supports_legacy_today_and_new_base_date(self) -> None:
+        expected = date(2026, 8, 8)
+
+        legacy = MilkrunDownloadRequest(Path("downloads"), "안산2", expected)
+        manual = MilkrunDownloadRequest(Path("downloads"), base_date=expected)
+        truck_manual = TruckDownloadRequest(Path("downloads"), base_date=expected)
+
+        self.assertEqual(legacy.resolve_base_date(), expected)
+        self.assertEqual(manual.resolve_base_date(), expected)
+        self.assertEqual(truck_manual.resolve_base_date(), expected)
+
+    def test_request_rejects_conflicting_legacy_and_new_base_dates(self) -> None:
+        request = MilkrunDownloadRequest(
+            Path("downloads"),
+            today=date(2026, 8, 8),
+            base_date=date(2026, 8, 9),
+        )
+
+        with self.assertRaisesRegex(ValueError, "서로 다른 기준일"):
+            request.resolve_base_date()
+
+    def test_legacy_result_constructor_derives_base_date_from_end_date(self) -> None:
+        milkrun = MilkrunDownloadResult(
+            Path("milkrun.csv"),
+            date(2026, 8, 7),
+            date(2026, 8, 8),
+            "08.07-08.08",
+        )
+        truck = TruckDownloadResult(
+            Path("truck.csv"),
+            date(2026, 8, 8),
+            date(2026, 8, 8),
+            "08.08",
+        )
+
+        self.assertEqual(milkrun.base_date, date(2026, 8, 8))
+        self.assertEqual(truck.base_date, date(2026, 8, 8))
+
+    def test_result_rejects_base_date_different_from_end_date(self) -> None:
+        with self.assertRaisesRegex(ValueError, "조회 종료일"):
+            MilkrunDownloadResult(
+                Path("milkrun.csv"),
+                date(2026, 8, 7),
+                date(2026, 8, 8),
+                "08.07-08.08",
+                base_date=date(2026, 8, 9),
+            )
+
     def test_milkrun_and_truck_resolve_distinct_date_ranges(self) -> None:
         today = date(2026, 8, 8)
 
@@ -316,9 +386,12 @@ class MilkrunDownloaderTests(unittest.TestCase):
                 "_open_download_history",
                 "_download_latest_history_file",
             )
-            patches = [mock.patch.object(downloader, name) for name in no_op_methods]
-            for patcher in patches:
-                patcher.start()
+            patches = {
+                name: mock.patch.object(downloader, name) for name in no_op_methods
+            }
+            patched_methods = {
+                name: patcher.start() for name, patcher in patches.items()
+            }
             try:
                 with (
                     mock.patch.object(downloader, "_build_driver", return_value=fake_driver),
@@ -329,18 +402,34 @@ class MilkrunDownloaderTests(unittest.TestCase):
                     mock.patch.object(downloader, "close") as close,
                 ):
                     result = downloader.run(
-                        MilkrunDownloadRequest(download_dir=root, today=date(2026, 8, 8)),
+                        MilkrunDownloadRequest(
+                            download_dir=root,
+                            base_date=date(2026, 8, 8),
+                        ),
                         keep_browser_open=True,
                     )
 
                 self.assertEqual(result.file_path, root / "milkrun.csv")
+                self.assertEqual(result.start_date, date(2026, 8, 7))
+                self.assertEqual(result.end_date, date(2026, 8, 8))
+                self.assertEqual(result.base_date, date(2026, 8, 8))
+                self.assertEqual(result.reason, "08.07-08.08")
+                patched_methods["_set_date_range"].assert_called_once_with(
+                    date(2026, 8, 7),
+                    date(2026, 8, 8),
+                )
+                patched_methods["_submit_download_reason"].assert_called_once_with(
+                    "08.07-08.08"
+                )
+                history_call = patched_methods["_download_latest_history_file"].call_args
+                self.assertEqual(history_call.args[0], "08.07-08.08")
                 self.assertIs(downloader.driver, fake_driver)
                 close.assert_not_called()
                 self.assertFalse(
                     any(path.name.startswith(downloader.STAGING_PREFIX) for path in root.iterdir())
                 )
             finally:
-                for patcher in reversed(patches):
+                for patcher in reversed(tuple(patches.values())):
                     patcher.stop()
 
     def test_truck_run_uses_today_for_calendar_reason_and_csv_download(self) -> None:
@@ -370,7 +459,10 @@ class MilkrunDownloaderTests(unittest.TestCase):
                 mock.patch.object(downloader, "_close_request_confirmation"),
                 mock.patch.object(downloader, "_open_download_history"),
                 mock.patch.object(downloader, "_download_snapshot", return_value={}),
-                mock.patch.object(downloader, "_download_latest_history_file"),
+                mock.patch.object(
+                    downloader,
+                    "_download_latest_history_file",
+                ) as download_history,
                 mock.patch.object(downloader, "_wait_for_download", side_effect=create_staged_file),
                 mock.patch.object(downloader, "close") as close,
             ):
@@ -381,6 +473,10 @@ class MilkrunDownloaderTests(unittest.TestCase):
 
             set_date_range.assert_called_once_with(date(2026, 8, 8), date(2026, 8, 8))
             submit_reason.assert_called_once_with("08.08")
+            self.assertEqual(download_history.call_args.args[0], "08.08")
+            self.assertEqual(result.start_date, date(2026, 8, 8))
+            self.assertEqual(result.end_date, date(2026, 8, 8))
+            self.assertEqual(result.base_date, date(2026, 8, 8))
             self.assertEqual(result.reason, "08.08")
             self.assertEqual(result.file_path.name, "TRUCK_BOOKING_LIST_20260808.csv")
             self.assertIs(downloader.driver, fake_driver)

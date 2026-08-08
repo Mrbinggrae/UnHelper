@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import date
 from pathlib import Path
 from decimal import Decimal
 from unittest.mock import patch
@@ -11,14 +12,18 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QThread
+from PySide6.QtCore import QDate, QSettings, QThread
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from Modules.Common.Credentials import WMSCredentialStore
+from Modules.Common.ErrorReport import FailureDetails
 from Modules.GUI.MainWindow import MainWindow, SettingsDialog, _open_product_memory_with_recovery
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
 from Modules.Shipments.DailyInbound import MilkrunProductRow
+from Modules.Shipments.MilkrunDownloader import MilkrunDownloadRequest
+from Modules.Shipments.TruckDownloader import TruckDownloadRequest
 from Modules.WMS.ProductMemory import ProductMemory
+from Modules.WMS.ProductWeightWorker import ProductWeightSummary, SkuWeightFailure
 
 
 class BriefWorker(QThread):
@@ -32,11 +37,14 @@ class RunningWorker:
 
 
 class FinishedWorker:
+    def __init__(self) -> None:
+        self.cancel_requests = 0
+
     def isRunning(self) -> bool:
         return False
 
     def request_cancel(self) -> None:
-        pass
+        self.cancel_requests += 1
 
     def deleteLater(self) -> None:
         pass
@@ -87,6 +95,319 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.truck_table.item(0, 3).text(), "2")
             self.assertEqual(window.truck_table.item(0, 4).text(), "2")
             self.assertGreaterEqual(window.truck_table.columnWidth(9), 84)
+        finally:
+            window.close()
+
+    def test_multi_sku_truck_merges_pallet_and_category_without_persisting_group_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow(
+                        "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                        "123", "상품 A", "T3372829",
+                    ),
+                    MilkrunProductRow(
+                        "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                        "456", "상품 B", "T3372829",
+                    ),
+                )
+                window._populate_truck_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                first = memory.upsert_measurement("123", "상품 A", "1000", "20", "2")
+                first = memory.set_manual_category("123", "고단")
+                second = memory.upsert_measurement("456", "상품 B", "2000", "20", "2")
+                second = memory.set_manual_category("456", "중량")
+
+                window._render_weight_record(first, "truck")
+                window._render_weight_record(second, "truck")
+
+                self.assertEqual(window.truck_table.rowSpan(0, 2), 2)
+                self.assertEqual(window.truck_table.rowSpan(0, 9), 2)
+                self.assertEqual(window.truck_table.item(0, 1).text(), "T3372829")
+                self.assertEqual(window.truck_table.item(1, 1).text(), "T3372829")
+                self.assertEqual(window.truck_table.item(0, 7).text(), "1000")
+                self.assertEqual(window.truck_table.item(1, 7).text(), "2000")
+                self.assertEqual(window.truck_table.item(0, 8).text(), "?")
+                self.assertEqual(window.truck_table.item(1, 8).text(), "?")
+                group_button = window.truck_table.cellWidget(0, 9)
+                self.assertIsNone(window.truck_table.cellWidget(1, 9))
+                self.assertEqual(group_button.text(), "?")
+                memory_bytes = window.product_memory_file.read_bytes()
+
+                group_button.click()
+
+                self.assertEqual(group_button.text(), "경량")
+                self.assertEqual(window.product_memory_file.read_bytes(), memory_bytes)
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "고단",
+                )
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("456").category_override,
+                    "중량",
+                )
+
+                window._populate_truck_products((products[0],))
+                self.assertEqual(window._truck_group_categories, {})
+                self.assertEqual(window.truck_table.rowSpan(0, 2), 1)
+                self.assertEqual(window.truck_table.rowSpan(0, 9), 1)
+            finally:
+                window.close()
+
+    def test_multi_sku_milkrun_uses_milkrun_number_group_and_keeps_choice_ephemeral(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow(
+                        "거래처 A", "10813478", "2", "20", "123", "상품 A", "M3370492"
+                    ),
+                    MilkrunProductRow(
+                        "거래처 B", "10799314", "1", "5", "789", "다른 밀크런", "M3370492"
+                    ),
+                    MilkrunProductRow(
+                        "거래처 A", "10813478", "2", "20", "456", "상품 B", "M3370492"
+                    ),
+                )
+                window._populate_milkrun_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                first = memory.upsert_measurement("123", "상품 A", "1000", "20", "2")
+                first = memory.set_manual_category("123", "고단")
+                second = memory.upsert_measurement("456", "상품 B", "2000", "20", "2")
+                second = memory.set_manual_category("456", "중량")
+
+                window._render_weight_record(first, "milkrun")
+                window._render_weight_record(second, "milkrun")
+
+                self.assertEqual(
+                    tuple(window.raw_table.item(row, 1).text() for row in range(3)),
+                    ("10813478", "10813478", "10799314"),
+                )
+                self.assertEqual(window.raw_table.rowSpan(0, 2), 2)
+                self.assertEqual(window.raw_table.rowSpan(0, 9), 2)
+                self.assertEqual(window.raw_table.item(0, 7).text(), "1000")
+                self.assertEqual(window.raw_table.item(1, 7).text(), "2000")
+                self.assertEqual(window.raw_table.item(0, 8).text(), "?")
+                self.assertEqual(window.raw_table.item(1, 8).text(), "?")
+                group_button = window.raw_table.cellWidget(0, 9)
+                self.assertEqual(group_button.text(), "?")
+                self.assertIsNone(window.raw_table.cellWidget(1, 9))
+                self.assertIsNotNone(window.raw_table.cellWidget(2, 9))
+                memory_bytes = window.product_memory_file.read_bytes()
+
+                group_button.click()
+
+                self.assertEqual(group_button.text(), "경량")
+                self.assertEqual(window.product_memory_file.read_bytes(), memory_bytes)
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "고단",
+                )
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("456").category_override,
+                    "중량",
+                )
+
+                window._refresh_current_product_memory()
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "경량")
+                self.assertEqual(window.product_memory_file.read_bytes(), memory_bytes)
+
+                window._populate_milkrun_products((products[0],))
+                self.assertEqual(window._milkrun_group_categories, {})
+                self.assertEqual(window.raw_table.rowSpan(0, 2), 1)
+                self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
+            finally:
+                window.close()
+
+    def test_multi_sku_milkrun_weight_refresh_clears_stale_failure_tooltip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "123", "상품 A"),
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "456", "상품 B"),
+                )
+                window._populate_milkrun_products(products)
+                failure = SkuWeightFailure(
+                    sku_id="123",
+                    product_name="상품 A",
+                    details=FailureDetails(summary="이전 WMS 실패", detail="이전 WMS 실패"),
+                )
+
+                window._on_weight_sku_failed(failure)
+                self.assertEqual(window.raw_table.item(0, 7).toolTip(), "이전 WMS 실패")
+
+                record = ProductMemory(window.product_memory_file).upsert_weight_only(
+                    "123", "상품 A", "1000"
+                )
+                window._render_weight_record(record, "milkrun")
+                self.assertEqual(window.raw_table.item(0, 7).text(), "1000")
+                self.assertEqual(window.raw_table.item(0, 7).toolTip(), "")
+
+                window._on_weight_sku_failed(failure)
+                window._render_unknown_sku("123", "milkrun")
+                self.assertEqual(window.raw_table.item(0, 7).text(), "-")
+                self.assertEqual(window.raw_table.item(0, 7).toolTip(), "")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
+            finally:
+                window.close()
+
+    def test_sku_shared_by_multi_and_single_truck_ignores_saved_light_heavy_only_in_display(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow(
+                        "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                        "123", "공유 상품", "T11111",
+                    ),
+                    MilkrunProductRow(
+                        "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                        "456", "다중 상품", "T11111",
+                    ),
+                    MilkrunProductRow(
+                        "트럭 거래처", "상세", Decimal("1"), Decimal("2"),
+                        "123", "공유 상품", "T22222",
+                    ),
+                )
+                window._populate_truck_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                shared = memory.upsert_measurement("123", "공유 상품", "1000", "300", "1")
+                shared = memory.set_manual_category("123", "중량")
+
+                window._render_weight_record(shared, "truck")
+
+                self.assertEqual(window.truck_table.item(0, 8).text(), "?")
+                self.assertEqual(window.truck_table.cellWidget(0, 9).text(), "?")
+                self.assertEqual(window.truck_table.item(2, 8).text(), "2")
+                self.assertEqual(window.truck_table.cellWidget(2, 9).text(), "경량")
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "중량",
+                )
+            finally:
+                window.close()
+
+    def test_sku_shared_by_multi_and_single_milkrun_recalculates_only_single_display(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "123", "공유 상품", "M1"),
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "456", "다중 상품", "M1"),
+                    MilkrunProductRow("거래처", "10799314", "1", "2", "123", "공유 상품", "M1"),
+                )
+                window._populate_milkrun_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                shared = memory.upsert_measurement("123", "공유 상품", "1000", "300", "1")
+                shared = memory.set_manual_category("123", "중량")
+
+                window._render_weight_record(shared, "milkrun")
+
+                self.assertEqual(window.raw_table.item(0, 8).text(), "?")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
+                self.assertEqual(window.raw_table.item(2, 8).text(), "2")
+                self.assertEqual(window.raw_table.cellWidget(2, 9).text(), "경량")
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "중량",
+                )
+            finally:
+                window.close()
+
+    def test_multi_sku_truck_failure_stays_on_weight_cell_and_keeps_group_button(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            products = (
+                MilkrunProductRow(
+                    "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                    "123", "상품 A", "T3372829",
+                ),
+                MilkrunProductRow(
+                    "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                    "456", "상품 B", "T3372829",
+                ),
+            )
+            window._populate_truck_products(products)
+            group_button = window.truck_table.cellWidget(0, 9)
+            original_tooltip = group_button.toolTip()
+
+            for row_index, sku_id in enumerate(("123", "456")):
+                summary = f"SKU {sku_id} 조회 실패"
+                window._on_weight_sku_failed(
+                    SkuWeightFailure(
+                        sku_id=sku_id,
+                        product_name=f"상품 {sku_id}",
+                        details=FailureDetails(summary=summary, detail=summary),
+                    )
+                )
+                self.assertEqual(window.truck_table.item(row_index, 7).toolTip(), summary)
+
+            self.assertEqual(group_button.text(), "?")
+            self.assertEqual(group_button.toolTip(), original_tooltip)
+            self.assertIsNone(window.truck_table.cellWidget(1, 9))
+        finally:
+            window.close()
+
+    def test_multi_sku_truck_completion_does_not_claim_classification_complete(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            products = (
+                MilkrunProductRow(
+                    "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                    "123", "상품 A", "T3372829",
+                ),
+                MilkrunProductRow(
+                    "트럭 거래처", "상세", Decimal("2"), Decimal("20"),
+                    "456", "상품 B", "T3372829",
+                ),
+            )
+            window._populate_truck_products(products)
+            window._pending_weight_summary = ProductWeightSummary(
+                total_skus=2,
+                cache_hits=2,
+                wms_successes=0,
+                failures=(),
+            )
+
+            with patch.object(QMessageBox, "warning") as warning:
+                window._finalize_weight_lookup()
+
+            message = warning.call_args.args[2]
+            self.assertIn("WMS SKU별 유닛 무게 확인을 완료했습니다.", message)
+            self.assertIn("다중 SKU 예약 수동 분류", message)
+            self.assertNotIn("WMS 무게 분류를 완료했습니다.", message)
+        finally:
+            window.close()
+
+    def test_multi_sku_milkrun_completion_requires_group_classification(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            products = (
+                MilkrunProductRow("거래처", "10813478", "2", "20", "123", "상품 A"),
+                MilkrunProductRow("거래처", "10813478", "2", "20", "456", "상품 B"),
+            )
+            window._populate_milkrun_products(products)
+            window._pending_weight_summary = ProductWeightSummary(
+                total_skus=2,
+                cache_hits=2,
+                wms_successes=0,
+                failures=(),
+            )
+
+            with patch.object(QMessageBox, "warning") as warning:
+                window._finalize_weight_lookup()
+
+            message = warning.call_args.args[2]
+            self.assertIn("WMS SKU별 상품 무게 확인을 완료했습니다.", message)
+            self.assertIn("다중 SKU 밀크런 수동 분류", message)
+            self.assertNotIn("WMS 무게 분류를 완료했습니다.", message)
         finally:
             window.close()
 
@@ -160,6 +481,53 @@ class MainWindowSmokeTests(unittest.TestCase):
             window._closing_after_cancel = False
             window.close()
 
+    def test_stop_intent_blocks_queued_booking_completion_from_starting_wms(self) -> None:
+        window = MainWindow(smoke_test=True)
+        worker = FinishedWorker()
+        window.milkrun_worker = worker
+        try:
+            window.cancel_milkrun_download()
+
+            self.assertEqual(worker.cancel_requests, 1)
+            self.assertTrue(window._automation_cancel_requested)
+            self.assertEqual(window.status_label.text(), "작업 중지 중...")
+            with patch.object(window, "_start_weight_lookup") as start_weight:
+                window._on_milkrun_completed(object())
+            start_weight.assert_not_called()
+            self.assertEqual(window.status_label.text(), "작업 취소됨")
+        finally:
+            window.milkrun_worker = None
+            window._automation_cancel_requested = False
+            window.close()
+
+    def test_stop_intent_converts_queued_weight_completion_to_cancelled(self) -> None:
+        window = MainWindow(smoke_test=True)
+        worker = FinishedWorker()
+        window.weight_worker = worker
+        try:
+            window.cancel_milkrun_download()
+            window._on_weight_completed(
+                ProductWeightSummary(
+                    total_skus=1,
+                    cache_hits=1,
+                    wms_successes=0,
+                    failures=(),
+                )
+            )
+
+            self.assertEqual(worker.cancel_requests, 1)
+            self.assertTrue(window._automation_cancel_requested)
+            self.assertIsNone(window._pending_weight_summary)
+            self.assertIn("중지", window._pending_weight_cancel)
+            with patch.object(QMessageBox, "information") as information:
+                window._on_weight_finished()
+            self.assertIsNone(window.weight_worker)
+            self.assertEqual(information.call_args.args[1], "WMS 무게 조회 취소")
+        finally:
+            window.weight_worker = None
+            window._automation_cancel_requested = False
+            window.close()
+
     def test_settings_persists_linked_milkrun_excel_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -177,6 +545,158 @@ class MainWindowSmokeTests(unittest.TestCase):
                 )
             finally:
                 dialog.close()
+
+    def test_settings_persists_auto_or_manual_base_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(str(root / "settings.ini"), QSettings.Format.IniFormat)
+            dialog = SettingsDialog(settings, memory_path=root / "memory.json")
+            try:
+                self.assertEqual(dialog.base_date_mode.currentData(), "auto")
+                self.assertFalse(dialog.manual_base_date.isEnabled())
+
+                dialog.base_date_mode.setCurrentIndex(1)
+                dialog.manual_base_date.setDate(QDate(2026, 8, 8))
+                self.assertTrue(dialog.manual_base_date.isEnabled())
+                self.assertIsNotNone(dialog._persist())
+
+                self.assertEqual(settings.value("base_date_mode"), "manual")
+                self.assertEqual(settings.value("manual_base_date"), "2026-08-08")
+            finally:
+                dialog.close()
+
+            window = MainWindow(smoke_test=True)
+            window.settings = settings
+            try:
+                self.assertEqual(window._configured_base_date(), date(2026, 8, 8))
+                settings.setValue("base_date_mode", "auto")
+                self.assertIsNone(window._configured_base_date())
+                settings.setValue("base_date_mode", "manual")
+                settings.setValue("manual_base_date", "not-a-date")
+                with self.assertRaisesRegex(ValueError, "수동 기준일"):
+                    window._configured_base_date()
+            finally:
+                window.close()
+
+    def test_manual_base_date_reaches_milkrun_and_truck_start_button_requests(self) -> None:
+        cases = (
+            (
+                "milkrun",
+                "get_data_button",
+                MilkrunDownloadRequest,
+                "Modules.GUI.MainWindow.MilkrunExcelImporter.validate_target_path",
+            ),
+            (
+                "truck",
+                "truck_get_data_button",
+                TruckDownloadRequest,
+                "Modules.GUI.MainWindow.TruckExcelImporter.validate_target_path",
+            ),
+        )
+        for booking_type, button_name, request_type, validator_path in cases:
+            with self.subTest(booking_type=booking_type), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                driver = root / "chromedriver.exe"
+                driver.write_bytes(b"driver")
+                workbook = root / "SAN2_입고스케줄관리.xlsx"
+                workbook.write_bytes(b"workbook")
+                settings = QSettings(
+                    str(root / "settings.ini"),
+                    QSettings.Format.IniFormat,
+                )
+                settings.setValue("download_dir", str(root / "downloads"))
+                settings.setValue("milkrun_excel_path", str(workbook))
+                settings.setValue("base_date_mode", "manual")
+                settings.setValue("manual_base_date", "2026-08-08")
+                settings.sync()
+
+                window = MainWindow(smoke_test=True)
+                window.settings = settings
+                fake_worker = mock.Mock()
+                try:
+                    with (
+                        patch(
+                            "Modules.GUI.MainWindow.chromedriver_path",
+                            return_value=driver,
+                        ),
+                        patch(validator_path, return_value=workbook),
+                        patch(
+                            "Modules.GUI.MainWindow.MilkrunWorker",
+                            return_value=fake_worker,
+                        ) as worker_class,
+                    ):
+                        getattr(window, button_name).click()
+
+                    request = worker_class.call_args.args[0]
+                    self.assertIsInstance(request, request_type)
+                    self.assertEqual(request.base_date, date(2026, 8, 8))
+                    self.assertEqual(
+                        worker_class.call_args.kwargs["booking_type"],
+                        booking_type,
+                    )
+                    fake_worker.start.assert_called_once_with()
+                finally:
+                    window.milkrun_worker = None
+                    window._closing_after_cancel = False
+                    window.close()
+
+    def test_corrupt_base_date_mode_or_value_warns_without_starting_worker(self) -> None:
+        cases = (
+            (
+                "invalid mode",
+                "get_data_button",
+                "broken-mode",
+                "2026-08-08",
+                "Modules.GUI.MainWindow.MilkrunExcelImporter.validate_target_path",
+            ),
+            (
+                "invalid date",
+                "truck_get_data_button",
+                "manual",
+                "not-a-date",
+                "Modules.GUI.MainWindow.TruckExcelImporter.validate_target_path",
+            ),
+        )
+        for case_name, button_name, mode, raw_date, validator_path in cases:
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                driver = root / "chromedriver.exe"
+                driver.write_bytes(b"driver")
+                workbook = root / "SAN2_입고스케줄관리.xlsx"
+                workbook.write_bytes(b"workbook")
+                settings = QSettings(
+                    str(root / "settings.ini"),
+                    QSettings.Format.IniFormat,
+                )
+                settings.setValue("milkrun_excel_path", str(workbook))
+                settings.setValue("base_date_mode", mode)
+                settings.setValue("manual_base_date", raw_date)
+                settings.sync()
+
+                window = MainWindow(smoke_test=True)
+                window.settings = settings
+                try:
+                    with (
+                        patch(
+                            "Modules.GUI.MainWindow.chromedriver_path",
+                            return_value=driver,
+                        ),
+                        patch(validator_path, return_value=workbook),
+                        patch("Modules.GUI.MainWindow.MilkrunWorker") as worker_class,
+                        patch.object(QMessageBox, "warning") as warning,
+                        patch.object(window, "show_settings") as show_settings,
+                    ):
+                        getattr(window, button_name).click()
+
+                    worker_class.assert_not_called()
+                    warning.assert_called_once()
+                    self.assertEqual(warning.call_args.args[1], "기준일 확인")
+                    show_settings.assert_called_once_with()
+                    self.assertIsNone(window.milkrun_worker)
+                finally:
+                    window.milkrun_worker = None
+                    window._closing_after_cancel = False
+                    window.close()
 
     def test_settings_persists_dpapi_protected_wms_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -209,7 +729,10 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.raw_table.item(0, 4).text(), "72")
             self.assertEqual(window.raw_table.item(1, 5).text(), "72246115")
             self.assertEqual(window.raw_table.item(1, 6).text(), "상품 B")
-            self.assertEqual(window.raw_table.cellWidget(1, 9).text(), "?")
+            self.assertEqual(window.raw_table.rowSpan(0, 2), 2)
+            self.assertEqual(window.raw_table.rowSpan(0, 9), 2)
+            self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
+            self.assertIsNone(window.raw_table.cellWidget(1, 9))
         finally:
             window.close()
 
@@ -301,7 +824,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertIsNone(window.weight_worker)
             self.assertIsNone(window._credential_load_failure)
             self.assertEqual(window._pending_weight_summary.total_skus, 0)
-            self.assertEqual(window.status_label.text(), "오늘 표시할 상품 없음 · WMS 조회 생략")
+            self.assertEqual(window.status_label.text(), "기준일 표시 상품 없음 · WMS 조회 생략")
         finally:
             window.close()
 
@@ -480,7 +1003,10 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 window._refresh_current_product_memory()
 
-                self.assertEqual(window.raw_table.cellWidget(1, 9).text(), "중량")
+                self.assertEqual(window.raw_table.item(1, 7).text(), "1000")
+                self.assertEqual(window.raw_table.item(1, 8).text(), "?")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
+                self.assertIsNone(window.raw_table.cellWidget(1, 9))
                 self.assertIn("123", window._weight_records)
             finally:
                 window.close()
@@ -513,6 +1039,18 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ):
                     dialog._delete_selected()
                 self.assertEqual(len(changes), 2)
+            finally:
+                dialog.close()
+
+    def test_product_memory_dialog_labels_weight_only_record_as_weight_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = ProductMemory(Path(temp) / "memory.json")
+            memory.upsert_weight_only("123", "무게 전용 상품", "1000")
+            dialog = ProductMemoryDialog(memory)
+            try:
+                self.assertEqual(dialog.table.item(0, 2).text(), "1000")
+                self.assertEqual(dialog.table.item(0, 3).text(), "미분류")
+                self.assertEqual(dialog.table.item(0, 4).text(), "무게만")
             finally:
                 dialog.close()
 

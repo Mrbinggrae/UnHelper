@@ -2,28 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 
-from .MilkrunDownloader import MilkrunDownloader
-
-
-@dataclass(frozen=True)
-class TruckDownloadRequest:
-    download_dir: Path
-    center_name: str = "안산2"
-    today: date | None = None
+from .MilkrunDownloader import (
+    MilkrunDownloadRequest,
+    MilkrunDownloadResult,
+    MilkrunDownloader,
+)
 
 
 @dataclass(frozen=True)
-class TruckDownloadResult:
-    file_path: Path
-    start_date: date
-    end_date: date
-    reason: str
+class TruckDownloadRequest(MilkrunDownloadRequest):
+    pass
+
+
+@dataclass(frozen=True)
+class TruckDownloadResult(MilkrunDownloadResult):
+    pass
 
 
 class TruckDownloader(MilkrunDownloader):
-    """Download today's Truck inbound booking list with the shared browser flow."""
+    """Download the selected base date's Truck list with the shared browser flow."""
 
     BOOKING_LIST_HREF = "/app/inbound-booking/truck/list"
     BOOKING_LIST_LABEL = "트럭 입고예약 목록"
@@ -49,4 +47,5 @@ class TruckDownloader(MilkrunDownloader):
             start_date=result.start_date,
             end_date=result.end_date,
             reason=result.reason,
+            base_date=result.base_date,
         )

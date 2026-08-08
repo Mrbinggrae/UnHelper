@@ -327,7 +327,7 @@ QPushButton#CategoryButton[classification="?"] {
     color: #CBD5E1;
 }
 
-QLineEdit, QComboBox {
+QLineEdit, QComboBox, QDateEdit {
     background: #16212C;
     border: 1px solid #34475A;
     border-radius: 8px;
@@ -337,10 +337,10 @@ QLineEdit, QComboBox {
     selection-background-color: #174B63;
     selection-color: #FFFFFF;
 }
-QLineEdit:hover, QComboBox:hover {
+QLineEdit:hover, QComboBox:hover, QDateEdit:hover {
     border-color: #4A6178;
 }
-QLineEdit:focus, QComboBox:focus {
+QLineEdit:focus, QComboBox:focus, QDateEdit:focus {
     border: 2px solid #38BDF8;
     padding: 6px 9px;
 }
@@ -351,7 +351,7 @@ QLineEdit:read-only {
 QLineEdit::placeholder {
     color: #64748B;
 }
-QComboBox::drop-down {
+QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;
     width: 26px;
 }

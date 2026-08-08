@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QDate, QSettings, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
+    QDateEdit,
     QDialog,
     QFileDialog,
     QFrame,
@@ -67,6 +69,7 @@ from Modules.Shipments.DailyInboundScraper import (
     TRUCK_DAILY_INBOUND_PROFILE,
 )
 from Modules.WMS.ProductMemory import (
+    AUTOMATIC_CATEGORIES,
     MANUAL_CATEGORIES,
     ProductMemory,
     ProductMemoryRecord,
@@ -157,7 +160,7 @@ class MilkrunWorker(QThread):
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
             if import_result.rows == 1 and not import_result.dispatch_numbers:
                 self.log_updated.emit(
-                    f"오늘 반영할 {booking_label} 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
+                    f"기준일에 반영할 {booking_label} 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
                 )
                 daily_result = DailyInboundResult(
                     products=(),
@@ -168,11 +171,11 @@ class MilkrunWorker(QThread):
             else:
                 if is_truck:
                     self.log_updated.emit(
-                        "다운로드 첫 시트 C열의 예약번호를 T 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
+                        "다운로드 첫 시트 C열의 예약번호를 T 접두사로 변환해 기준일 일별 입고 상세를 조회합니다."
                     )
                 else:
                     self.log_updated.emit(
-                        "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 오늘 일별 입고 상세를 조회합니다."
+                        "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 기준일 일별 입고 상세를 조회합니다."
                     )
                 scraper_kwargs = {"evidence_dir": self.request.download_dir}
                 if is_truck:
@@ -250,15 +253,28 @@ class MilkrunWorker(QThread):
                 str(product.sku_id).strip()
             )
 
+        grouped_products: dict[str, list] = {}
+        group_order: list[str] = []
+        for product in products:
+            if product.dispatch_number not in grouped_products:
+                grouped_products[product.dispatch_number] = []
+                group_order.append(product.dispatch_number)
+            grouped_products[product.dispatch_number].append(product)
+
         for reservation_number, sku_ids in skus_by_reservation.items():
             if len(sku_ids) > 1:
-                raise DailyInboundError(
-                    f"예약번호 {reservation_number}에서 서로 다른 SKU {len(sku_ids)}개를 "
-                    "확인했습니다. 다운로드의 M/N열은 예약 단위 수량이므로 각 SKU의 "
-                    "팔렛트 무게를 정확히 계산할 수 없습니다. Excel 반영은 완료했지만 "
-                    "잘못된 중량 분류를 막기 위해 WMS 조회를 시작하지 않았습니다."
+                self.log_updated.emit(
+                    f"예약번호 {reservation_number}에 서로 다른 SKU {len(sku_ids)}개가 있어 "
+                    "SKU별 유닛 무게만 확인합니다. 팔렛트 무게와 분류는 "
+                    "표에서 예약 단위로 수동 관리합니다."
                 )
-        return replace(daily_result, products=tuple(products))
+
+        ordered_products = tuple(
+            product
+            for reservation_number in group_order
+            for product in grouped_products[reservation_number]
+        )
+        return replace(daily_result, products=ordered_products)
 
 
 class UpdateCheckWorker(QThread):
@@ -451,6 +467,37 @@ class SettingsDialog(QDialog):
         download_row.addWidget(browse)
         file_layout.addLayout(download_row)
 
+        base_date_label = QLabel("조회 기준일")
+        base_date_label.setObjectName("FieldLabel")
+        file_layout.addWidget(base_date_label)
+        base_date_row = QHBoxLayout()
+        self.base_date_mode = QComboBox()
+        self.base_date_mode.addItem("자동 (실행일)", "auto")
+        self.base_date_mode.addItem("수동", "manual")
+        saved_mode = str(self.settings.value("base_date_mode", "auto")).strip().lower()
+        self.base_date_mode.setCurrentIndex(1 if saved_mode == "manual" else 0)
+        self.manual_base_date = QDateEdit()
+        self.manual_base_date.setCalendarPopup(True)
+        self.manual_base_date.setDisplayFormat("yyyy-MM-dd")
+        saved_date = QDate.fromString(
+            str(self.settings.value("manual_base_date", "")),
+            Qt.DateFormat.ISODate,
+        )
+        self.manual_base_date.setDate(saved_date if saved_date.isValid() else QDate.currentDate())
+        self.base_date_mode.currentIndexChanged.connect(self._sync_base_date_controls)
+        base_date_row.addWidget(self.base_date_mode)
+        base_date_row.addWidget(self.manual_base_date)
+        base_date_row.addStretch(1)
+        file_layout.addLayout(base_date_row)
+        base_date_help = QLabel(
+            "자동은 작업 시작일을 사용합니다. 수동 기준일을 선택하면 "
+            "Milkrun은 기준일 전날~기준일, 트럭은 기준일 하루만 조회합니다."
+        )
+        base_date_help.setWordWrap(True)
+        base_date_help.setObjectName("HelpText")
+        file_layout.addWidget(base_date_help)
+        self._sync_base_date_controls()
+
         excel_label = QLabel("Milkrun·트럭 데이터를 반영할 Excel 파일")
         excel_label.setObjectName("FieldLabel")
         file_layout.addWidget(excel_label)
@@ -593,6 +640,9 @@ class SettingsDialog(QDialog):
         if selected:
             self.excel_path.setText(selected)
 
+    def _sync_base_date_controls(self) -> None:
+        self.manual_base_date.setEnabled(self.base_date_mode.currentData() == "manual")
+
     def _persist(self) -> tuple[bool, bool] | None:
         previous_beta = self.settings.value("use_prerelease", False, type=bool)
         next_beta = self.beta_checkbox.isChecked()
@@ -616,6 +666,11 @@ class SettingsDialog(QDialog):
             return None
         self.settings.setValue("download_dir", path)
         self.settings.setValue("milkrun_excel_path", excel_path)
+        self.settings.setValue("base_date_mode", self.base_date_mode.currentData())
+        self.settings.setValue(
+            "manual_base_date",
+            self.manual_base_date.date().toString(Qt.DateFormat.ISODate),
+        )
         self.settings.setValue("use_prerelease", next_beta)
         self.settings.sync()
         return previous_beta != next_beta, next_beta
@@ -690,6 +745,9 @@ class MainWindow(QMainWindow):
             "truck": None,
         }
         self._active_booking_type = "milkrun"
+        self._milkrun_group_categories: dict[str, str] = {}
+        self._truck_group_categories: dict[str, str] = {}
+        self._session_manual_category_skus: set[str] = set()
         self._weight_records: dict[str, ProductMemoryRecord] = {}
         self._weight_failures: dict[str, SkuWeightFailure] = {}
         self._weight_row_errors: dict[str, str] = {}
@@ -705,6 +763,7 @@ class MainWindow(QMainWindow):
         self.current_update_info = None
         self.manual_update_check = False
         self._closing_after_cancel = False
+        self._automation_cancel_requested = False
         self._closing_after_workers = False
 
         self.setWindowTitle(f"UnHelper v{CURRENT_VERSION}")
@@ -820,9 +879,9 @@ class MainWindow(QMainWindow):
         section_title.setObjectName("SectionTitle")
         section_description = QLabel(
             (
-                "오늘 트럭 예약과 WMS 상품 무게를 예약번호 기준으로 정리합니다."
+                "선택한 기준일의 트럭 예약과 WMS 상품 무게를 예약번호 기준으로 정리합니다."
                 if is_truck
-                else "Shipments 예약 정보와 WMS 상품 무게를 오늘 입고 기준으로 정리합니다."
+                else "Shipments 예약 정보와 WMS 상품 무게를 선택한 기준일로 정리합니다."
             )
         )
         section_description.setObjectName("SectionDescription")
@@ -940,6 +999,24 @@ class MainWindow(QMainWindow):
     def start_truck_download(self) -> None:
         self._start_booking_download("truck")
 
+    def _configured_base_date(self) -> date | None:
+        mode = str(self.settings.value("base_date_mode", "auto")).strip().lower()
+        if mode not in {"auto", "manual"}:
+            raise ValueError(
+                "저장된 기준일 선택 방식을 읽을 수 없습니다. "
+                "설정에서 자동 또는 수동을 다시 선택해 주세요."
+            )
+        if mode == "auto":
+            return None
+        raw_base_date = str(self.settings.value("manual_base_date", "")).strip()
+        try:
+            return date.fromisoformat(raw_base_date)
+        except ValueError as exc:
+            raise ValueError(
+                "저장된 수동 기준일을 읽을 수 없습니다. "
+                "설정에서 기준일을 다시 선택해 주세요."
+            ) from exc
+
     def _start_booking_download(self, booking_type: str) -> None:
         if self._automation_worker_running():
             return
@@ -973,18 +1050,35 @@ class MainWindow(QMainWindow):
         download_dir = Path(
             str(self.settings.value("download_dir", str(default_download_dir())))
         ).expanduser()
+        try:
+            base_date = self._configured_base_date()
+        except ValueError as exc:
+            QMessageBox.warning(self, "기준일 확인", str(exc))
+            self.show_settings()
+            return
         if is_truck:
             from Modules.Shipments.TruckDownloader import TruckDownloadRequest
 
-            request = TruckDownloadRequest(download_dir=download_dir, center_name="안산2")
+            request = TruckDownloadRequest(
+                download_dir=download_dir,
+                center_name="안산2",
+                base_date=base_date,
+            )
         else:
-            request = MilkrunDownloadRequest(download_dir=download_dir, center_name="안산2")
+            request = MilkrunDownloadRequest(
+                download_dir=download_dir,
+                center_name="안산2",
+                base_date=base_date,
+            )
         self.log_view.clear()
         table = self._table_for_booking(booking_type)
         table.setRowCount(0)
         self._active_booking_type = booking_type
         self._products_by_booking[booking_type] = ()
         self._pipeline_results_by_booking[booking_type] = None
+        self._group_categories_for_booking(booking_type).clear()
+        self._session_manual_category_skus.clear()
+        self._automation_cancel_requested = False
         self.current_products = ()
         self.current_pipeline_result = None
         self._pending_weight_summary = None
@@ -993,6 +1087,11 @@ class MainWindow(QMainWindow):
         self._credential_load_failure = None
         self._weight_finalize_pending = False
         self.append_log(f"{booking_label} 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
+        self.append_log(
+            f"조회 기준일: {base_date:%Y-%m-%d} (수동)"
+            if base_date is not None
+            else "조회 기준일: 실행일 자동"
+        )
         self.append_log(f"연결된 Excel: {target_workbook}")
         self._set_automation_working(True)
         self.milkrun_worker = MilkrunWorker(
@@ -1012,14 +1111,13 @@ class MainWindow(QMainWindow):
         self.milkrun_worker.start()
 
     def cancel_milkrun_download(self) -> None:
-        requested = False
-        if self.milkrun_worker and self.milkrun_worker.isRunning():
+        requested = self.milkrun_worker is not None or self.weight_worker is not None
+        if self.milkrun_worker is not None:
             self.milkrun_worker.request_cancel()
-            requested = True
-        if self.weight_worker and self.weight_worker.isRunning():
+        if self.weight_worker is not None:
             self.weight_worker.request_cancel()
-            requested = True
         if requested:
+            self._automation_cancel_requested = True
             self.append_log("작업 중지를 요청했습니다.")
             self.status_label.setText("작업 중지 중...")
             self.stop_button.setEnabled(False)
@@ -1028,6 +1126,10 @@ class MainWindow(QMainWindow):
     def _on_milkrun_completed(self, result) -> None:
         if self._closing_after_cancel:
             self.append_log("종료 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
+            return
+        if self._automation_cancel_requested:
+            self.append_log("작업 중지 요청이 처리되어 WMS 무게 조회를 시작하지 않습니다.")
+            self.status_label.setText("작업 취소됨")
             return
         booking_type = getattr(result, "booking_type", self._active_booking_type)
         self._active_booking_type = booking_type
@@ -1042,16 +1144,18 @@ class MainWindow(QMainWindow):
             f"{excel.rows}행 × {excel.columns}열"
         )
         if excel.filtered_rows:
-            self.append_log(f"입고일이 어제인 행 {excel.filtered_rows}개를 제외했습니다.")
+            self.append_log(
+                f"입고일이 기준일 전날인 행 {excel.filtered_rows}개를 제외했습니다."
+            )
         self.append_log(f"일별 입고 상세 표시 완료: {len(daily.products)}개 상품")
         if daily.unmatched_dispatches:
             number_label = "예약번호" if booking_type == "truck" else "배차번호"
             self.append_log(
-                f"오늘 카드에서 찾지 못한 {number_label}: "
+                f"기준일 카드에서 찾지 못한 {number_label}: "
                 + ", ".join(daily.unmatched_dispatches)
             )
         self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
-        self._start_weight_lookup(daily.products)
+        self._start_weight_lookup(self.current_products)
 
     def _populate_milkrun_products(self, products) -> None:
         self._active_booking_type = "milkrun"
@@ -1061,14 +1165,107 @@ class MainWindow(QMainWindow):
         self._active_booking_type = "truck"
         self._populate_booking_products(products, "truck")
 
+    @staticmethod
+    def _group_sku_key(value: object) -> str:
+        try:
+            return normalize_sku_id(value)
+        except ValueError:
+            return f"invalid:{str(value).strip()}"
+
+    @staticmethod
+    def _booking_group_key(product, booking_type: str) -> str:
+        if booking_type == "truck":
+            return str(product.dispatch_number or "").strip()
+        # The daily-detail table rowspans vendor/Milkrun/pallet/box values.
+        # ``milkrun_number`` identifies that inner quantity group, while
+        # ``dispatch_number`` identifies the outer M schedule card and can
+        # contain several independent Milkrun groups.
+        return normalize_product_name(product.milkrun_number)
+
+    def _group_categories_for_booking(self, booking_type: str) -> dict[str, str]:
+        return (
+            self._truck_group_categories
+            if booking_type == "truck"
+            else self._milkrun_group_categories
+        )
+
+    @classmethod
+    def _booking_multi_sku_groups(
+        cls,
+        products,
+        booking_type: str,
+    ) -> dict[str, tuple[int, ...]]:
+        rows_by_group: dict[str, list[int]] = {}
+        skus_by_group: dict[str, set[str]] = {}
+        for row_index, product in enumerate(products):
+            group_key = cls._booking_group_key(product, booking_type)
+            if not group_key:
+                continue
+            rows_by_group.setdefault(group_key, []).append(row_index)
+            skus_by_group.setdefault(group_key, set()).add(
+                cls._group_sku_key(product.sku_id)
+            )
+        return {
+            group_key: tuple(rows_by_group[group_key])
+            for group_key, sku_ids in skus_by_group.items()
+            if len(sku_ids) > 1
+        }
+
+    @classmethod
+    def _booking_multi_sku_ids(cls, products, booking_type: str) -> set[str]:
+        groups = cls._booking_multi_sku_groups(products, booking_type)
+        sku_ids: set[str] = set()
+        for rows in groups.values():
+            for row_index in rows:
+                try:
+                    sku_ids.add(normalize_sku_id(products[row_index].sku_id))
+                except ValueError:
+                    continue
+        return sku_ids
+
+    @classmethod
+    def _ordered_booking_products(cls, products, booking_type: str) -> tuple:
+        """Keep every row while making identical booking groups contiguous."""
+        grouped: dict[tuple[str, object], list] = {}
+        group_order: list[tuple[str, object]] = []
+        for row_index, product in enumerate(products):
+            group_key = cls._booking_group_key(product, booking_type)
+            identity: tuple[str, object] = (
+                ("group", group_key) if group_key else ("row", row_index)
+            )
+            if identity not in grouped:
+                grouped[identity] = []
+                group_order.append(identity)
+            grouped[identity].append(product)
+        return tuple(product for identity in group_order for product in grouped[identity])
+
+    @classmethod
+    def _truck_multi_sku_groups(cls, products) -> dict[str, tuple[int, ...]]:
+        return cls._booking_multi_sku_groups(products, "truck")
+
+    @classmethod
+    def _truck_multi_sku_ids(cls, products) -> set[str]:
+        return cls._booking_multi_sku_ids(products, "truck")
+
     def _populate_booking_products(self, products, booking_type: str) -> None:
-        self.current_products = tuple(products)
+        self.current_products = self._ordered_booking_products(tuple(products), booking_type)
         self._products_by_booking[booking_type] = self.current_products
+        self._group_categories_for_booking(booking_type).clear()
         self._weight_records.clear()
         self._weight_failures.clear()
         self._weight_row_errors.clear()
         table = self._table_for_booking(booking_type)
+        table.clearSpans()
         table.setRowCount(len(self.current_products))
+        multi_sku_groups = self._booking_multi_sku_groups(
+            self.current_products,
+            booking_type,
+        )
+        multi_sku_rows = {
+            row_index: reservation_number
+            for reservation_number, rows in multi_sku_groups.items()
+            for row_index in rows
+        }
         for row_index, product in enumerate(self.current_products):
             try:
                 boxes_per_pallet = self._format_decimal(
@@ -1086,7 +1283,7 @@ class MainWindow(QMainWindow):
                 product.sku_id,
                 normalize_product_name(product.sku_name),
                 "-",
-                "-",
+                "?" if row_index in multi_sku_rows else "-",
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -1094,25 +1291,51 @@ class MainWindow(QMainWindow):
                 if column_index in (0, 6):
                     item.setToolTip(str(value))
                 table.setItem(row_index, column_index, item)
+            if row_index not in multi_sku_rows:
+                category_button = QPushButton("?")
+                category_button.setObjectName("CategoryButton")
+                category_button.setProperty("classification", "?")
+                category_button.setEnabled(False)
+                category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
+                category_button.clicked.connect(
+                    lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
+                        sku_id,
+                        kind,
+                    )
+                )
+                table.setCellWidget(row_index, 9, category_button)
+
+        for group_key, rows in multi_sku_groups.items():
+            first_row = rows[0]
+            if rows != tuple(range(first_row, first_row + len(rows))):
+                group_label = "예약번호" if booking_type == "truck" else "밀크런 번호"
+                raise ValueError(
+                    f"{group_label} {group_key}의 SKU 행이 연속되지 않아 표를 병합할 수 없습니다."
+                )
+            table.setSpan(first_row, 2, len(rows), 1)
+            table.setSpan(first_row, 9, len(rows), 1)
             category_button = QPushButton("?")
             category_button.setObjectName("CategoryButton")
-            category_button.setProperty("classification", "?")
-            category_button.setEnabled(False)
-            category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
             category_button.clicked.connect(
-                lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
-                    sku_id,
+                lambda _checked=False, kind=booking_type, key=group_key: self._cycle_booking_group_category(
                     kind,
+                    key,
                 )
             )
-            table.setCellWidget(row_index, 9, category_button)
+            self._configure_booking_group_button(
+                category_button,
+                self._group_categories_for_booking(booking_type).get(group_key),
+                booking_type=booking_type,
+                enabled=False,
+            )
+            table.setCellWidget(first_row, 9, category_button)
 
     def _start_weight_lookup(self, products) -> None:
         if self.weight_worker and self.weight_worker.isRunning():
             return
         self._credential_load_failure = None
-        if self._closing_after_cancel:
-            self.append_log("종료 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
+        if self._closing_after_cancel or self._automation_cancel_requested:
+            self.append_log("중지 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
             return
         products = tuple(products)
         if not products:
@@ -1125,8 +1348,8 @@ class MainWindow(QMainWindow):
             self._pending_weight_failure = None
             self._pending_weight_cancel = ""
             self._weight_finalize_pending = True
-            self.status_label.setText("오늘 표시할 상품 없음 · WMS 조회 생략")
-            self.append_log("오늘 표시할 상품이 없어 WMS 무게 조회를 건너뜁니다.")
+            self.status_label.setText("기준일 표시 상품 없음 · WMS 조회 생략")
+            self.append_log("기준일에 표시할 상품이 없어 WMS 무게 조회를 건너뜁니다.")
             self._finalize_weight_if_ready()
             return
         memory = _open_product_memory_with_recovery(self.product_memory_file, self)
@@ -1193,6 +1416,9 @@ class MainWindow(QMainWindow):
         booking_type = booking_type or self._active_booking_type
         products = self._products_by_booking.get(booking_type, ())
         table = self._table_for_booking(booking_type)
+        multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
+        multi_sku_group_skus = self._booking_multi_sku_ids(products, booking_type)
+        group_categories = self._group_categories_for_booking(booking_type)
         self._weight_row_errors.pop(record.sku_id, None)
         for row_index, product in enumerate(products):
             try:
@@ -1202,7 +1428,42 @@ class MainWindow(QMainWindow):
             if row_sku != record.sku_id:
                 continue
 
-            category = record.category_override or "?"
+            group_key = self._booking_group_key(product, booking_type)
+            if group_key in multi_sku_groups:
+                if record.weight_grams is not None:
+                    self._set_table_text(
+                        row_index,
+                        7,
+                        self._format_decimal(record.weight_grams),
+                        table=table,
+                    )
+                else:
+                    self._set_table_text(row_index, 7, "-", table=table)
+                self._clear_table_tooltip(row_index, 7, table=table)
+                self._set_table_text(row_index, 8, "?", table=table)
+                first_row = multi_sku_groups[group_key][0]
+                button = table.cellWidget(first_row, 9)
+                if isinstance(button, QPushButton):
+                    self._configure_booking_group_button(
+                        button,
+                        group_categories.get(group_key),
+                        booking_type=booking_type,
+                        enabled=not self._automation_worker_running(),
+                    )
+                continue
+
+            display_override = record.category_override
+            if (
+                display_override in AUTOMATIC_CATEGORIES
+                and record.sku_id in multi_sku_group_skus
+                and record.sku_id not in self._session_manual_category_skus
+            ):
+                # A multi-SKU booking row must not mutate the global SKU memory.
+                # If the same SKU also has a single-SKU reservation, ignore a
+                # stale saved light/heavy override for this run and show the
+                # current local pallet calculation. High-stack still persists.
+                display_override = None
+            category = display_override or "?"
             error_text = ""
             try:
                 boxes_per_pallet = calculate_boxes_per_pallet(
@@ -1241,7 +1502,7 @@ class MainWindow(QMainWindow):
                         self._format_decimal(pallet_weight_kg, 3),
                         table=table,
                     )
-                    category = record.category_override or automatic_category
+                    category = display_override or automatic_category
                 else:
                     self._set_table_text(row_index, 8, "-", table=table)
             else:
@@ -1253,7 +1514,7 @@ class MainWindow(QMainWindow):
                 self._configure_category_button(
                     button,
                     category,
-                    manual=record.category_override is not None,
+                    manual=display_override is not None,
                     enabled=not self._automation_worker_running(),
                     error_text=error_text,
                     quantity_label="유닛" if booking_type == "truck" else "박스",
@@ -1264,6 +1525,10 @@ class MainWindow(QMainWindow):
         self.append_log(f"[WMS 조회 실패] SKU {failure.sku_id}: {failure.details.summary}")
         products = self._products_by_booking.get(self._active_booking_type, ())
         table = self._table_for_booking(self._active_booking_type)
+        multi_sku_groups = self._booking_multi_sku_groups(
+            products,
+            self._active_booking_type,
+        )
         for row_index, product in enumerate(products):
             try:
                 matches = normalize_sku_id(product.sku_id) == normalize_sku_id(failure.sku_id)
@@ -1271,11 +1536,24 @@ class MainWindow(QMainWindow):
                 matches = str(product.sku_id).strip() == failure.sku_id
             if not matches:
                 continue
+            group_key = self._booking_group_key(product, self._active_booking_type)
+            if group_key in multi_sku_groups:
+                weight_item = table.item(row_index, 7)
+                if weight_item is None:
+                    self._set_table_text(row_index, 7, "-", table=table)
+                    weight_item = table.item(row_index, 7)
+                if weight_item is not None:
+                    weight_item.setToolTip(failure.details.summary)
+                continue
             button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 button.setToolTip(failure.details.summary)
 
     def _on_weight_completed(self, summary: ProductWeightSummary) -> None:
+        if self._automation_cancel_requested:
+            self._pending_weight_cancel = "사용자가 WMS 무게 조회를 중지했습니다."
+            self.status_label.setText("WMS 무게 조회 취소 처리 중")
+            return
         self._pending_weight_summary = summary
         self.status_label.setText("WMS 무게 결과 정리 중")
 
@@ -1361,20 +1639,49 @@ class MainWindow(QMainWindow):
         cache_hits = summary.cache_hits if summary is not None else 0
         wms_successes = summary.wms_successes if summary is not None else 0
         product_count = len(self.current_products)
+        manual_groups = self._booking_multi_sku_groups(
+            self.current_products,
+            self._active_booking_type,
+        )
         unmatched = (
             self.current_pipeline_result.daily_inbound.unmatched_dispatches
             if self.current_pipeline_result is not None
             else ()
         )
-        self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
+        if manual_groups:
+            self.status_label.setText(
+                f"완료 · 상품 {product_count}개 · 수동 분류 필요 {len(manual_groups)}건"
+            )
+        else:
+            self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
+        completion_text = (
+            (
+                "WMS SKU별 유닛 무게 확인을 완료했습니다."
+                if self._active_booking_type == "truck"
+                else "WMS SKU별 상품 무게 확인을 완료했습니다."
+            )
+            if manual_groups
+            else "WMS 무게 분류를 완료했습니다."
+        )
         message = (
-            f"{booking_label} 다운로드, Excel 값 반영, 일별 입고 상세와 WMS 무게 분류를 완료했습니다.\n\n"
+            f"{booking_label} 다운로드, Excel 값 반영, 일별 입고 상세와 {completion_text}\n\n"
             f"표시 상품: {product_count}개\n"
             f"저장된 무게 사용: {cache_hits}개\n"
             f"WMS 신규 조회: {wms_successes}개"
         )
+        if manual_groups:
+            group_label = "예약" if self._active_booking_type == "truck" else "밀크런"
+            quantity_label = "유닛" if self._active_booking_type == "truck" else "상품"
+            message += (
+                f"\n\n다중 SKU {group_label} 수동 분류: {len(manual_groups)}건\n"
+                f"해당 {group_label}은 SKU별 {quantity_label} 무게만 저장했습니다. "
+                f"표의 병합된 분류 버튼을 눌러 {group_label} 전체를 수동 분류해 주세요. "
+                "수동 값은 상품 메모리에 저장되지 않습니다."
+            )
         if unmatched:
-            message += f"\n\n오늘 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
+            message += f"\n\n기준일 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
+            QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
+        elif manual_groups:
             QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
         else:
             QMessageBox.information(self, f"{booking_label} 작업 완료", message)
@@ -1392,6 +1699,15 @@ class MainWindow(QMainWindow):
             memory = ProductMemory(self.product_memory_file)
             record = memory.get(sku_id)
             override = record.category_override if record is not None else None
+            if (
+                override in AUTOMATIC_CATEGORIES
+                and sku_id in self._booking_multi_sku_ids(
+                    self._products_by_booking.get(booking_type, ()),
+                    booking_type,
+                )
+                and sku_id not in self._session_manual_category_skus
+            ):
+                override = None
             product_name = ""
             for product in self._products_by_booking.get(booking_type, ()):
                 try:
@@ -1425,16 +1741,61 @@ class MainWindow(QMainWindow):
             return
 
         if updated is None:
+            self._session_manual_category_skus.discard(sku_id)
             self._weight_records.pop(sku_id, None)
             for kind in ("milkrun", "truck"):
                 self._render_unknown_sku(sku_id, kind)
             self.append_log(f"SKU {sku_id} 수동 분류를 해제했습니다.")
         else:
+            if updated.category_override is None:
+                self._session_manual_category_skus.discard(sku_id)
+            else:
+                self._session_manual_category_skus.add(sku_id)
             self._weight_records[sku_id] = updated
             for kind in ("milkrun", "truck"):
                 self._render_weight_record(updated, kind)
             source = "자동" if updated.category_override is None else "수동"
             self.append_log(f"SKU {sku_id} 분류 변경: {updated.effective_category or '?'} ({source})")
+
+    def _cycle_booking_group_category(self, booking_type: str, group_key: str) -> None:
+        if self._automation_worker_running():
+            return
+        categories = self._group_categories_for_booking(booking_type)
+        current = categories.get(group_key)
+        if current is None:
+            next_category = "경량"
+        elif current == "경량":
+            next_category = "중량"
+        elif current == "중량":
+            next_category = "고단"
+        else:
+            next_category = None
+
+        if next_category is None:
+            categories.pop(group_key, None)
+        else:
+            categories[group_key] = next_category
+
+        products = self._products_by_booking.get(booking_type, ())
+        rows = self._booking_multi_sku_groups(products, booking_type).get(group_key, ())
+        if rows:
+            table = self._table_for_booking(booking_type)
+            button = table.cellWidget(rows[0], 9)
+            if isinstance(button, QPushButton):
+                self._configure_booking_group_button(
+                    button,
+                    next_category,
+                    booking_type=booking_type,
+                    enabled=True,
+                )
+        group_label = "예약번호" if booking_type == "truck" else "밀크런 번호"
+        self.append_log(
+            f"{group_label} {group_key} 표 분류 변경: {next_category or '?'} "
+            "(현재 표에만 적용·상품 메모리에 저장하지 않음)"
+        )
+
+    def _cycle_truck_group_category(self, reservation_number: str) -> None:
+        self._cycle_booking_group_category("truck", reservation_number)
 
     def _render_unknown_sku(
         self,
@@ -1444,12 +1805,15 @@ class MainWindow(QMainWindow):
         booking_type = booking_type or self._active_booking_type
         products = self._products_by_booking.get(booking_type, ())
         table = self._table_for_booking(booking_type)
+        multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
+        group_categories = self._group_categories_for_booking(booking_type)
         for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
                     continue
             except ValueError:
                 continue
+            group_key = self._booking_group_key(product, booking_type)
             try:
                 boxes_per_pallet = calculate_boxes_per_pallet(
                     product.box_count,
@@ -1464,7 +1828,24 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 self._set_table_text(row_index, 4, "-", table=table)
             self._set_table_text(row_index, 7, "-", table=table)
-            self._set_table_text(row_index, 8, "-", table=table)
+            self._clear_table_tooltip(row_index, 7, table=table)
+            self._set_table_text(
+                row_index,
+                8,
+                "?" if group_key in multi_sku_groups else "-",
+                table=table,
+            )
+            if group_key in multi_sku_groups:
+                first_row = multi_sku_groups[group_key][0]
+                button = table.cellWidget(first_row, 9)
+                if isinstance(button, QPushButton):
+                    self._configure_booking_group_button(
+                        button,
+                        group_categories.get(group_key),
+                        booking_type=booking_type,
+                        enabled=not self._automation_worker_running(),
+                    )
+                continue
             button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 self._configure_category_button(button, "?", manual=False, enabled=True)
@@ -1477,12 +1858,17 @@ class MainWindow(QMainWindow):
         booking_type = booking_type or self._active_booking_type
         products = self._products_by_booking.get(booking_type, ())
         table = self._table_for_booking(booking_type)
+        multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
+        group_categories = self._group_categories_for_booking(booking_type)
         for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
                     continue
             except ValueError:
                 continue
+            group_key = self._booking_group_key(product, booking_type)
+            if group_key in multi_sku_groups:
+                return group_categories.get(group_key, "?")
             button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 return button.text()
@@ -1524,6 +1910,45 @@ class MainWindow(QMainWindow):
         button.style().unpolish(button)
         button.style().polish(button)
 
+    @classmethod
+    def _configure_booking_group_button(
+        cls,
+        button: QPushButton,
+        category: str | None,
+        *,
+        booking_type: str,
+        enabled: bool,
+    ) -> None:
+        quantity_label = "유닛" if booking_type == "truck" else "박스"
+        cls._configure_category_button(
+            button,
+            category or "?",
+            manual=category is not None,
+            enabled=enabled,
+            quantity_label=quantity_label,
+        )
+        group_label = "예약" if booking_type == "truck" else "밀크런 번호"
+        button.setToolTip(
+            f"한 {group_label}에 서로 다른 SKU가 여러 개이므로 팔렛트 무게를 "
+            f"자동 계산하지 않습니다. 클릭해 {group_label} 전체를 수동 분류하며, "
+            "이 값은 현재 표에만 적용되고 상품 메모리에 저장되지 않습니다."
+        )
+
+    @classmethod
+    def _configure_truck_group_button(
+        cls,
+        button: QPushButton,
+        category: str | None,
+        *,
+        enabled: bool,
+    ) -> None:
+        cls._configure_booking_group_button(
+            button,
+            category,
+            booking_type="truck",
+            enabled=enabled,
+        )
+
     def _set_table_text(
         self,
         row: int,
@@ -1539,6 +1964,17 @@ class MainWindow(QMainWindow):
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row, column, item)
         item.setText(value)
+
+    @staticmethod
+    def _clear_table_tooltip(
+        row: int,
+        column: int,
+        *,
+        table: QTableWidget,
+    ) -> None:
+        item = table.item(row, column)
+        if item is not None:
+            item.setToolTip("")
 
     @staticmethod
     def _format_decimal(value: Decimal, digits: int | None = None) -> str:

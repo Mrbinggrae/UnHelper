@@ -40,6 +40,23 @@ class MilkrunDownloadRequest:
     download_dir: Path
     center_name: str = "안산2"
     today: date | None = None
+    base_date: date | None = None
+
+    def resolve_base_date(self) -> date:
+        """Return the date selected for this run.
+
+        ``today`` is the legacy manual-date argument.  Keeping it in the same
+        position preserves existing callers while ``base_date`` gives the UI a
+        name that matches the automatic/manual date setting.
+        """
+
+        if (
+            self.today is not None
+            and self.base_date is not None
+            and self.today != self.base_date
+        ):
+            raise ValueError("today와 base_date에 서로 다른 기준일을 지정할 수 없습니다.")
+        return self.base_date or self.today or date.today()
 
 
 @dataclass(frozen=True)
@@ -48,6 +65,13 @@ class MilkrunDownloadResult:
     start_date: date
     end_date: date
     reason: str
+    base_date: date | None = None
+
+    def __post_init__(self) -> None:
+        actual_base_date = self.end_date if self.base_date is None else self.base_date
+        if actual_base_date != self.end_date:
+            raise ValueError("다운로드 결과의 기준일은 조회 종료일과 같아야 합니다.")
+        object.__setattr__(self, "base_date", actual_base_date)
 
 
 @dataclass(frozen=True)
@@ -99,8 +123,8 @@ class MilkrunDownloader:
         *,
         keep_browser_open: bool = False,
     ) -> MilkrunDownloadResult:
-        target_date = request.today or date.today()
-        start_date, end_date = self._resolve_date_range(target_date)
+        base_date = request.resolve_base_date()
+        start_date, end_date = self._resolve_date_range(base_date)
         reason = self.format_reason(start_date, end_date)
         download_dir = Path(request.download_dir).expanduser().resolve()
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -137,6 +161,7 @@ class MilkrunDownloader:
                 start_date=start_date,
                 end_date=end_date,
                 reason=reason,
+                base_date=base_date,
             )
             succeeded = True
             return result

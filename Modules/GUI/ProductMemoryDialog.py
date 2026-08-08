@@ -120,7 +120,14 @@ class ProductMemoryDialog(QDialog):
         self.table.setRowCount(len(records))
         for row_index, record in enumerate(records):
             category = record.effective_category or "미분류"
-            source = "수동" if record.category_override else ("자동" if record.automatic_category else "측정 전")
+            if record.category_override:
+                source = "수동"
+            elif record.automatic_category:
+                source = "자동"
+            elif record.weight_grams is not None:
+                source = "무게만"
+            else:
+                source = "측정 전"
             values = (
                 record.sku_id,
                 record.product_name,

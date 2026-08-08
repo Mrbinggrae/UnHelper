@@ -174,7 +174,7 @@ class DailyInboundScraper:
         if not products:
             missing = ", ".join(unmatched or requested)
             raise DailyInboundError(
-                "오늘 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
+                "기준일 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
                 f"미조회 {self.profile.number_label}: {missing}"
             )
 

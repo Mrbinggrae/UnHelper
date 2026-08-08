@@ -172,6 +172,51 @@ class ProductMemoryTests(unittest.TestCase):
         high = memory.upsert_weight("123", "상품", "3000")
         self.assertEqual(high.category_override, HIGH_CATEGORY)
 
+    def test_weight_only_update_preserves_existing_category_and_calculation(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        memory.upsert_measurement("123", "기존 상품", "1000", "300", "1")
+        memory.set_manual_category("123", HIGH_CATEGORY)
+
+        weight_only = memory.upsert_weight_only("123", "트럭 상품", "1000")
+
+        self.assertEqual(weight_only.product_name, "트럭 상품")
+        self.assertEqual(weight_only.weight_grams, Decimal("1000"))
+        self.assertEqual(weight_only.automatic_category, HEAVY_CATEGORY)
+        self.assertEqual(weight_only.category_override, HIGH_CATEGORY)
+        self.assertEqual(weight_only.boxes_per_pallet, Decimal("300"))
+        self.assertEqual(weight_only.pallet_weight_kg, Decimal("300"))
+        self.assertEqual(weight_only.effective_category, HIGH_CATEGORY)
+        self.assertEqual(ProductMemory(self.root / "memory.json").get("123"), weight_only)
+
+    def test_weight_only_update_rejects_changed_weight_that_would_corrupt_calculation(self) -> None:
+        path = self.root / "memory.json"
+        memory = ProductMemory(path)
+        original = memory.upsert_measurement("123", "상품", "1000", "300", "1")
+        original_bytes = path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "계산값을 유지하면서 WMS 무게"):
+            memory.upsert_weight_only("123", "상품", "2000")
+
+        self.assertEqual(path.read_bytes(), original_bytes)
+        self.assertEqual(memory.get("123"), original)
+        self.assertEqual(ProductMemory(path).get("123"), original)
+
+    def test_weight_only_update_adds_weight_without_deleting_manual_placeholder(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        placeholder = memory.set_manual_category("456", HIGH_CATEGORY, "미측정 상품")
+
+        updated = memory.upsert_weight_only("456", "측정 상품", "1000")
+
+        self.assertIsNotNone(placeholder)
+        self.assertEqual(updated.product_name, "측정 상품")
+        self.assertEqual(updated.weight_grams, Decimal("1000"))
+        self.assertEqual(updated.automatic_category, "")
+        self.assertEqual(updated.category_override, HIGH_CATEGORY)
+        self.assertIsNone(updated.boxes_per_pallet)
+        self.assertIsNone(updated.pallet_weight_kg)
+        self.assertEqual(updated.effective_category, HIGH_CATEGORY)
+        self.assertEqual(ProductMemory(self.root / "memory.json").get("456"), updated)
+
     def test_legacy_light_or_heavy_override_json_remains_readable_until_next_calculation(self) -> None:
         path = self.root / "memory.json"
         memory = ProductMemory(path)

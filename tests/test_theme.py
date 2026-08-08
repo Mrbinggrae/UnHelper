@@ -32,6 +32,7 @@ class DarkThemeTests(unittest.TestCase):
         self.assertIn("QTabBar#SubTabBar::tab", APP_STYLESHEET)
         self.assertIn("QScrollBar:vertical", APP_STYLESHEET)
         self.assertIn("QComboBox QAbstractItemView", APP_STYLESHEET)
+        self.assertIn("QDateEdit", APP_STYLESHEET)
         self.assertNotIn("#DDE1E5", APP_STYLESHEET.upper())
         self.assertGreaterEqual(self._contrast(COLORS["primary"], "#FFFFFF"), 4.5)
         self.assertGreaterEqual(self._contrast(COLORS["primary_hover"], "#FFFFFF"), 4.5)

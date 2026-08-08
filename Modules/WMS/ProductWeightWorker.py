@@ -8,7 +8,11 @@ from typing import Callable, Iterable
 from PySide6.QtCore import QThread, Signal
 
 from Modules.Common.ErrorReport import FailureDetails
-from Modules.Shipments.DailyInbound import MilkrunProductRow
+from Modules.Shipments.DailyInbound import (
+    MilkrunProductRow,
+    normalize_milkrun_card_number,
+    normalize_truck_card_number,
+)
 from Modules.WMS.ProductMemory import (
     AUTOMATIC_CATEGORIES,
     ProductMemory,
@@ -52,6 +56,7 @@ class ProductWeightWorker(QThread):
         *,
         evidence_dir: str | Path,
         quantity_label: str = "박스",
+        multi_sku_booking_weight_only: bool = True,
         crawler_factory: Callable[..., ProductWeightCrawler] = ProductWeightCrawler,
     ) -> None:
         super().__init__()
@@ -62,6 +67,7 @@ class ProductWeightWorker(QThread):
         self.wms_password = str(wms_password or "")
         self.evidence_dir = Path(evidence_dir)
         self.quantity_label = str(quantity_label or "박스")
+        self.multi_sku_booking_weight_only = bool(multi_sku_booking_weight_only)
         self.crawler_factory = crawler_factory
         self.stop_event = threading.Event()
         self.crawler: ProductWeightCrawler | None = None
@@ -72,6 +78,11 @@ class ProductWeightWorker(QThread):
     def run(self) -> None:
         try:
             unique_products, invalid_failures = self._unique_products(self.products)
+            weight_only_skus = (
+                self._multi_sku_booking_skus(self.products)
+                if self.multi_sku_booking_weight_only
+                else frozenset()
+            )
             failures = list(invalid_failures)
             for failure in invalid_failures:
                 self.sku_failed.emit(failure)
@@ -84,12 +95,21 @@ class ProductWeightWorker(QThread):
             for product in unique_products:
                 self._check_cancelled()
                 record = memory.get(product.sku_id)
+                weight_only = product.sku_id in weight_only_skus
                 if record is None or record.weight_grams is None:
                     if record is not None:
                         self.record_ready.emit(record, False)
                     misses.append(product)
                     continue
                 cache_hits += 1
+                if weight_only:
+                    self.log_updated.emit(
+                        f"SKU {record.sku_id}는 다중 SKU 입고 예약 상품이므로 "
+                        "저장된 WMS 무게만 사용하고 현재 예약의 분류 및 팔렛트 "
+                        "계산값은 새로 저장하지 않습니다."
+                    )
+                    self.record_ready.emit(record, True)
+                    continue
                 if record.category_override in AUTOMATIC_CATEGORIES:
                     # Manual light/heavy values belong to the previous display.
                     # Clear them before calculation so an invalid current pallet
@@ -160,20 +180,27 @@ class ProductWeightWorker(QThread):
                 try:
                     lookup = self.crawler.lookup(sku_id)
                     product_name = normalize_product_name(product.sku_name) or lookup.product_name
-                    try:
-                        record = memory.upsert_measurement(
-                            lookup.sku_id,
-                            product_name,
-                            lookup.weight_grams,
-                            product.box_count,
-                            product.pallet_count,
-                        )
-                    except (TypeError, ValueError):
-                        record = memory.upsert_weight(
+                    if sku_id in weight_only_skus:
+                        record = memory.upsert_weight_only(
                             lookup.sku_id,
                             product_name,
                             lookup.weight_grams,
                         )
+                    else:
+                        try:
+                            record = memory.upsert_measurement(
+                                lookup.sku_id,
+                                product_name,
+                                lookup.weight_grams,
+                                product.box_count,
+                                product.pallet_count,
+                            )
+                        except (TypeError, ValueError):
+                            record = memory.upsert_weight(
+                                lookup.sku_id,
+                                product_name,
+                                lookup.weight_grams,
+                            )
                     wms_successes += 1
                     self.record_ready.emit(record, False)
                 except Exception as exc:
@@ -222,6 +249,50 @@ class ProductWeightWorker(QThread):
             return normalize_sku_id(value)
         except ValueError:
             return normalize_product_name(value) or "알 수 없음"
+
+    @staticmethod
+    def _multi_sku_booking_skus(
+        products: Iterable[MilkrunProductRow],
+    ) -> frozenset[str]:
+        """Return SKUs in an explicit inbound group with 2+ distinct identities.
+
+        Truck rows are grouped by their explicit ``T...`` reservation card.
+        A Milkrun ``M...`` card can contain several independent Milkrun groups,
+        so those rows are grouped by ``milkrun_number`` instead of by the outer
+        schedule card.  Invalid SKU values still count as a distinct identity;
+        otherwise a valid peer could be misclassified and persisted from an
+        incomplete multi-SKU group.
+        """
+        group_identities: dict[tuple[str, str], set[str]] = {}
+        normalized_skus: dict[tuple[str, str], set[str]] = {}
+        for product in products:
+            truck_number = normalize_truck_card_number(product.dispatch_number)
+            if truck_number:
+                group_key = ("truck", truck_number)
+            elif normalize_milkrun_card_number(product.dispatch_number):
+                milkrun_number = normalize_product_name(product.milkrun_number)
+                if not milkrun_number:
+                    continue
+                group_key = ("milkrun", milkrun_number)
+            else:
+                continue
+            try:
+                sku_id = normalize_sku_id(product.sku_id)
+            except ValueError:
+                raw_identity = normalize_product_name(product.sku_id) or "<empty>"
+                group_identities.setdefault(group_key, set()).add(
+                    f"invalid:{raw_identity}"
+                )
+                continue
+            group_identities.setdefault(group_key, set()).add(sku_id)
+            normalized_skus.setdefault(group_key, set()).add(sku_id)
+
+        return frozenset(
+            sku_id
+            for group_key, identities in group_identities.items()
+            if len(identities) > 1
+            for sku_id in normalized_skus.get(group_key, ())
+        )
 
     @classmethod
     def _unique_products(

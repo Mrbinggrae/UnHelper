@@ -399,7 +399,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(scraper.call_args.kwargs["profile"].booking_prefix, "T")
         fake_downloader.close.assert_called_once()
 
-    def test_truck_worker_rejects_reservation_counts_for_multiple_skus(self) -> None:
+    def test_truck_worker_keeps_all_skus_for_one_reservation(self) -> None:
         from Modules.Shipments.DailyInboundScraper import DailyInboundResult
 
         metric = TruckReservationMetrics(
@@ -433,8 +433,19 @@ class DailyInboundScraperTests(unittest.TestCase):
             booking_type="truck",
         )
 
-        with self.assertRaisesRegex(DailyInboundError, "서로 다른 SKU 2개"):
-            worker._apply_truck_reservation_metrics(daily_result, import_result)
+        logs = []
+        worker.log_updated.connect(logs.append)
+
+        updated = worker._apply_truck_reservation_metrics(daily_result, import_result)
+
+        self.assertEqual(len(updated.products), 2)
+        self.assertEqual(
+            tuple(product.dispatch_number for product in updated.products),
+            ("T3372829", "T3372829"),
+        )
+        self.assertTrue(all(product.box_count == Decimal("20") for product in updated.products))
+        self.assertTrue(all(product.pallet_count == Decimal("1") for product in updated.products))
+        self.assertTrue(any("SKU 2개" in message and "수동 관리" in message for message in logs))
 
     def test_truck_detail_sheet_close_uses_truck_profile_href(self) -> None:
         browser = _Browser()

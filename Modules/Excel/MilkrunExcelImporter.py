@@ -238,7 +238,7 @@ class MilkrunExcelImporter:
             columns = max((len(row) for row in values), default=0)
             if rows > self.MAX_ROWS:
                 size_description = (
-                    "입고일이 어제인 행을 제외한 데이터"
+                    "입고일이 기준일 전날인 행을 제외한 데이터"
                     if exclude_arrival_date is not None
                     else "반영할 다운로드 데이터"
                 )
@@ -400,7 +400,7 @@ class MilkrunExcelImporter:
         dispatch_numbers = extract_dispatch_numbers(values)
         if exclude_arrival_date is not None and len(values) > 1 and not dispatch_numbers:
             raise ExcelImportError(
-                "오늘 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
+                "기준일 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
                 "기존 값을 지우지 않았습니다."
             )
         return dispatch_numbers, None
