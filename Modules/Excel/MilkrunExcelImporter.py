@@ -59,13 +59,30 @@ class MilkrunExcelImporter:
     TARGET_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".xlsb", ".xls"})
     SOURCE_EXCEL_EXTENSIONS = TARGET_EXTENSIONS
     SOURCE_TEXT_EXTENSIONS = frozenset({".csv", ".txt", ".tsv"})
-    _SAVE_RETRY_MARKERS = (
+    _COM_OPERATION_MAX_RETRIES = 5
+    _COM_RETRY_BASE_DELAY_SECONDS = 0.5
+    _COM_READY_MAX_CHECKS = 4
+    _COM_READY_BASE_DELAY_SECONDS = 0.2
+    _COM_BUSY_HRESULTS = frozenset({
+        -2147418111,  # RPC_E_CALL_REJECTED
+        -2147417846,  # RPC_E_SERVERCALL_RETRYLATER
+    })
+    _COM_BUSY_RETRY_MARKERS = (
+        "-2147418111",
         "-2147417846",
-        "-2146827284",
+        "0x80010001",
+        "0x8001010a",
+        "RPC_E_CALL_REJECTED",
+        "RPC_E_SERVERCALL_RETRYLATER",
+        "피호출자가 호출을 거부",
+        "Call was rejected by callee",
+        "The message filter indicated that the application is busy",
         "메시지 필터",
+    )
+    _SAVE_RETRY_MARKERS = (
+        "-2146827284",
         "문서가 저장되지",
         "Document not saved",
-        "Call was rejected by callee",
     )
 
     def __init__(
@@ -129,7 +146,7 @@ class MilkrunExcelImporter:
                 com_client,
                 target_path,
             )
-            self._ensure_target_ready(target)
+            self._ensure_target_ready(excel, target)
             self.log(f"연결된 Excel 파일과 '{self.TARGET_SHEET}' 시트를 확인했습니다.")
             return target_path
         finally:
@@ -182,7 +199,11 @@ class MilkrunExcelImporter:
                 com_client,
                 target_path,
             )
-            sheet = self._ensure_target_ready(target)
+            sheet = self._ensure_target_ready(
+                excel,
+                target,
+                cancel_requested=cancel_requested,
+            )
             self.log(f"다운로드 파일의 값 데이터를 읽습니다: {source_path.name}")
             if source_kind == "text":
                 values = self._read_delimited_values(source_path)
@@ -232,31 +253,67 @@ class MilkrunExcelImporter:
                     "오늘 입고 데이터의 A열에서 Milkrun 배차번호를 찾지 못했습니다. "
                     "기존 값을 지우지 않았습니다."
                 )
-            clear_range = sheet.Range(self.CLEAR_RANGE)
+            clear_range = self._run_excel_com_operation(
+                excel,
+                lambda: sheet.Range(self.CLEAR_RANGE),
+                "대상 범위 확인",
+                cancel_requested=cancel_requested,
+            )
             original_attribute = "Value2"
-            original_contents = clear_range.Value2
+            original_contents = self._run_excel_com_operation(
+                excel,
+                lambda: clear_range.Value2,
+                "기존 값 백업",
+            )
             try:
-                original_contents = clear_range.Formula2
+                original_contents = self._run_excel_com_operation(
+                    excel,
+                    lambda: clear_range.Formula2,
+                    "기존 수식 백업",
+                )
                 original_attribute = "Formula2"
-            except Exception:
+            except Exception as formula2_error:
+                if self._is_excel_busy_error(formula2_error):
+                    raise
                 try:
-                    original_contents = clear_range.Formula
+                    original_contents = self._run_excel_com_operation(
+                        excel,
+                        lambda: clear_range.Formula,
+                        "기존 수식 백업",
+                    )
                     original_attribute = "Formula"
-                except Exception:
+                except Exception as formula_error:
+                    if self._is_excel_busy_error(formula_error):
+                        raise
                     pass
             changed_target = False
             try:
                 self.log(f"{self.TARGET_SHEET}!{self.CLEAR_RANGE}의 기존 값만 지웁니다.")
-                clear_range.ClearContents()
-                changed_target = True
-                destination = sheet.Range(
-                    sheet.Cells(self.START_ROW, self.START_COLUMN),
-                    sheet.Cells(
-                        self.START_ROW + rows - 1,
-                        self.START_COLUMN + columns - 1,
-                    ),
+                self._run_excel_com_operation(
+                    excel,
+                    clear_range.ClearContents,
+                    "기존 값 지우기",
+                    cancel_requested=cancel_requested,
                 )
-                destination.Value2 = normalized_values
+                changed_target = True
+                destination = self._run_excel_com_operation(
+                    excel,
+                    lambda: sheet.Range(
+                        sheet.Cells(self.START_ROW, self.START_COLUMN),
+                        sheet.Cells(
+                            self.START_ROW + rows - 1,
+                            self.START_COLUMN + columns - 1,
+                        ),
+                    ),
+                    "붙여넣을 범위 확인",
+                    cancel_requested=cancel_requested,
+                )
+                self._run_excel_com_operation(
+                    excel,
+                    lambda: setattr(destination, "Value2", normalized_values),
+                    "값 붙여넣기",
+                    cancel_requested=cancel_requested,
+                )
                 if cancel_requested is not None and cancel_requested():
                     raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
                 self.log(f"{self.TARGET_SHEET}!C1부터 {rows}행 × {columns}열을 값으로 붙여넣었습니다.")
@@ -270,7 +327,11 @@ class MilkrunExcelImporter:
                 rollback_error = None
                 if changed_target:
                     try:
-                        setattr(clear_range, original_attribute, original_contents)
+                        self._run_excel_com_operation(
+                            excel,
+                            lambda: setattr(clear_range, original_attribute, original_contents),
+                            "기존 값 복원",
+                        )
                     except Exception as exc:
                         rollback_error = exc
                 if rollback_error is not None:
@@ -385,24 +446,87 @@ class MilkrunExcelImporter:
                 continue
         return None
 
-    def _get_target_sheet(self, workbook: Any) -> Any:
+    def _get_target_sheet(
+        self,
+        excel: Any,
+        workbook: Any,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Any:
         try:
-            return workbook.Worksheets(self.TARGET_SHEET)
+            return self._run_excel_com_operation(
+                excel,
+                lambda: workbook.Worksheets(self.TARGET_SHEET),
+                f"'{self.TARGET_SHEET}' 시트 확인",
+                cancel_requested=cancel_requested,
+            )
+        except ExcelImportCancelled:
+            raise
         except Exception as exc:
+            if self._is_excel_busy_error(exc):
+                raise ExcelImportError(
+                    "Excel이 계속 사용 중이어 연결된 파일의 "
+                    f"'{self.TARGET_SHEET}' 시트를 확인하지 못했습니다. "
+                    "Excel의 편집 중인 셀이나 팝업창을 닫고 다시 시도해 주세요."
+                ) from exc
             raise ExcelImportError(
                 f"연결된 Excel 파일에 '{self.TARGET_SHEET}' 시트가 없습니다. 기존 값은 변경하지 않았습니다."
             ) from exc
 
-    def _ensure_target_ready(self, workbook: Any) -> Any:
-        if bool(getattr(workbook, "ReadOnly", False)):
+    def _ensure_target_ready(
+        self,
+        excel: Any,
+        workbook: Any,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Any:
+        try:
+            read_only = self._run_excel_com_operation(
+                excel,
+                lambda: bool(getattr(workbook, "ReadOnly", False)),
+                "읽기 전용 상태 확인",
+                cancel_requested=cancel_requested,
+            )
+        except ExcelImportCancelled:
+            raise
+        except Exception as exc:
+            if self._is_excel_busy_error(exc):
+                raise ExcelImportError(
+                    "Excel이 계속 사용 중이어 연결된 파일의 편집 상태를 "
+                    "확인하지 못했습니다. Excel의 편집 중인 셀이나 팝업창을 닫고 "
+                    "다시 시도해 주세요."
+                ) from exc
+            raise
+        if read_only:
             raise ExcelImportError(
                 "연결된 Excel 파일이 읽기 전용입니다. Excel에서 '편집 사용'으로 연 뒤 다시 시도해 주세요."
             )
-        if not bool(getattr(workbook, "Saved", True)):
+        try:
+            saved = self._run_excel_com_operation(
+                excel,
+                lambda: bool(getattr(workbook, "Saved", True)),
+                "저장 상태 확인",
+                cancel_requested=cancel_requested,
+            )
+        except ExcelImportCancelled:
+            raise
+        except Exception as exc:
+            if self._is_excel_busy_error(exc):
+                raise ExcelImportError(
+                    "Excel이 계속 사용 중이어 연결된 파일의 저장 상태를 "
+                    "확인하지 못했습니다. Excel의 편집 중인 셀이나 팝업창을 닫고 "
+                    "다시 시도해 주세요."
+                ) from exc
+            raise
+        if not saved:
             raise ExcelImportError(
                 "연결된 Excel 파일에 저장하지 않은 변경사항이 있습니다. Excel에서 먼저 저장한 뒤 다시 시도해 주세요."
             )
-        return self._get_target_sheet(workbook)
+        return self._get_target_sheet(
+            excel,
+            workbook,
+            cancel_requested=cancel_requested,
+        )
 
     @classmethod
     def _open_source_workbook(cls, excel: Any, source_path: Path) -> Any:
@@ -762,6 +886,10 @@ class MilkrunExcelImporter:
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 1):
             try:
+                self._wait_until_excel_ready(
+                    excel,
+                    cancel_requested=cancel_requested,
+                )
                 if cancel_requested is not None and cancel_requested():
                     raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
                 if not suppress_display_alerts:
@@ -784,12 +912,101 @@ class MilkrunExcelImporter:
                 raise
             except Exception as exc:
                 last_error = exc
-                retryable = any(marker in str(exc) for marker in self._SAVE_RETRY_MARKERS)
+                retryable = self._is_excel_busy_error(exc) or any(
+                    marker.casefold() in str(exc).casefold()
+                    for marker in self._SAVE_RETRY_MARKERS
+                )
                 if not retryable or attempt >= max_retries:
                     break
+                if cancel_requested is not None and cancel_requested():
+                    raise ExcelImportCancelled("사용자가 작업을 중지했습니다.") from exc
                 self.log(f"Excel 저장을 잠시 기다린 뒤 다시 시도합니다. ({attempt}/{max_retries})")
+                self._pump_waiting_com_messages()
                 time.sleep(0.5 * attempt)
         raise ExcelImportError(f"연결된 Excel 파일을 저장하지 못했습니다.\n{last_error}")
+
+    def _run_excel_com_operation(
+        self,
+        excel: Any,
+        operation: Callable[[], Any],
+        action_name: str,
+        *,
+        max_retries: int | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Any:
+        """Run an idempotent Excel COM operation with bounded busy retries."""
+        attempts = max_retries or self._COM_OPERATION_MAX_RETRIES
+        for attempt in range(1, attempts + 1):
+            self._wait_until_excel_ready(
+                excel,
+                cancel_requested=cancel_requested,
+            )
+            try:
+                return operation()
+            except ExcelImportCancelled:
+                raise
+            except Exception as exc:
+                if not self._is_excel_busy_error(exc) or attempt >= attempts:
+                    raise
+                if cancel_requested is not None and cancel_requested():
+                    raise ExcelImportCancelled("사용자가 작업을 중지했습니다.") from exc
+                self.log(
+                    f"Excel이 다른 작업을 처리 중입니다. "
+                    f"{action_name}를 잠시 후 다시 시도합니다. ({attempt}/{attempts})"
+                )
+                self._pump_waiting_com_messages()
+                time.sleep(self._COM_RETRY_BASE_DELAY_SECONDS * attempt)
+
+        raise RuntimeError(f"Excel {action_name} 재시도가 종료되었습니다.")
+
+    def _wait_until_excel_ready(
+        self,
+        excel: Any,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        """Briefly yield while Excel reports that it is busy.
+
+        Some Excel versions do not expose ``Ready`` through all automation
+        proxies.  In that case the actual operation remains the source of
+        truth and its RPC error is handled by ``_run_excel_com_operation``.
+        """
+        for check in range(1, self._COM_READY_MAX_CHECKS + 1):
+            try:
+                if bool(excel.Ready):
+                    return
+            except Exception as exc:
+                if not self._is_excel_busy_error(exc):
+                    return
+            if check >= self._COM_READY_MAX_CHECKS:
+                return
+            if cancel_requested is not None and cancel_requested():
+                raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
+            self._pump_waiting_com_messages()
+            time.sleep(self._COM_READY_BASE_DELAY_SECONDS * check)
+
+    def _pump_waiting_com_messages(self) -> None:
+        try:
+            pump_messages = getattr(self._pythoncom, "PumpWaitingMessages", None)
+            if callable(pump_messages):
+                pump_messages()
+        except Exception:
+            pass
+
+    @classmethod
+    def _is_excel_busy_error(cls, exc: BaseException) -> bool:
+        hresult_candidates = [getattr(exc, "hresult", None)]
+        hresult_candidates.extend(getattr(exc, "args", ()))
+        for candidate in hresult_candidates:
+            if not isinstance(candidate, int):
+                continue
+            if candidate in cls._COM_BUSY_HRESULTS:
+                return True
+            if candidate & 0xFFFFFFFF in {0x80010001, 0x8001010A}:
+                return True
+
+        error_text = str(exc).casefold()
+        return any(marker.casefold() in error_text for marker in cls._COM_BUSY_RETRY_MARKERS)
 
     @staticmethod
     def _same_path(left: Path, right: Path) -> bool:

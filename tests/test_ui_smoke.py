@@ -115,11 +115,37 @@ class MainWindowSmokeTests(unittest.TestCase):
 
             self.assertEqual(window.raw_table.rowCount(), 2)
             self.assertEqual(window.raw_table.item(0, 0).text(), "거래처")
+            self.assertEqual(window.raw_table.item(0, 4).text(), "72")
             self.assertEqual(window.raw_table.item(1, 5).text(), "72246115")
             self.assertEqual(window.raw_table.item(1, 6).text(), "상품 B")
             self.assertEqual(window.raw_table.cellWidget(1, 9).text(), "?")
         finally:
             window.close()
+
+    def test_one_pallet_two_boxes_displays_two_before_wms_and_keeps_manual_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = root / "memory.json"
+            try:
+                product = MilkrunProductRow("거래처", "M1", "1", "2", "123", "상품")
+                window._populate_milkrun_products((product,))
+
+                self.assertEqual(window.raw_table.item(0, 4).text(), "2")
+
+                manual = ProductMemory(window.product_memory_file).set_manual_category(
+                    "123",
+                    "고단",
+                    "상품",
+                )
+                window._on_weight_record_ready(manual, False)
+
+                self.assertEqual(window.raw_table.item(0, 4).text(), "2")
+                self.assertEqual(window.raw_table.item(0, 7).text(), "-")
+                self.assertEqual(window.raw_table.item(0, 8).text(), "-")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "고단")
+            finally:
+                window.close()
 
     def test_empty_today_result_skips_memory_recovery_and_wms_worker(self) -> None:
         window = MainWindow(smoke_test=True)
@@ -290,7 +316,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 with mock.patch.object(SettingsDialog, "exec", remove_and_emit):
                     window.show_settings()
 
-                self.assertEqual(window.raw_table.item(0, 4).text(), "-")
+                self.assertEqual(window.raw_table.item(0, 4).text(), "280")
                 self.assertEqual(window.raw_table.item(0, 7).text(), "-")
                 self.assertEqual(window.raw_table.item(0, 8).text(), "-")
                 self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
@@ -419,7 +445,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ):
                     window.show_settings()
 
-                self.assertEqual(window.raw_table.item(0, 4).text(), "-")
+                self.assertEqual(window.raw_table.item(0, 4).text(), "280")
                 self.assertEqual(window.raw_table.item(0, 7).text(), "-")
                 self.assertEqual(window.raw_table.item(0, 8).text(), "-")
                 self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")

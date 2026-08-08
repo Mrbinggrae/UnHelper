@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from urllib import error
 import build_release
 from build_manifest import build_manifest, build_release_assets
 from Modules.Common.AutoUpdater import AutoUpdater
+from Modules.Common.GitHubIssueReporter import encode_token_value
 
 
 def release_payload(
@@ -153,6 +155,218 @@ class PreviousManifestSelectionTests(unittest.TestCase):
                     build_release.find_previous_manifest("0.2.0"),
                     local_manifest,
                 )
+
+
+class ReleaseTokenValidationTests(unittest.TestCase):
+    @staticmethod
+    def _api_response(payload: dict):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps(payload).encode("utf-8")
+        return response
+
+    @staticmethod
+    def _api_error(status: int) -> error.HTTPError:
+        return error.HTTPError(
+            build_release.GITHUB_ISSUES_API,
+            status,
+            "GitHub API error",
+            hdrs=None,
+            fp=io.BytesIO(b'{"message":"Validation Failed"}'),
+        )
+
+    @staticmethod
+    def _write_valid_token(root: Path) -> Path:
+        token_path = root / build_release.BUG_REPORT_TOKEN_NAME
+        token_path.write_text(
+            encode_token_value("github_pat_" + "A" * 40),
+            encoding="utf-8",
+        )
+        return token_path
+
+    def test_release_source_token_must_exist_and_be_nonempty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            token_path = root / build_release.BUG_REPORT_TOKEN_NAME
+
+            with mock.patch.object(build_release, "PROJECT_ROOT", root):
+                with self.assertRaisesRegex(RuntimeError, "토큰 파일이 없습니다"):
+                    build_release.require_bug_report_token_source()
+
+                token_path.touch()
+                with self.assertRaisesRegex(RuntimeError, "토큰 파일이 비어 있습니다"):
+                    build_release.require_bug_report_token_source()
+
+                token_path.write_bytes(b"opaque-token-data")
+                self.assertEqual(
+                    build_release.require_bug_report_token_source(),
+                    token_path,
+                )
+
+    def test_valid_token_authenticates_and_accesses_intended_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_valid_token(root)
+            responses = (
+                self._api_response({"login": "token-owner"}),
+                self._api_response({"full_name": "Mrbinggrae/UnHelper"}),
+                self._api_error(422),
+            )
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(
+                    build_release.request,
+                    "urlopen",
+                    side_effect=responses,
+                ) as urlopen,
+            ):
+                build_release.validate_bug_report_token_preflight()
+
+            self.assertEqual(urlopen.call_count, 3)
+            for call in urlopen.call_args_list:
+                authorization = call.args[0].headers.get("Authorization", "")
+                self.assertTrue(authorization.startswith("Bearer github_pat_"))
+            issue_probe = urlopen.call_args_list[-1].args[0]
+            self.assertEqual(issue_probe.get_method(), "POST")
+            self.assertEqual(issue_probe.data, b"{}")
+
+    def test_missing_issues_write_permission_fails_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_valid_token(root)
+            responses = (
+                self._api_response({"login": "token-owner"}),
+                self._api_response({"full_name": "Mrbinggrae/UnHelper"}),
+                self._api_error(403),
+            )
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(
+                    build_release.request,
+                    "urlopen",
+                    side_effect=responses,
+                ),
+                self.assertRaisesRegex(RuntimeError, "Issues 쓰기 권한"),
+            ):
+                build_release.validate_bug_report_token_preflight()
+
+    def test_malformed_and_non_fine_grained_tokens_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            token_path = root / build_release.BUG_REPORT_TOKEN_NAME
+            cases = (
+                "v1:not-valid-base64%%%",
+                encode_token_value("ghp_not-a-fine-grained-token"),
+            )
+
+            for value in cases:
+                with self.subTest(value_kind=value[:3]):
+                    token_path.write_text(value, encoding="utf-8")
+                    with (
+                        mock.patch.object(build_release, "PROJECT_ROOT", root),
+                        mock.patch.object(build_release.request, "urlopen") as urlopen,
+                        self.assertRaisesRegex(RuntimeError, "토큰"),
+                    ):
+                        build_release.validate_bug_report_token_preflight()
+                    urlopen.assert_not_called()
+
+    def test_http_401_fails_token_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_valid_token(root)
+            unauthorized = error.HTTPError(
+                build_release.GITHUB_USER_API,
+                401,
+                "Unauthorized",
+                hdrs=None,
+                fp=None,
+            )
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(
+                    build_release.request,
+                    "urlopen",
+                    side_effect=unauthorized,
+                ),
+                self.assertRaisesRegex(RuntimeError, "HTTP 401"),
+            ):
+                build_release.validate_bug_report_token_preflight()
+
+    def test_wrong_repository_and_network_failure_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_valid_token(root)
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(
+                    build_release.request,
+                    "urlopen",
+                    side_effect=(
+                        self._api_response({"login": "token-owner"}),
+                        self._api_response({"full_name": "Mrbinggrae/Other"}),
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "저장소가 UnHelper와 일치하지"),
+            ):
+                build_release.validate_bug_report_token_preflight()
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(
+                    build_release.request,
+                    "urlopen",
+                    side_effect=error.URLError("offline"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "네트워크"),
+            ):
+                build_release.validate_bug_report_token_preflight()
+
+    def test_packaged_token_must_exist_and_be_nonempty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            dist_dir = Path(temp) / "dist" / "UnHelper"
+            packaged_path = dist_dir / build_release.PACKAGED_BUG_REPORT_TOKEN_PATH
+
+            with mock.patch.object(build_release, "DIST_DIR", dist_dir):
+                with self.assertRaisesRegex(RuntimeError, "산출물에 오류 신고 토큰"):
+                    build_release.require_packaged_bug_report_token()
+
+                packaged_path.parent.mkdir(parents=True)
+                packaged_path.touch()
+                with self.assertRaisesRegex(RuntimeError, "산출물에 오류 신고 토큰"):
+                    build_release.require_packaged_bug_report_token()
+
+                packaged_path.write_bytes(b"opaque-token-data")
+                self.assertEqual(
+                    build_release.require_packaged_bug_report_token(),
+                    packaged_path,
+                )
+
+    def test_build_stops_before_manifest_when_pyinstaller_omits_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dist_dir = root / "dist" / "UnHelper"
+            (root / build_release.BUG_REPORT_TOKEN_NAME).write_bytes(
+                b"opaque-token-data"
+            )
+
+            with (
+                mock.patch.object(build_release, "PROJECT_ROOT", root),
+                mock.patch.object(build_release, "DIST_DIR", dist_dir),
+                mock.patch.object(build_release, "validate_bug_report_token_preflight"),
+                mock.patch.object(build_release, "copy_and_verify_chromedriver"),
+                mock.patch.object(build_release, "find_previous_manifest", return_value=None),
+                mock.patch.object(build_release, "project_python", return_value=Path("python")),
+                mock.patch.object(build_release, "run") as run_command,
+                self.assertRaisesRegex(RuntimeError, "산출물에 오류 신고 토큰"),
+            ):
+                build_release.build_unhelper("0.1.4", with_installer=False)
+
+            run_command.assert_called_once()
+            self.assertIn("PyInstaller", run_command.call_args.args[1])
 
 
 class UpdaterSelectionTests(unittest.TestCase):

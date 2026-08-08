@@ -10,3 +10,5 @@ htmlcov/
 *.log
 *.crdownload
 downloads/
+bug_report_token.dat
+bug_report_token.txt

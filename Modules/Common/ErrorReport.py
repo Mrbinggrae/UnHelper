@@ -59,6 +59,25 @@ def sanitize_report_text(value: object) -> str:
         text,
     )
 
+    # JSON and Python diagnostics commonly quote mapping keys, for example
+    # ``{"password": "value"}`` or ``{'wms_id': 'worker'}``.  Mask these
+    # separately while preserving the surrounding syntax so the next key can
+    # still be recognized and redacted.
+    quoted_mapping_pattern = re.compile(
+        rf"(?P<prefix>(?P<key_quote>['\"])(?:{key_names})(?P=key_quote)\s*:\s*)"
+        rf"(?:"
+        rf"(?P<value_quote>['\"])(?:\\.|(?!(?P=value_quote)).)*(?P=value_quote)"
+        rf"|(?P<bare_value>[^,}}\]\r\n]*)"
+        rf")",
+        flags=re.IGNORECASE,
+    )
+
+    def mask_quoted_mapping(match: re.Match[str]) -> str:
+        quote = match.group("value_quote") or ""
+        return f"{match.group('prefix')}{quote}***{quote}"
+
+    text = quoted_mapping_pattern.sub(mask_quoted_mapping, text)
+
     # A credential value may legitimately contain whitespace and punctuation.
     # Stop only at the next recognized credential assignment or at the line
     # boundary; masking just the first whitespace-delimited token can leak the

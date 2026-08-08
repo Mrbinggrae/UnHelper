@@ -4,6 +4,7 @@ from .ProductMemory import (
     LIGHT_CATEGORY,
     ProductMemory,
     ProductMemoryRecord,
+    calculate_boxes_per_pallet,
     calculate_pallet_measurement,
 )
 from .ProductWeightCrawler import ProductWeightCrawler, ProductWeightLookup, WMSWeightError
@@ -21,5 +22,6 @@ __all__ = [
     "ProductWeightWorker",
     "SkuWeightFailure",
     "WMSWeightError",
+    "calculate_boxes_per_pallet",
     "calculate_pallet_measurement",
 ]

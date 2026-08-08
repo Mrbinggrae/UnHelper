@@ -120,6 +120,19 @@ def _positive_decimal(value: Any, field_name: str) -> Decimal:
     return result
 
 
+def calculate_boxes_per_pallet(
+    box_count: Any,
+    pallet_count: Any,
+) -> Decimal:
+    """Calculate a shipment's box count per pallet without requiring WMS data."""
+    boxes = _positive_decimal(box_count, "박스 수")
+    pallets = _positive_decimal(pallet_count, "팔레트 수")
+
+    with localcontext() as context:
+        context.prec = CALCULATION_PRECISION
+        return boxes / pallets
+
+
 def calculate_pallet_measurement(
     weight_grams: Any,
     box_count: Any,
@@ -127,12 +140,10 @@ def calculate_pallet_measurement(
 ) -> tuple[Decimal, Decimal, str]:
     """Calculate boxes/pallet, kg/pallet, and the unrounded threshold result."""
     weight = _positive_decimal(weight_grams, "상품 무게(g)")
-    boxes = _positive_decimal(box_count, "박스 수")
-    pallets = _positive_decimal(pallet_count, "팔레트 수")
+    boxes_per_pallet = calculate_boxes_per_pallet(box_count, pallet_count)
 
     with localcontext() as context:
         context.prec = CALCULATION_PRECISION
-        boxes_per_pallet = boxes / pallets
         pallet_weight_kg = weight * boxes_per_pallet / Decimal("1000")
     automatic_category = HEAVY_CATEGORY if pallet_weight_kg >= HEAVY_THRESHOLD_KG else LIGHT_CATEGORY
     return boxes_per_pallet, pallet_weight_kg, automatic_category

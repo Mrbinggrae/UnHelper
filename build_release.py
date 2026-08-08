@@ -20,9 +20,15 @@ SHARED_DRIVER = Path(
     )
 )
 GITHUB_API = "https://api.github.com/repos/Mrbinggrae/UnHelper/releases"
+GITHUB_USER_API = "https://api.github.com/user"
+GITHUB_REPO_API = "https://api.github.com/repos/Mrbinggrae/UnHelper"
+GITHUB_ISSUES_API = "https://api.github.com/repos/Mrbinggrae/UnHelper/issues"
+GITHUB_REPO_FULL_NAME = "Mrbinggrae/UnHelper"
 APP_NAME = "UnHelper"
 APP_PREFIX = "UnHelper"
 DIST_DIR = PROJECT_ROOT / "dist" / APP_NAME
+BUG_REPORT_TOKEN_NAME = "bug_report_token.dat"
+PACKAGED_BUG_REPORT_TOKEN_PATH = Path("_internal") / BUG_REPORT_TOKEN_NAME
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -43,6 +49,188 @@ def read_version() -> str:
 def project_python() -> Path:
     venv_python = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
     return venv_python if venv_python.is_file() else Path(sys.executable)
+
+
+def require_bug_report_token_source() -> Path:
+    """Fail a release build when its separately-managed issue token is absent.
+
+    Only filesystem metadata is inspected here.  The token value is never read
+    or printed by the release builder.
+    """
+
+    token_path = PROJECT_ROOT / BUG_REPORT_TOKEN_NAME
+    if not token_path.is_file():
+        raise RuntimeError(
+            f"오류 신고 토큰 파일이 없습니다: {BUG_REPORT_TOKEN_NAME}\n"
+            "python create_bug_report_token.py로 먼저 생성해 주세요."
+        )
+    if token_path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"오류 신고 토큰 파일이 비어 있습니다: {BUG_REPORT_TOKEN_NAME}\n"
+            "python create_bug_report_token.py로 다시 생성해 주세요."
+        )
+    return token_path
+
+
+def _load_bug_report_token_for_validation(token_path: Path) -> str:
+    """Decode exactly *token_path* through the application's token loader."""
+
+    try:
+        encoded_value = token_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise RuntimeError(
+            f"오류 신고 토큰 파일을 읽을 수 없습니다: {BUG_REPORT_TOKEN_NAME}\n"
+            "python create_bug_report_token.py로 다시 생성해 주세요."
+        ) from None
+
+    # The runtime loader normally gives environment variables precedence. For
+    # a release preflight we must validate the exact file being packaged, so
+    # temporarily feed that file value through the same public decoder path.
+    from Modules.Common.GitHubIssueReporter import (
+        TOKEN_ENV_VARS,
+        load_github_issue_token,
+    )
+
+    previous_environment = {
+        name: os.environ.get(name)
+        for name in TOKEN_ENV_VARS
+    }
+    try:
+        for name in TOKEN_ENV_VARS:
+            os.environ.pop(name, None)
+        os.environ[TOKEN_ENV_VARS[0]] = encoded_value
+        try:
+            token = load_github_issue_token().strip()
+        except (ValueError, UnicodeError):
+            raise RuntimeError(
+                f"오류 신고 토큰 파일 형식이 올바르지 않습니다: {BUG_REPORT_TOKEN_NAME}\n"
+                "python create_bug_report_token.py로 다시 생성해 주세요."
+            ) from None
+    finally:
+        for name, previous_value in previous_environment.items():
+            if previous_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous_value
+
+    if not re.fullmatch(r"github_pat_[A-Za-z0-9_]+", token):
+        raise RuntimeError(
+            "오류 신고 토큰이 GitHub fine-grained personal access token 형식이 아닙니다.\n"
+            "'github_pat_'로 시작하는 토큰으로 다시 생성해 주세요."
+        )
+    return token
+
+
+def _authenticated_github_get(url: str, token: str, description: str) -> dict[str, Any]:
+    api_request = request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "UnHelper-Release-Token-Validator",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with request.urlopen(api_request, timeout=20) as response:
+            payload = response.read()
+    except error.HTTPError as exc:
+        raise RuntimeError(
+            f"오류 신고 토큰의 {description}에 실패했습니다. (GitHub HTTP {exc.code})"
+        ) from None
+    except (error.URLError, TimeoutError, OSError):
+        raise RuntimeError(
+            f"오류 신고 토큰의 {description} 중 GitHub 네트워크 연결에 실패했습니다."
+        ) from None
+
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        raise RuntimeError(
+            f"오류 신고 토큰의 {description} 응답 형식이 올바르지 않습니다."
+        ) from None
+    if not isinstance(decoded, dict):
+        raise RuntimeError(
+            f"오류 신고 토큰의 {description} 응답 형식이 올바르지 않습니다."
+        )
+    return decoded
+
+
+def _validate_github_issue_write(token: str) -> None:
+    """Prove Issues write permission without creating an issue.
+
+    GitHub checks repository permissions before validating the required issue
+    title.  A deliberately invalid request therefore returns HTTP 422 only
+    after the token has passed the Issues write authorization check.
+    """
+
+    api_request = request.Request(
+        GITHUB_ISSUES_API,
+        data=b"{}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "UnHelper-Release-Token-Validator",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(api_request, timeout=20):
+            pass
+    except error.HTTPError as exc:
+        if exc.code == 422:
+            return
+        raise RuntimeError(
+            "오류 신고 토큰의 Issues 쓰기 권한 확인에 실패했습니다. "
+            f"(GitHub HTTP {exc.code})"
+        ) from None
+    except (error.URLError, TimeoutError, OSError):
+        raise RuntimeError(
+            "오류 신고 토큰의 Issues 쓰기 권한 확인 중 GitHub 네트워크 연결에 실패했습니다."
+        ) from None
+
+    raise RuntimeError(
+        "오류 신고 토큰의 Issues 쓰기 권한 검증 요청이 예상과 다르게 성공했습니다. "
+        "GitHub API 검증 방식을 확인해 주세요."
+    )
+
+
+def validate_bug_report_token_preflight() -> None:
+    """Validate token identity, target repository, and Issues write access."""
+
+    token_path = require_bug_report_token_source()
+    token = _load_bug_report_token_for_validation(token_path)
+    user = _authenticated_github_get(GITHUB_USER_API, token, "사용자 인증 확인")
+    if not str(user.get("login") or "").strip():
+        raise RuntimeError("오류 신고 토큰의 GitHub 사용자 인증 응답에 로그인 정보가 없습니다.")
+
+    repository = _authenticated_github_get(
+        GITHUB_REPO_API,
+        token,
+        "UnHelper 저장소 접근 확인",
+    )
+    full_name = str(repository.get("full_name") or "").strip()
+    if full_name.casefold() != GITHUB_REPO_FULL_NAME.casefold():
+        raise RuntimeError(
+            "오류 신고 토큰이 확인한 저장소가 UnHelper와 일치하지 않습니다."
+        )
+    _validate_github_issue_write(token)
+
+    print("[OK] GitHub 오류 신고 토큰 인증, 저장소 접근, Issues 쓰기 권한 확인")
+
+
+def require_packaged_bug_report_token() -> Path:
+    """Confirm PyInstaller actually copied the token into the distribution."""
+
+    packaged_path = DIST_DIR / PACKAGED_BUG_REPORT_TOKEN_PATH
+    if not packaged_path.is_file() or packaged_path.stat().st_size <= 0:
+        raise RuntimeError(
+            "PyInstaller 산출물에 오류 신고 토큰 파일이 포함되지 않았습니다: "
+            f"{PACKAGED_BUG_REPORT_TOKEN_PATH.as_posix()}"
+        )
+    return packaged_path
 
 
 def run(command: list[str], label: str) -> None:
@@ -312,6 +500,7 @@ def build_installer(version: str) -> None:
 
 
 def build_unhelper(version: str, with_installer: bool) -> None:
+    validate_bug_report_token_preflight()
     copy_and_verify_chromedriver()
     previous_manifest = find_previous_manifest(version)
     python = project_python()
@@ -320,6 +509,7 @@ def build_unhelper(version: str, with_installer: bool) -> None:
         [str(python), "-m", "PyInstaller", "UnHelper.spec", "--clean", "--noconfirm"],
         "PyInstaller UnHelper (onedir)",
     )
+    require_packaged_bug_report_token()
 
     manifest_command = [
         str(python),

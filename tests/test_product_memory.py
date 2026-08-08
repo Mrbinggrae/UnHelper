@@ -15,6 +15,7 @@ from Modules.WMS.ProductMemory import (
     MEMORY_TYPE,
     MEMORY_VERSION,
     ProductMemory,
+    calculate_boxes_per_pallet,
     calculate_pallet_measurement,
     normalize_product_name,
     normalize_sku_id,
@@ -37,6 +38,10 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertEqual(boxes, Decimal("280"))
         self.assertEqual(kilograms, Decimal("280"))
         self.assertEqual(category, HEAVY_CATEGORY)
+
+    def test_boxes_per_pallet_is_decimal_and_does_not_require_wms_weight(self) -> None:
+        self.assertEqual(calculate_boxes_per_pallet("2", "1"), Decimal("2"))
+        self.assertEqual(calculate_boxes_per_pallet("1", "2"), Decimal("0.5"))
 
     def test_calculation_rejects_empty_zero_and_non_numeric_values(self) -> None:
         for values in (("", "10", "1"), ("1000", "0", "1"), ("1000", "10", "0"), ("x", "10", "1")):
@@ -125,6 +130,18 @@ class ProductMemoryTests(unittest.TestCase):
         cleared = memory.set_manual_category("123", None)
         self.assertIsNotNone(cleared)
         self.assertEqual(cleared.effective_category, HEAVY_CATEGORY)
+
+    def test_cached_weight_recalculates_two_boxes_on_one_pallet_and_keeps_override(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        memory.upsert_measurement("123", "상품", "1000", "80", "2")
+        memory.set_manual_category("123", HIGH_CATEGORY)
+
+        recalculated = memory.update_calculation("123", "2", "1")
+
+        self.assertEqual(recalculated.boxes_per_pallet, Decimal("2"))
+        self.assertEqual(recalculated.pallet_weight_kg, Decimal("2"))
+        self.assertEqual(recalculated.automatic_category, LIGHT_CATEGORY)
+        self.assertEqual(recalculated.category_override, HIGH_CATEGORY)
 
     def test_weight_only_cache_survives_invalid_pallet_inputs_and_can_recalculate_later(self) -> None:
         path = self.root / "memory.json"

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -19,9 +18,9 @@ from PySide6.QtWidgets import (
 from Modules.Common.ErrorReport import (
     FailureDetails,
     build_error_report,
-    build_github_issue_url,
 )
 from Modules.Common.paths import bundled_root
+from Modules.GUI.BugReportWorker import BugReportWorker
 
 
 class ErrorReportDialog(QDialog):
@@ -32,13 +31,14 @@ class ErrorReportDialog(QDialog):
         *,
         context: dict[str, object] | None = None,
         parent=None,
-        open_url: Callable[[QUrl], bool] | None = None,
     ):
         super().__init__(parent)
         self.failure = FailureDetails.coerce(failure)
-        self.report = build_error_report(title, self.failure, context=context)
-        self.issue_url = build_github_issue_url(title, self.report)
-        self._open_url = open_url or QDesktopServices.openUrl
+        self.report_context = dict(context or {})
+        self.report = build_error_report(title, self.failure, context=self.report_context)
+        self.report_title = title
+        self._report_worker: BugReportWorker | None = None
+        self._report_in_progress = False
 
         self.setWindowTitle(title)
         self.setMinimumSize(680, 440)
@@ -73,8 +73,8 @@ class ErrorReportDialog(QDialog):
         layout.addWidget(self.detail_view, 1)
 
         self.action_status = QLabel(
-            "신고 버튼을 누르면 개인정보와 인증정보를 가린 보고서를 복사하고 GitHub 작성 화면을 엽니다. "
-            "열린 본문 입력칸에 Ctrl+V로 붙여넣어 주세요."
+            "신고 버튼을 누르면 개인정보와 인증정보를 가린 보고서를 자동으로 전송합니다. "
+            "사용자의 GitHub 로그인은 필요하지 않습니다."
         )
         self.action_status.setWordWrap(True)
         self.action_status.setStyleSheet("color: #A1A1AA;")
@@ -82,15 +82,15 @@ class ErrorReportDialog(QDialog):
 
         buttons = QHBoxLayout()
         self.copy_button = QPushButton("오류 내용 복사")
-        self.report_button = QPushButton("GitHub 이슈 신고")
-        close_button = QPushButton("닫기")
+        self.report_button = QPushButton("GitHub 오류 자동 신고")
+        self.close_button = QPushButton("닫기")
         self.copy_button.clicked.connect(self.copy_report)
-        self.report_button.clicked.connect(self.open_github_issue)
-        close_button.clicked.connect(self.accept)
+        self.report_button.clicked.connect(self.submit_github_issue)
+        self.close_button.clicked.connect(self.accept)
         buttons.addWidget(self.copy_button)
         buttons.addWidget(self.report_button)
         buttons.addStretch(1)
-        buttons.addWidget(close_button)
+        buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
 
     def copy_report(self) -> None:
@@ -99,17 +99,61 @@ class ErrorReportDialog(QDialog):
             clipboard.setText(self.report)
         self.action_status.setText("개인정보와 인증정보를 가린 오류 내용이 클립보드에 복사되었습니다.")
 
-    def open_github_issue(self) -> None:
-        self.copy_report()
-        if self._open_url(QUrl(self.issue_url)):
-            self.action_status.setText(
-                "GitHub 이슈 작성 화면을 열었습니다. 본문 입력칸에 Ctrl+V로 복사된 오류 내용을 "
-                "붙여넣고 확인한 뒤 제출해 주세요."
-            )
+    def submit_github_issue(self) -> None:
+        if self._report_in_progress:
             return
-        self.action_status.setText(
-            "브라우저를 열지 못했습니다. 복사된 오류 내용을 UnHelper GitHub Issues에 붙여넣어 주세요."
+
+        self._report_in_progress = True
+        self.report_button.setEnabled(False)
+        self.copy_button.setEnabled(False)
+        self.close_button.setEnabled(False)
+        self.action_status.setText("오류 신고를 안전하게 전송하고 있습니다...")
+
+        worker = BugReportWorker(
+            self.report_title,
+            self.failure,
+            self.report,
+            self.report_context,
         )
+        self._report_worker = worker
+        worker.report_finished.connect(self._on_report_finished)
+        worker.finished.connect(self._on_report_worker_finished)
+        worker.start()
+
+    def _on_report_finished(self, success: bool, message: str, issue_url: str) -> None:
+        del issue_url
+        self.action_status.setText(message)
+        if success:
+            QMessageBox.information(self, "신고 완료", message)
+        else:
+            QMessageBox.warning(
+                self,
+                "신고 실패",
+                f"오류 신고를 전송하지 못했습니다.\n\n{message}\n\n"
+                "오류 내용 복사 버튼으로 내용을 보관한 뒤 관리자에게 전달해 주세요.",
+            )
+
+    def _on_report_worker_finished(self) -> None:
+        worker = self._report_worker
+        self._report_worker = None
+        self._report_in_progress = False
+        self.report_button.setEnabled(True)
+        self.copy_button.setEnabled(True)
+        self.close_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+
+    def accept(self) -> None:
+        if self._report_in_progress:
+            self.action_status.setText("오류 신고 전송이 끝날 때까지 잠시 기다려 주세요.")
+            return
+        super().accept()
+
+    def reject(self) -> None:
+        if self._report_in_progress:
+            self.action_status.setText("오류 신고 전송이 끝날 때까지 잠시 기다려 주세요.")
+            return
+        super().reject()
 
 
 class UpdateHistoryDialog(QDialog):

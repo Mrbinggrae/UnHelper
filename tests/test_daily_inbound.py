@@ -77,6 +77,27 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(result[2].sku_name, "바유이 전동드릴")
         self.assertEqual(result[2].dispatch_number, "M3370492")
 
+    def test_parser_keeps_one_pallet_and_two_boxes_in_their_own_fields(self) -> None:
+        rows = (
+            (
+                "거래처 (A00001)",
+                "10813478",
+                "1",
+                "2",
+                "shipment",
+                "",
+                "123",
+                "상품",
+                "barcode",
+                "2",
+            ),
+        )
+
+        result = parse_detail_table_cells(rows)
+
+        self.assertEqual(result[0].pallet_count, "1")
+        self.assertEqual(result[0].box_count, "2")
+
 
 if __name__ == "__main__":
     unittest.main()

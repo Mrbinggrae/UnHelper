@@ -60,6 +60,7 @@ from Modules.WMS.ProductMemory import (
     MANUAL_CATEGORIES,
     ProductMemory,
     ProductMemoryRecord,
+    calculate_boxes_per_pallet,
     calculate_pallet_measurement,
     normalize_product_name,
     normalize_sku_id,
@@ -799,12 +800,19 @@ class MainWindow(QMainWindow):
         self._weight_row_errors.clear()
         self.raw_table.setRowCount(len(self.current_products))
         for row_index, product in enumerate(self.current_products):
+            try:
+                boxes_per_pallet = self._format_decimal(
+                    calculate_boxes_per_pallet(product.box_count, product.pallet_count),
+                    3,
+                )
+            except (TypeError, ValueError):
+                boxes_per_pallet = "-"
             values = (
                 product.vendor_name,
                 product.milkrun_number,
                 product.pallet_count,
                 product.box_count,
-                "-",
+                boxes_per_pallet,
                 product.sku_id,
                 normalize_product_name(product.sku_name),
                 "-",
@@ -913,25 +921,31 @@ class MainWindow(QMainWindow):
 
             category = record.category_override or "?"
             error_text = ""
+            try:
+                boxes_per_pallet = calculate_boxes_per_pallet(
+                    product.box_count,
+                    product.pallet_count,
+                )
+                self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
+            except (TypeError, ValueError) as exc:
+                self._set_table_text(row_index, 4, "-")
+                error_text = str(exc)
+                self._weight_row_errors[record.sku_id] = error_text
+
             if record.weight_grams is not None:
                 self._set_table_text(row_index, 7, self._format_decimal(record.weight_grams))
-                try:
-                    boxes_per_pallet, pallet_weight_kg, automatic_category = calculate_pallet_measurement(
+                if not error_text:
+                    _, pallet_weight_kg, automatic_category = calculate_pallet_measurement(
                         record.weight_grams,
                         product.box_count,
                         product.pallet_count,
                     )
-                    self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
                     self._set_table_text(row_index, 8, self._format_decimal(pallet_weight_kg, 3))
                     category = record.category_override or automatic_category
-                except (TypeError, ValueError) as exc:
-                    self._set_table_text(row_index, 4, "-")
+                else:
                     self._set_table_text(row_index, 8, "-")
-                    error_text = str(exc)
-                    self._weight_row_errors[record.sku_id] = error_text
             else:
                 self._set_table_text(row_index, 7, "-")
-                self._set_table_text(row_index, 4, "-")
                 self._set_table_text(row_index, 8, "-")
 
             button = self.raw_table.cellWidget(row_index, 9)
@@ -1117,7 +1131,14 @@ class MainWindow(QMainWindow):
                     continue
             except ValueError:
                 continue
-            self._set_table_text(row_index, 4, "-")
+            try:
+                boxes_per_pallet = calculate_boxes_per_pallet(
+                    product.box_count,
+                    product.pallet_count,
+                )
+                self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
+            except (TypeError, ValueError):
+                self._set_table_text(row_index, 4, "-")
             self._set_table_text(row_index, 7, "-")
             self._set_table_text(row_index, 8, "-")
             button = self.raw_table.cellWidget(row_index, 9)

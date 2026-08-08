@@ -94,7 +94,10 @@ class ProductWeightCrawler:
         (By.XPATH, "/html/body/div[1]/div[3]/div[1]/div[2]/ul/li[1]/a"),
     )
 
-    SKU_INPUT_LOCATOR: Locator = (By.CSS_SELECTOR, "input.input-sku-id")
+    SKU_INPUT_LOCATOR: Locator = (
+        By.CSS_SELECTOR,
+        "input.form-control.input-external-id",
+    )
     SKU_SEARCH_BUTTON_LOCATOR: Locator = (By.CSS_SELECTOR, "button.btn-search")
     RESULT_ROWS_LOCATOR: Locator = (By.CSS_SELECTOR, "#wms__container table tbody tr")
     HIDDEN_WEIGHT_LOCATOR: Locator = (By.CSS_SELECTOR, "input.hidden-weight")

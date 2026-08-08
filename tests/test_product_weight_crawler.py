@@ -98,6 +98,12 @@ class ProductWeightCrawlerTests(unittest.TestCase):
     def make_crawler(self) -> ProductWeightCrawler:
         return ProductWeightCrawler(Path("chromedriver.exe"), log=lambda _message: None)
 
+    def test_sku_input_targets_product_management_external_id_field(self) -> None:
+        self.assertEqual(
+            ProductWeightCrawler.SKU_INPUT_LOCATOR,
+            (By.CSS_SELECTOR, "input.form-control.input-external-id"),
+        )
+
     def test_exact_sku_row_only_and_product_name_preserves_slash(self) -> None:
         wrong = _result_row("999", "다른 상품")
         exact = _result_row("123", "상품 A /\n상품 B")

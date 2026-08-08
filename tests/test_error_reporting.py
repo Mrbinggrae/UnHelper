@@ -9,8 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QUrl
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from Modules.Common.ErrorReport import (
@@ -18,6 +17,14 @@ from Modules.Common.ErrorReport import (
     build_error_report,
     build_github_issue_url,
     sanitize_report_text,
+)
+from Modules.Common.GitHubIssueReporter import (
+    FINGERPRINT_MARKER,
+    GitHubAPIError,
+    GitHubIssueReporter,
+    IssueReportResult,
+    encode_token_value,
+    load_github_issue_token,
 )
 from Modules.Common.Credentials import WMSCredentialStore
 from Modules.Excel.MilkrunExcelImporter import ExcelImportError, MilkrunExcelImporter
@@ -86,6 +93,23 @@ class ErrorReportTests(unittest.TestCase):
         self.assertIn("Authorization: ***", sanitized)
         self.assertIn("safe diagnostic line", sanitized)
 
+    def test_report_masks_json_and_python_mapping_credentials(self) -> None:
+        raw = (
+            '{"password": "alpha beta", "token": "abc123", "safe": "visible"}\n'
+            "{'wms_password': 'delta epsilon', 'wms_id': 'worker123', 'count': 2}"
+        )
+
+        sanitized = sanitize_report_text(raw)
+
+        for secret in ("alpha beta", "abc123", "delta epsilon", "worker123"):
+            self.assertNotIn(secret, sanitized)
+        self.assertIn('"password": "***"', sanitized)
+        self.assertIn('"token": "***"', sanitized)
+        self.assertIn("'wms_password': '***'", sanitized)
+        self.assertIn("'wms_id': '***'", sanitized)
+        self.assertIn('"safe": "visible"', sanitized)
+        self.assertIn("'count': 2", sanitized)
+
     def test_issue_url_targets_unhelper_without_putting_report_in_query(self) -> None:
         failure = FailureDetails("실패", "token=do-not-send")
         report = build_error_report("Excel 반영 실패", failure)
@@ -105,22 +129,258 @@ class ErrorReportTests(unittest.TestCase):
         self.assertLess(len(issue_url), 1_000)
         self.assertNotIn("body=", issue_url)
 
-    def test_error_dialog_copies_report_and_opens_prefilled_issue(self) -> None:
-        opened = []
+    def test_bug_report_token_can_be_loaded_from_encoded_environment_value(self) -> None:
+        encoded = encode_token_value("test-fine-grained-token")
+        with patch.dict(
+            os.environ,
+            {"UNHELPER_GITHUB_ISSUE_TOKEN": encoded},
+            clear=False,
+        ):
+            self.assertEqual(load_github_issue_token(), "test-fine-grained-token")
+
+    def test_bug_report_token_can_be_loaded_from_gitignored_data_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            token_path = Path(temp) / "bug_report_token.dat"
+            token_path.write_text(encode_token_value("file-token"), encoding="utf-8")
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "UNHELPER_GITHUB_ISSUE_TOKEN": "",
+                        "GITHUB_ISSUE_TOKEN": "",
+                    },
+                    clear=False,
+                ),
+                patch(
+                    "Modules.Common.GitHubIssueReporter._candidate_token_paths",
+                    return_value=[token_path],
+                ),
+            ):
+                self.assertEqual(load_github_issue_token(), "file-token")
+
+    def test_reporter_creates_sanitized_issue_with_fingerprint(self) -> None:
+        reporter = GitHubIssueReporter(token="test-token")
+        calls = []
+
+        def request_json(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return []
+            return {"number": 31, "html_url": "https://example.invalid/issues/31"}
+
+        with (
+            patch.object(reporter, "_request_json", side_effect=request_json),
+            patch("Modules.Common.GitHubIssueReporter.time.sleep"),
+        ):
+            result = reporter.report_error(
+                "Excel 반영 실패",
+                "Traceback\ntoken=secret-value",
+                {"category": "Milkrun"},
+                report="## 오류\n\ntoken=secret-value\n안전한 진단 내용",
+            )
+
+        self.assertTrue(result.created)
+        self.assertEqual(result.number, 31)
+        self.assertEqual([call[0] for call in calls], ["GET", "GET", "POST"])
+        payload = calls[-1][2]
+        self.assertIn(f"<!-- {FINGERPRINT_MARKER}:", payload["body"])
+        self.assertNotIn("secret-value", payload["body"])
+        self.assertIn("안전한 진단 내용", payload["body"])
+        self.assertEqual(payload["labels"], ["bug", "auto-report"])
+
+    def test_reporter_adds_comment_to_matching_open_issue(self) -> None:
+        reporter = GitHubIssueReporter(token="test-token")
+        title = "동일 오류"
+        error_msg = 'File "C:/one.py", line 123\nRuntimeError: busy'
+        context = {"category": "Excel"}
+        fingerprint = reporter._fingerprint(title, error_msg, context)
+        marker = f"<!-- {FINGERPRINT_MARKER}: {fingerprint} -->"
+        calls = []
+
+        def request_json(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return [
+                    {
+                        "number": 7,
+                        "html_url": "https://example.invalid/issues/7",
+                        "body": marker,
+                    }
+                ]
+            return {"id": 1}
+
+        with patch.object(reporter, "_request_json", side_effect=request_json):
+            result = reporter.report_error(
+                title,
+                error_msg,
+                context,
+                report="재발생 오류 내용",
+            )
+
+        self.assertFalse(result.created)
+        self.assertEqual(result.number, 7)
+        self.assertIn("/issues/7/comments", calls[-1][1])
+        self.assertIn("## 오류 재발생", calls[-1][2]["body"])
+
+    def test_reporter_reuses_recent_creation_when_issue_list_is_stale(self) -> None:
+        first_reporter = GitHubIssueReporter(token="test-token")
+        second_reporter = GitHubIssueReporter(token="test-token")
+        calls = []
+
+        def request_json(_reporter, method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return []
+            if path.endswith("/issues"):
+                return {
+                    "number": 41,
+                    "html_url": "https://example.invalid/issues/41",
+                }
+            return {"id": 1}
+
+        with (
+            patch.object(
+                GitHubIssueReporter,
+                "_request_json",
+                autospec=True,
+                side_effect=request_json,
+            ),
+            patch("Modules.Common.GitHubIssueReporter.time.sleep"),
+        ):
+            first = first_reporter.report_error(
+                "생성 직후 중복 방지",
+                "RuntimeError: immediate recurrence",
+                {"category": "Consistency regression"},
+                report="첫 오류",
+            )
+            second = second_reporter.report_error(
+                "생성 직후 중복 방지",
+                "RuntimeError: immediate recurrence",
+                {"category": "Consistency regression"},
+                report="두 번째 오류",
+            )
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual((first.number, second.number), (41, 41))
+        self.assertEqual(sum(method == "GET" for method, _path, _payload in calls), 2)
+        self.assertEqual(
+            sum(
+                method == "POST" and path.endswith("/issues")
+                for method, path, _payload in calls
+            ),
+            1,
+        )
+        self.assertTrue(calls[-1][1].endswith("/issues/41/comments"))
+
+    def test_reporter_get_requests_disable_http_caches(self) -> None:
+        reporter = GitHubIssueReporter(token="test-token")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b"[]"
+
+        with patch(
+            "Modules.Common.GitHubIssueReporter.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            self.assertEqual(reporter._request_json("GET", "/repos/test/issues"), [])
+
+        api_request = urlopen.call_args.args[0]
+        headers = {key.lower(): value for key, value in api_request.header_items()}
+        self.assertEqual(headers["cache-control"], "no-cache")
+        self.assertEqual(headers["pragma"], "no-cache")
+
+    def test_reporter_retries_without_optional_labels_on_422(self) -> None:
+        reporter = GitHubIssueReporter(token="test-token")
+        responses = [
+            [],
+            [],
+            GitHubAPIError(422, "Validation Failed"),
+            {"number": 9},
+        ]
+        payloads = []
+
+        def request_json(method, path, payload=None):
+            payloads.append(payload.copy() if payload else payload)
+            value = responses.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with (
+            patch.object(reporter, "_request_json", side_effect=request_json),
+            patch("Modules.Common.GitHubIssueReporter.time.sleep"),
+        ):
+            result = reporter.report_error("오류", "상세", report="보고서")
+
+        self.assertTrue(result.created)
+        self.assertIn("labels", payloads[2])
+        self.assertNotIn("labels", payloads[3])
+
+    def test_error_dialog_submits_report_without_opening_browser(self) -> None:
+        class SuccessfulReporter:
+            def report_error(self, title, error_msg, context, *, report=None):
+                self.args = (title, error_msg, context, report)
+                return IssueReportResult(True, 17, "https://example.invalid/issues/17", "abc")
+
         dialog = ErrorReportDialog(
             "Milkrun 작업 실패",
             FailureDetails("로그인 확인 실패", "Traceback\ntoken=hidden"),
-            open_url=lambda url: opened.append(url.toString()) or True,
         )
         try:
-            dialog.report_button.click()
-            clipboard = QGuiApplication.clipboard()
-            self.assertIsNotNone(clipboard)
-            self.assertEqual(clipboard.text(), dialog.report)
+            with (
+                patch(
+                    "Modules.GUI.BugReportWorker.GitHubIssueReporter",
+                    SuccessfulReporter,
+                ),
+                patch("Modules.GUI.Dialogs.QMessageBox.information") as information,
+            ):
+                dialog.report_button.click()
+                worker = dialog._report_worker
+                self.assertIsNotNone(worker)
+                self.assertTrue(worker.wait(5_000))
+                self.app.processEvents()
+                self.app.processEvents()
+
             self.assertNotIn("hidden", dialog.report)
-            self.assertEqual([QUrl(value) for value in opened], [QUrl(dialog.issue_url)])
-            self.assertIn("GitHub 이슈 작성 화면", dialog.action_status.text())
-            self.assertIn("Ctrl+V", dialog.action_status.text())
+            self.assertIn("#17", dialog.action_status.text())
+            self.assertTrue(dialog.report_button.isEnabled())
+            information.assert_called_once()
+        finally:
+            dialog.close()
+
+    def test_error_dialog_shows_report_failure_and_keeps_copy_fallback(self) -> None:
+        class FailingReporter:
+            def __init__(self):
+                raise RuntimeError("토큰 없음")
+
+        dialog = ErrorReportDialog("작업 실패", FailureDetails("실패", "상세 오류"))
+        try:
+            with (
+                patch(
+                    "Modules.GUI.BugReportWorker.GitHubIssueReporter",
+                    FailingReporter,
+                ),
+                patch("Modules.GUI.Dialogs.QMessageBox.warning") as warning,
+            ):
+                dialog.report_button.click()
+                worker = dialog._report_worker
+                self.assertIsNotNone(worker)
+                self.assertTrue(worker.wait(5_000))
+                self.app.processEvents()
+                self.app.processEvents()
+
+            self.assertIn("토큰 없음", dialog.action_status.text())
+            self.assertTrue(dialog.copy_button.isEnabled())
+            warning.assert_called_once()
         finally:
             dialog.close()
 

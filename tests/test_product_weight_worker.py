@@ -79,6 +79,24 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(summaries[0].cache_hits, 1)
             self.assertFalse(summaries[0].failures)
 
+    def test_cache_hit_recalculates_one_pallet_two_boxes_as_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = ProductMemory(root / "memory.json")
+            memory.upsert_measurement("123", "상품 A/B", "1000", "80", "2")
+            memory.set_manual_category("123", "고단")
+            product = MilkrunProductRow("거래처", "M1", "1", "2", "123", "상품 A/B")
+            worker = self._worker(root, (product,), wms_id="", password="")
+            records = []
+            worker.record_ready.connect(lambda record, cache_hit: records.append((record, cache_hit)))
+
+            worker.run()
+
+            self.assertEqual(len(records), 1)
+            self.assertTrue(records[0][1])
+            self.assertEqual(records[0][0].boxes_per_pallet, Decimal("2"))
+            self.assertEqual(records[0][0].category_override, "고단")
+
     def test_duplicate_sku_is_looked_up_once_and_saved_with_daily_full_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

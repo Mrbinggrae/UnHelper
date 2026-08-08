@@ -40,6 +40,46 @@ class FakeRange:
         super().__setattr__(name, value)
 
 
+class FakeComCallRejected(RuntimeError):
+    hresult = -2147418111
+
+    def __init__(self) -> None:
+        super().__init__(
+            -2147418111,
+            "피호출자가 호출을 거부했습니다.",
+            None,
+            None,
+        )
+
+
+class RejectingRange(FakeRange):
+    def __init__(
+        self,
+        value=None,
+        *,
+        clear_rejections: int = 0,
+        value2_rejections: int = 0,
+    ) -> None:
+        self.clear_rejections = clear_rejections
+        self.value2_rejections = value2_rejections
+        self.clear_attempts = 0
+        self.value2_attempts = 0
+        super().__init__(value)
+
+    def ClearContents(self) -> None:
+        self.clear_attempts += 1
+        if self.clear_attempts <= self.clear_rejections:
+            raise FakeComCallRejected()
+        super().ClearContents()
+
+    def __setattr__(self, name, value) -> None:
+        if name == "Value2" and "assignments" in self.__dict__:
+            self.value2_attempts += 1
+            if self.value2_attempts <= self.value2_rejections:
+                raise FakeComCallRejected()
+        super().__setattr__(name, value)
+
+
 class FakeCells:
     def __call__(self, row: int, column: int):
         return row, column
@@ -57,6 +97,20 @@ class FakeTargetSheet:
             return self.clear_range
         self.destination_coordinates = args
         return self.destination
+
+
+class RejectingDestinationRangeSheet(FakeTargetSheet):
+    def __init__(self, rejections: int) -> None:
+        super().__init__()
+        self.destination_range_rejections = rejections
+        self.destination_range_attempts = 0
+
+    def Range(self, *args):
+        if not (len(args) == 1 and args[0] == "C1:P1000"):
+            self.destination_range_attempts += 1
+            if self.destination_range_attempts <= self.destination_range_rejections:
+                raise FakeComCallRejected()
+        return super().Range(*args)
 
 
 class FakeDimension:
@@ -94,12 +148,23 @@ class FakeSourceSheet:
 
 
 class FakeWorksheets:
-    def __init__(self, *, target_sheet=None, source_sheet=None) -> None:
+    def __init__(
+        self,
+        *,
+        target_sheet=None,
+        source_sheet=None,
+        target_rejections: int = 0,
+    ) -> None:
         self.target_sheet = target_sheet
         self.source_sheet = source_sheet
+        self.target_rejections = target_rejections
+        self.target_attempts = 0
 
     def __call__(self, key):
         if key == MilkrunExcelImporter.TARGET_SHEET and self.target_sheet is not None:
+            self.target_attempts += 1
+            if self.target_attempts <= self.target_rejections:
+                raise FakeComCallRejected()
             return self.target_sheet
         if key == 1 and self.source_sheet is not None:
             return self.source_sheet
@@ -113,6 +178,7 @@ class FakeWorkbook:
         worksheets: FakeWorksheets,
         *,
         save_error=None,
+        save_errors=(),
         saved: bool = True,
     ) -> None:
         self.FullName = str(full_name)
@@ -120,16 +186,50 @@ class FakeWorkbook:
         self.ReadOnly = False
         self.Saved = saved
         self.save_error = save_error
+        self.save_errors = list(save_errors)
         self.save_count = 0
         self.close_calls = []
 
     def Save(self) -> None:
         self.save_count += 1
+        if self.save_errors:
+            error = self.save_errors.pop(0)
+            if error is not None:
+                raise error
         if self.save_error is not None:
             raise self.save_error
 
     def Close(self, SaveChanges=False) -> None:
         self.close_calls.append(SaveChanges)
+
+
+class BusyStateWorkbook:
+    def __init__(
+        self,
+        worksheets: FakeWorksheets,
+        *,
+        read_only_rejections: int = 0,
+        saved_rejections: int = 0,
+    ) -> None:
+        self.Worksheets = worksheets
+        self.read_only_rejections = read_only_rejections
+        self.saved_rejections = saved_rejections
+        self.read_only_attempts = 0
+        self.saved_attempts = 0
+
+    @property
+    def ReadOnly(self):
+        self.read_only_attempts += 1
+        if self.read_only_attempts <= self.read_only_rejections:
+            raise FakeComCallRejected()
+        return False
+
+    @property
+    def Saved(self):
+        self.saved_attempts += 1
+        if self.saved_attempts <= self.saved_rejections:
+            raise FakeComCallRejected()
+        return True
 
 
 class FakeWorkbooks:
@@ -747,7 +847,7 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             source.write_text("name,value\nnew,1\n", encoding="utf-8")
             sheet = FakeTargetSheet()
             original = sheet.clear_range.Value2
-            importer, _target_book, _excel, _pythoncom = self._active_importer(
+            importer, target_book, _excel, _pythoncom = self._active_importer(
                 target,
                 sheet,
                 save_error=RuntimeError("disk full"),
@@ -757,6 +857,150 @@ class MilkrunExcelImporterTests(unittest.TestCase):
                 importer.import_values(source, target)
 
             self.assertEqual(sheet.clear_range.assignments[-1], original)
+            self.assertEqual(target_book.save_count, 1)
+
+    def test_transient_excel_busy_retries_clear_and_value_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            sheet.clear_range = RejectingRange(
+                (("old",),),
+                clear_rejections=2,
+            )
+            sheet.destination = RejectingRange(value2_rejections=2)
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+            log_messages = []
+            importer.log = log_messages.append
+
+            with mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"):
+                result = importer.import_values(source, target)
+
+            self.assertEqual((result.rows, result.columns), (2, 2))
+            self.assertEqual(sheet.clear_range.clear_attempts, 3)
+            self.assertEqual(sheet.clear_range.clear_count, 1)
+            self.assertEqual(sheet.destination.value2_attempts, 3)
+            self.assertEqual(sheet.destination.Value2, (("name", "value"), ("new", "1")))
+            self.assertEqual(target_book.save_count, 1)
+            self.assertTrue(any("기존 값 지우기" in message for message in log_messages))
+            self.assertTrue(any("값 붙여넣기" in message for message in log_messages))
+
+    def test_persistent_excel_busy_before_clear_does_not_attempt_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            sheet.clear_range = RejectingRange(
+                (("old",),),
+                clear_rejections=100,
+            )
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with (
+                mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"),
+                self.assertRaisesRegex(ExcelImportError, "Excel 값 붙여넣기에 실패"),
+            ):
+                importer.import_values(source, target)
+
+            self.assertEqual(
+                sheet.clear_range.clear_attempts,
+                MilkrunExcelImporter._COM_OPERATION_MAX_RETRIES,
+            )
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(sheet.clear_range.assignments, [])
+            self.assertEqual(target_book.save_count, 0)
+
+    def test_transient_excel_busy_retries_destination_range_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = RejectingDestinationRangeSheet(rejections=2)
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"):
+                result = importer.import_values(source, target)
+
+            self.assertEqual((result.rows, result.columns), (2, 2))
+            self.assertEqual(sheet.destination_range_attempts, 3)
+            self.assertEqual(sheet.destination.Value2, (("name", "value"), ("new", "1")))
+            self.assertEqual(target_book.save_count, 1)
+
+    def test_persistent_excel_busy_during_assignment_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            original = sheet.clear_range.Value2
+            sheet.destination = RejectingRange(value2_rejections=100)
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with (
+                mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"),
+                self.assertRaisesRegex(ExcelImportError, "값 붙여넣기에 실패"),
+            ):
+                importer.import_values(source, target)
+
+            self.assertEqual(
+                sheet.destination.value2_attempts,
+                MilkrunExcelImporter._COM_OPERATION_MAX_RETRIES,
+            )
+            self.assertEqual(sheet.clear_range.assignments[-1], original)
+            self.assertEqual(target_book.save_count, 0)
+
+    def test_persistent_excel_busy_during_rollback_is_reported_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            sheet.clear_range = RejectingRange(
+                (("old",),),
+                value2_rejections=100,
+            )
+            sheet.destination = RejectingRange(value2_rejections=100)
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with (
+                mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"),
+                self.assertRaisesRegex(ExcelImportError, "기존 값 복원에도 실패"),
+            ):
+                importer.import_values(source, target)
+
+            self.assertEqual(
+                sheet.clear_range.value2_attempts,
+                MilkrunExcelImporter._COM_OPERATION_MAX_RETRIES,
+            )
+            self.assertEqual(target_book.save_count, 0)
+
+    def test_cancel_during_excel_busy_retry_rolls_back_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            original = sheet.clear_range.Value2
+            sheet.destination = RejectingRange(value2_rejections=100)
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+            cancel_checks = iter((False, True))
+
+            with (
+                mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep") as sleep_mock,
+                self.assertRaises(ExcelImportCancelled),
+            ):
+                importer.import_values(
+                    source,
+                    target,
+                    cancel_requested=lambda: next(cancel_checks),
+                )
+
+            self.assertEqual(sheet.destination.value2_attempts, 1)
+            self.assertEqual(sheet.clear_range.assignments[-1], original)
+            self.assertEqual(target_book.save_count, 0)
+            sleep_mock.assert_not_called()
 
     def test_cancel_after_assignment_rolls_back_without_saving(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -777,6 +1021,77 @@ class MilkrunExcelImporterTests(unittest.TestCase):
 
             self.assertEqual(target_book.save_count, 0)
             self.assertEqual(sheet.clear_range.assignments[-1], original)
+
+    def test_target_readiness_retries_busy_state_and_sheet_access(self) -> None:
+        sheet = FakeTargetSheet()
+        worksheets = FakeWorksheets(
+            target_sheet=sheet,
+            target_rejections=2,
+        )
+        workbook = BusyStateWorkbook(
+            worksheets,
+            read_only_rejections=1,
+            saved_rejections=1,
+        )
+        excel = FakeExcel(FakeWorkbooks())
+        importer = MilkrunExcelImporter(
+            com_client=FakeComClient(active_excel=excel),
+            pythoncom_module=FakePythonCom(),
+        )
+
+        with mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"):
+            result = importer._ensure_target_ready(excel, workbook)
+
+        self.assertIs(result, sheet)
+        self.assertEqual(workbook.read_only_attempts, 2)
+        self.assertEqual(workbook.saved_attempts, 2)
+        self.assertEqual(worksheets.target_attempts, 3)
+
+    def test_persistent_busy_sheet_access_is_not_reported_as_missing_sheet(self) -> None:
+        sheet = FakeTargetSheet()
+        worksheets = FakeWorksheets(
+            target_sheet=sheet,
+            target_rejections=100,
+        )
+        workbook = BusyStateWorkbook(worksheets)
+        excel = FakeExcel(FakeWorkbooks())
+        importer = MilkrunExcelImporter(
+            com_client=FakeComClient(active_excel=excel),
+            pythoncom_module=FakePythonCom(),
+        )
+
+        with (
+            mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"),
+            self.assertRaises(ExcelImportError) as raised,
+        ):
+            importer._ensure_target_ready(excel, workbook)
+
+        self.assertIn("Excel이 계속 사용 중", str(raised.exception))
+        self.assertNotIn("시트가 없습니다", str(raised.exception))
+
+    def test_transient_excel_busy_during_save_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text("name,value\nnew,1\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            target_book = FakeWorkbook(
+                target,
+                FakeWorksheets(target_sheet=sheet),
+                save_errors=(FakeComCallRejected(), FakeComCallRejected()),
+            )
+            excel = FakeExcel(FakeWorkbooks(open_books=[target_book]))
+            importer = MilkrunExcelImporter(
+                com_client=FakeComClient(active_excel=excel),
+                pythoncom_module=FakePythonCom(),
+            )
+
+            with mock.patch("Modules.Excel.MilkrunExcelImporter.time.sleep"):
+                result = importer.import_values(source, target)
+
+            self.assertEqual((result.rows, result.columns), (2, 2))
+            self.assertEqual(target_book.save_count, 3)
+            self.assertEqual(sheet.clear_range.assignments, [])
 
     def test_dirty_open_workbook_is_not_saved_or_changed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -10,6 +10,9 @@ datas = [
     (str(project_root / "UPDATE_HISTORY.txt"), "."),
     (str(project_root / "chromedriver.exe"), "."),
 ]
+token_path = project_root / "bug_report_token.dat"
+if token_path.is_file():
+    datas.append((str(token_path), "."))
 if asset_dir.is_dir():
     for asset in sorted(asset_dir.rglob("*")):
         if asset.is_file():
