@@ -24,6 +24,10 @@ COLORS = {
     "warning": "#F59E0B",
     "danger": "#EF4444",
     "violet": "#A78BFA",
+    "group_blue": "#102734",
+    "group_blue_key": "#123747",
+    "group_violet": "#202238",
+    "group_violet_key": "#2A2948",
 }
 
 
@@ -294,6 +298,19 @@ QPushButton#SettingsButton:hover {
     background: #1B2836;
     border-color: #38BDF8;
     color: #FFFFFF;
+}
+QPushButton#LogToggleButton {
+    background: transparent;
+    border-color: #253244;
+    color: #A8B4C2;
+    min-height: 18px;
+    padding: 5px 10px;
+    font-size: 9pt;
+}
+QPushButton#LogToggleButton:hover {
+    background: #16212C;
+    border-color: #38BDF8;
+    color: #F3F7FA;
 }
 QPushButton#CategoryButton {
     background: #273444;

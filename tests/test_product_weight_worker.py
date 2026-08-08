@@ -95,7 +95,6 @@ class ProductWeightWorkerTests(unittest.TestCase):
         wms_id="id",
         password="pw",
         quantity_label="박스",
-        multi_sku_booking_weight_only=True,
     ) -> ProductWeightWorker:
         return ProductWeightWorker(
             products,
@@ -105,7 +104,6 @@ class ProductWeightWorkerTests(unittest.TestCase):
             password,
             evidence_dir=root,
             quantity_label=quantity_label,
-            multi_sku_booking_weight_only=multi_sku_booking_weight_only,
             crawler_factory=FakeCrawler,
         )
 
@@ -213,7 +211,7 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(record.weight_grams, Decimal("1000"))
             self.assertEqual(summaries[0].wms_successes, 1)
 
-    def test_multi_sku_truck_wms_results_persist_only_each_sku_weight(self) -> None:
+    def test_multi_sku_truck_wms_results_persist_each_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             products = (
@@ -229,12 +227,12 @@ class ProductWeightWorkerTests(unittest.TestCase):
             for sku_id in ("123", "456"):
                 record = ProductMemory(root / "memory.json").get(sku_id)
                 self.assertEqual(record.weight_grams, Decimal("1000"))
-                self.assertEqual(record.automatic_category, "")
+                self.assertEqual(record.automatic_category, "중량")
                 self.assertIsNone(record.category_override)
-                self.assertIsNone(record.boxes_per_pallet)
-                self.assertIsNone(record.pallet_weight_kg)
+                self.assertEqual(record.boxes_per_pallet, Decimal("300"))
+                self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
-    def test_invalid_sku_in_multi_truck_group_does_not_allow_valid_sku_calculation(self) -> None:
+    def test_invalid_sku_in_multi_truck_does_not_disable_valid_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             products = (
@@ -248,10 +246,10 @@ class ProductWeightWorkerTests(unittest.TestCase):
             record = ProductMemory(root / "memory.json").get("123")
             self.assertIsNotNone(record)
             self.assertEqual(record.weight_grams, Decimal("1000"))
-            self.assertEqual(record.automatic_category, "")
+            self.assertEqual(record.automatic_category, "중량")
             self.assertIsNone(record.category_override)
-            self.assertIsNone(record.boxes_per_pallet)
-            self.assertIsNone(record.pallet_weight_kg)
+            self.assertEqual(record.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
     def test_multi_sku_truck_cache_hit_preserves_global_categories_without_reopening_wms(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -305,12 +303,12 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(preserved.weight_grams, Decimal("1000"))
             self.assertEqual(preserved.category_override, "고단")
             self.assertEqual(preserved.effective_category, "고단")
-            self.assertIsNone(preserved.boxes_per_pallet)
-            self.assertIsNone(preserved.pallet_weight_kg)
+            self.assertEqual(preserved.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(preserved.pallet_weight_kg, Decimal("300"))
             self.assertEqual(created.weight_grams, Decimal("1000"))
-            self.assertEqual(created.effective_category, "")
-            self.assertIsNone(created.boxes_per_pallet)
-            self.assertIsNone(created.pallet_weight_kg)
+            self.assertEqual(created.effective_category, "중량")
+            self.assertEqual(created.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(created.pallet_weight_kg, Decimal("300"))
 
     def test_same_sku_in_multi_and_single_truck_keeps_high_and_prior_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -337,8 +335,8 @@ class ProductWeightWorkerTests(unittest.TestCase):
             record = ProductMemory(root / "memory.json").get("123")
             self.assertEqual(FakeCrawler.instances, [])
             self.assertEqual(record.category_override, "고단")
-            self.assertEqual(record.boxes_per_pallet, Decimal("40"))
-            self.assertEqual(record.pallet_weight_kg, Decimal("40"))
+            self.assertEqual(record.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
     def test_multi_sku_truck_missing_credentials_does_not_delete_manual_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -388,7 +386,7 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(record.boxes_per_pallet, Decimal("2"))
             self.assertEqual(record.category_override, "고단")
 
-    def test_multi_sku_milkrun_cache_hit_preserves_prior_calculation_and_high_override(self) -> None:
+    def test_multi_sku_milkrun_cache_hit_recalculates_each_sku_and_keeps_high(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             memory = ProductMemory(root / "memory.json")
@@ -405,14 +403,14 @@ class ProductWeightWorkerTests(unittest.TestCase):
             worker.run()
 
             self.assertEqual(FakeCrawler.instances, [])
-            self.assertEqual((root / "memory.json").read_bytes(), before)
+            self.assertNotEqual((root / "memory.json").read_bytes(), before)
             for sku_id in ("123", "456"):
                 record = ProductMemory(root / "memory.json").get(sku_id)
-                self.assertEqual(record.boxes_per_pallet, Decimal("40"))
-                self.assertEqual(record.pallet_weight_kg, Decimal("40"))
+                self.assertEqual(record.boxes_per_pallet, Decimal("2"))
+                self.assertEqual(record.pallet_weight_kg, Decimal("2"))
                 self.assertEqual(record.category_override, "고단")
 
-    def test_multi_sku_milkrun_wms_results_persist_only_each_sku_weight(self) -> None:
+    def test_multi_sku_milkrun_wms_results_persist_each_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             products = (
@@ -428,10 +426,10 @@ class ProductWeightWorkerTests(unittest.TestCase):
             for sku_id in ("123", "456"):
                 record = ProductMemory(root / "memory.json").get(sku_id)
                 self.assertEqual(record.weight_grams, Decimal("1000"))
-                self.assertEqual(record.automatic_category, "")
+                self.assertEqual(record.automatic_category, "중량")
                 self.assertIsNone(record.category_override)
-                self.assertIsNone(record.boxes_per_pallet)
-                self.assertIsNone(record.pallet_weight_kg)
+                self.assertEqual(record.boxes_per_pallet, Decimal("300"))
+                self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
     def test_milkrun_groups_are_separated_within_the_same_outer_m_card(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -451,7 +449,7 @@ class ProductWeightWorkerTests(unittest.TestCase):
                 self.assertEqual(record.pallet_weight_kg, Decimal("2"))
                 self.assertEqual(record.automatic_category, "경량")
 
-    def test_invalid_sku_in_multi_milkrun_group_keeps_valid_sku_weight_only(self) -> None:
+    def test_invalid_sku_in_multi_milkrun_does_not_disable_valid_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             products = (
@@ -468,12 +466,12 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(FakeCrawler.instances[0].lookups, ["123"])
             record = ProductMemory(root / "memory.json").get("123")
             self.assertEqual(record.weight_grams, Decimal("1000"))
-            self.assertEqual(record.automatic_category, "")
+            self.assertEqual(record.automatic_category, "중량")
             self.assertIsNone(record.category_override)
-            self.assertIsNone(record.boxes_per_pallet)
-            self.assertIsNone(record.pallet_weight_kg)
+            self.assertEqual(record.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
-    def test_multi_sku_milkrun_wms_miss_preserves_existing_manual_placeholder(self) -> None:
+    def test_multi_sku_milkrun_wms_miss_replaces_stale_light_heavy_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             ProductMemory(root / "memory.json").set_manual_category(
@@ -490,15 +488,16 @@ class ProductWeightWorkerTests(unittest.TestCase):
             preserved = ProductMemory(root / "memory.json").get("123")
             created = ProductMemory(root / "memory.json").get("456")
             self.assertEqual(preserved.weight_grams, Decimal("1000"))
-            self.assertEqual(preserved.category_override, "중량")
-            self.assertIsNone(preserved.boxes_per_pallet)
-            self.assertIsNone(preserved.pallet_weight_kg)
+            self.assertIsNone(preserved.category_override)
+            self.assertEqual(preserved.automatic_category, "중량")
+            self.assertEqual(preserved.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(preserved.pallet_weight_kg, Decimal("300"))
             self.assertEqual(created.weight_grams, Decimal("1000"))
-            self.assertEqual(created.effective_category, "")
-            self.assertIsNone(created.boxes_per_pallet)
-            self.assertIsNone(created.pallet_weight_kg)
+            self.assertEqual(created.effective_category, "중량")
+            self.assertEqual(created.boxes_per_pallet, Decimal("300"))
+            self.assertEqual(created.pallet_weight_kg, Decimal("300"))
 
-    def test_same_sku_in_multi_and_single_milkrun_preserves_global_memory(self) -> None:
+    def test_same_sku_in_multi_and_single_milkrun_uses_first_current_row_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             memory = ProductMemory(root / "memory.json")
@@ -511,18 +510,16 @@ class ProductWeightWorkerTests(unittest.TestCase):
                 _milkrun_booking_product("10813478", "456"),
             )
             worker = self._worker(root, products, wms_id="", password="")
-            before = (root / "memory.json").read_bytes()
-
             worker.run()
 
             self.assertEqual(FakeCrawler.instances, [])
-            self.assertEqual((root / "memory.json").read_bytes(), before)
             record = ProductMemory(root / "memory.json").get("123")
-            self.assertEqual(record.category_override, "중량")
-            self.assertEqual(record.boxes_per_pallet, Decimal("40"))
-            self.assertEqual(record.pallet_weight_kg, Decimal("40"))
+            self.assertIsNone(record.category_override)
+            self.assertEqual(record.automatic_category, "경량")
+            self.assertEqual(record.boxes_per_pallet, Decimal("2"))
+            self.assertEqual(record.pallet_weight_kg, Decimal("2"))
 
-    def test_multi_sku_booking_weight_only_policy_can_be_explicitly_disabled(self) -> None:
+    def test_multi_sku_truck_uses_normal_calculation_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             memory = ProductMemory(root / "memory.json")
@@ -537,7 +534,6 @@ class ProductWeightWorkerTests(unittest.TestCase):
                 root,
                 products,
                 quantity_label="유닛",
-                multi_sku_booking_weight_only=False,
             )
 
             worker.run()

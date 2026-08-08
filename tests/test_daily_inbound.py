@@ -146,15 +146,14 @@ class DailyInboundTests(unittest.TestCase):
     def test_detail_parser_keeps_truck_reservation_lineage(self) -> None:
         rows = (
             (
-                "거래처 (A00001)",
-                "예약 상세 번호",
+                "PALLET",
+                "PALLET_001",
+                "CBN001",
                 "3",
-                "120",
-                "shipment",
-                "",
                 "123",
                 "상품",
                 "barcode",
+                "40",
                 "120",
             ),
         )
@@ -168,6 +167,59 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(result[0].dispatch_number, "T3370492")
         self.assertEqual(result[0].pallet_count, "3")
         self.assertEqual(result[0].box_count, "120")
+
+    def test_truck_container_parser_aggregates_same_sku_pallets_and_units(self) -> None:
+        rows = (
+            (
+                "PALLET",
+                "PALLET_007",
+                "CBN0027164455",
+                "1",
+                "2370680",
+                "Box크라운_새콤달콤",
+                "18801111904206",
+                "110",
+                "110",
+            ),
+            (
+                "PALLET",
+                "PALLET_008",
+                "CBN0027164458",
+                "1",
+                "2370680",
+                "Box크라운_새콤달콤",
+                "18801111904206",
+                "11",
+                "11",
+            ),
+            (
+                "PALLET",
+                "PALLET_009",
+                "CBN0027164463",
+                "2",
+                "67859646",
+                "레쓰비 마일드 커피",
+                "8801056095161",
+                "121",
+                "242",
+            ),
+        )
+
+        result = parse_detail_table_cells(
+            rows,
+            dispatch_number="T3372829",
+            booking_prefix="T",
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].sku_id, "2370680")
+        self.assertEqual(result[0].sku_name, "Box크라운_새콤달콤")
+        self.assertEqual(result[0].pallet_count, "2")
+        self.assertEqual(result[0].box_count, "121")
+        self.assertEqual(result[1].sku_id, "67859646")
+        self.assertEqual(result[1].pallet_count, "2")
+        self.assertEqual(result[1].box_count, "242")
+        self.assertTrue(all(row.dispatch_number == "T3372829" for row in result))
 
 
 if __name__ == "__main__":

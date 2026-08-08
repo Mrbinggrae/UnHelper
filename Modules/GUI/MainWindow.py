@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QSettings, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtGui import QBrush, QCloseEvent, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -53,6 +53,7 @@ from Modules.Excel.TruckExcelImporter import (
 )
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
+from Modules.GUI.Theme import COLORS
 from Modules.Shipments.MilkrunDownloader import (
     AutomationCancelled,
     MilkrunDownloadRequest,
@@ -234,7 +235,8 @@ class MilkrunWorker(QThread):
     ) -> DailyInboundResult:
         metrics = import_result.metrics_by_reservation
         products = []
-        skus_by_reservation: dict[str, set[str]] = {}
+        detail_units: dict[str, Decimal] = {}
+        detail_pallets: dict[str, Decimal] = {}
         for product in daily_result.products:
             metric = metrics.get(product.dispatch_number)
             if metric is None:
@@ -242,15 +244,38 @@ class MilkrunWorker(QThread):
                     f"예약번호 {product.dispatch_number}의 유닛 수와 팔렛트 수를 "
                     "다운로드 파일에서 찾지 못했습니다."
                 )
+            try:
+                unit_count = Decimal(str(product.box_count).strip().replace(",", ""))
+                pallet_count = Decimal(
+                    str(product.pallet_count).strip().replace(",", "")
+                )
+            except Exception as exc:
+                raise DailyInboundError(
+                    f"예약번호 {product.dispatch_number}의 SKU {product.sku_id} "
+                    "컨테이너 수량 또는 총 수량을 읽지 못했습니다."
+                ) from exc
+            if (
+                not unit_count.is_finite()
+                or not pallet_count.is_finite()
+                or unit_count <= 0
+                or pallet_count <= 0
+            ):
+                raise DailyInboundError(
+                    f"예약번호 {product.dispatch_number}의 SKU {product.sku_id} "
+                    "컨테이너 수량 또는 총 수량이 0 이하입니다."
+                )
             products.append(
                 replace(
                     product,
-                    box_count=metric.unit_count,
-                    pallet_count=metric.pallet_count,
+                    box_count=unit_count,
+                    pallet_count=pallet_count,
                 )
             )
-            skus_by_reservation.setdefault(product.dispatch_number, set()).add(
-                str(product.sku_id).strip()
+            detail_units[product.dispatch_number] = (
+                detail_units.get(product.dispatch_number, Decimal("0")) + unit_count
+            )
+            detail_pallets[product.dispatch_number] = (
+                detail_pallets.get(product.dispatch_number, Decimal("0")) + pallet_count
             )
 
         grouped_products: dict[str, list] = {}
@@ -261,12 +286,16 @@ class MilkrunWorker(QThread):
                 group_order.append(product.dispatch_number)
             grouped_products[product.dispatch_number].append(product)
 
-        for reservation_number, sku_ids in skus_by_reservation.items():
-            if len(sku_ids) > 1:
+        for reservation_number in detail_units:
+            metric = metrics[reservation_number]
+            if (
+                detail_units.get(reservation_number) != metric.unit_count
+                or detail_pallets.get(reservation_number) != metric.pallet_count
+            ):
                 self.log_updated.emit(
-                    f"예약번호 {reservation_number}에 서로 다른 SKU {len(sku_ids)}개가 있어 "
-                    "SKU별 유닛 무게만 확인합니다. 팔렛트 무게와 분류는 "
-                    "표에서 예약 단위로 수동 관리합니다."
+                    f"예약번호 {reservation_number}의 컨테이너 상세 합계가 다운로드 "
+                    "M/N 합계와 다릅니다. SKU별 계산에는 상세 표의 컨테이너 수량과 "
+                    "총 수량을 사용합니다."
                 )
 
         ordered_products = tuple(
@@ -823,10 +852,15 @@ class MainWindow(QMainWindow):
         status_dot.setObjectName("StatusDot")
         self.status_label = QLabel("대기 중")
         self.status_label.setObjectName("Status")
+        self.log_toggle_button = QPushButton()
+        self.log_toggle_button.setObjectName("LogToggleButton")
+        self.log_toggle_button.setCheckable(True)
+        self.log_toggle_button.clicked.connect(self._toggle_log_view)
         self.open_folder_button = QPushButton("다운로드 폴더 열기")
         self.open_folder_button.clicked.connect(self.open_download_folder)
         status_row.addWidget(status_dot)
         status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.log_toggle_button)
         status_row.addWidget(self.open_folder_button)
         footer_layout.addLayout(status_row)
         self.log_view = QPlainTextEdit()
@@ -835,7 +869,25 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumHeight(112)
         self.log_view.setPlaceholderText("진행 로그")
         footer_layout.addWidget(self.log_view)
+        self._set_log_expanded(
+            self.settings.value("log_expanded", True, type=bool),
+            persist=False,
+        )
         layout.addWidget(footer)
+
+    def _toggle_log_view(self, checked: bool = False) -> None:
+        self._set_log_expanded(bool(checked), persist=True)
+
+    def _set_log_expanded(self, expanded: bool, *, persist: bool) -> None:
+        self.log_view.setVisible(expanded)
+        self.log_toggle_button.setChecked(expanded)
+        self.log_toggle_button.setText("로그 접기 ▲" if expanded else "로그 펼치기 ▼")
+        self.log_toggle_button.setToolTip(
+            "진행 로그를 숨깁니다." if expanded else "진행 로그를 표시합니다."
+        )
+        if persist:
+            self.settings.setValue("log_expanded", expanded)
+            self.settings.sync()
 
     def _build_arrival_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
@@ -1235,6 +1287,13 @@ class MainWindow(QMainWindow):
         products,
         booking_type: str,
     ) -> dict[str, tuple[int, ...]]:
+        # Both detail tables now provide per-SKU quantities: Milkrun exposes
+        # pallet/box columns and Truck exposes PALLET container count/total
+        # quantity. No booking group needs the legacy weight-only/manual mode.
+        return {}
+
+    @classmethod
+    def _visual_multi_sku_groups(cls, products, booking_type: str) -> dict[str, tuple[int, ...]]:
         rows_by_group: dict[str, list[int]] = {}
         skus_by_group: dict[str, set[str]] = {}
         for row_index, product in enumerate(products):
@@ -1250,6 +1309,28 @@ class MainWindow(QMainWindow):
             for group_key, sku_ids in skus_by_group.items()
             if len(sku_ids) > 1
         }
+
+    @staticmethod
+    def _apply_group_row_tint(
+        table: QTableWidget,
+        groups: dict[str, tuple[int, ...]],
+    ) -> None:
+        """Give each multi-SKU vehicle group a subtle alternating dark tint."""
+        row_colors = (QColor(COLORS["group_blue"]), QColor(COLORS["group_violet"]))
+        key_colors = (
+            QColor(COLORS["group_blue_key"]),
+            QColor(COLORS["group_violet_key"]),
+        )
+        for group_index, rows in enumerate(groups.values()):
+            row_brush = QBrush(row_colors[group_index % len(row_colors)])
+            key_brush = QBrush(key_colors[group_index % len(key_colors)])
+            for row_index in rows:
+                for column_index in range(table.columnCount()):
+                    item = table.item(row_index, column_index)
+                    if item is not None:
+                        item.setBackground(
+                            key_brush if column_index == 1 else row_brush
+                        )
 
     @classmethod
     def _booking_multi_sku_ids(cls, products, booking_type: str) -> set[str]:
@@ -1298,6 +1379,10 @@ class MainWindow(QMainWindow):
         table.clearSpans()
         table.setRowCount(len(self.current_products))
         multi_sku_groups = self._booking_multi_sku_groups(
+            self.current_products,
+            booking_type,
+        )
+        visual_multi_sku_groups = self._visual_multi_sku_groups(
             self.current_products,
             booking_type,
         )
@@ -1353,6 +1438,8 @@ class MainWindow(QMainWindow):
                     f"{group_label} {group_key}의 SKU 행이 연속되지 않아 표를 병합할 수 없습니다."
                 )
             table.setSpan(first_row, 2, len(rows), 1)
+            table.setSpan(first_row, 0, len(rows), 1)
+            table.setSpan(first_row, 1, len(rows), 1)
             table.setSpan(first_row, 9, len(rows), 1)
             category_button = QPushButton("?")
             category_button.setObjectName("CategoryButton")
@@ -1369,6 +1456,21 @@ class MainWindow(QMainWindow):
                 enabled=False,
             )
             table.setCellWidget(first_row, 9, category_button)
+
+        for group_key, rows in visual_multi_sku_groups.items():
+            first_row = rows[0]
+            if rows != tuple(range(first_row, first_row + len(rows))):
+                group_label = "예약번호" if booking_type == "truck" else "밀크런 번호"
+                raise ValueError(
+                    f"{group_label} {group_key}의 SKU 행이 연속되지 않아 "
+                    "표를 병합할 수 없습니다."
+                )
+            # Vehicle identity is shared, while pallet/unit/box calculation
+            # and category cells remain independent for every SKU.
+            table.setSpan(first_row, 0, len(rows), 1)
+            table.setSpan(first_row, 1, len(rows), 1)
+
+        self._apply_group_row_tint(table, visual_multi_sku_groups)
 
     def _start_weight_lookup(self, products) -> None:
         if self.weight_worker and self.weight_worker.isRunning():

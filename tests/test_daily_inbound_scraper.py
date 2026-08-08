@@ -150,6 +150,33 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertIn("A열 예약번호", str(raised.exception))
         self.assertIn("트럭", str(raised.exception))
 
+    def test_truck_detail_candidate_uses_container_table_layout(self) -> None:
+        browser = _Browser()
+        browser._driver.execute_script = mock.Mock(
+            return_value=[
+                (
+                    "PALLET",
+                    "PALLET_007",
+                    "CBN0027164455",
+                    "1",
+                    "17240577",
+                    "죠리퐁 165g 12개입",
+                    "18801111944202",
+                    "40",
+                    "40",
+                )
+            ]
+        )
+        scraper = DailyInboundScraper(browser, profile=TRUCK_DAILY_INBOUND_PROFILE)
+
+        rows = scraper._detail_logical_rows()
+
+        self.assertEqual(rows[0][4], "17240577")
+        script, prefix = browser._driver.execute_script.call_args.args
+        self.assertEqual(prefix, "T")
+        self.assertIn("table#truckContainerList tbody", script)
+        self.assertIn("row.length >= 9", script)
+
     def test_distinct_display_rows_are_not_deduplicated_by_sku_alone(self) -> None:
         scraper = _StubScraper(_Browser())
 
@@ -336,9 +363,9 @@ class DailyInboundScraperTests(unittest.TestCase):
             products=(
                 MilkrunProductRow(
                     "거래처",
-                    "트럭 예약",
-                    "사이트 팔렛트",
-                    "사이트 박스",
+                    "PALLET_001",
+                    "1",
+                    "2",
                     "56913939",
                     "상품",
                     "T3372829",
@@ -405,7 +432,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         metric = TruckReservationMetrics(
             reservation_number="T3372829",
             unit_count=Decimal("20"),
-            pallet_count=Decimal("1"),
+            pallet_count=Decimal("2"),
             source_rows=(2,),
         )
         import_result = TruckExcelImportResult(
@@ -419,8 +446,8 @@ class DailyInboundScraperTests(unittest.TestCase):
         )
         daily_result = DailyInboundResult(
             products=(
-                MilkrunProductRow("A", "1", "1", "1", "SKU1", "상품1", "T3372829"),
-                MilkrunProductRow("A", "1", "1", "1", "SKU2", "상품2", "T3372829"),
+                MilkrunProductRow("", "PALLET_1", "1", "12", "SKU1", "상품1", "T3372829"),
+                MilkrunProductRow("", "PALLET_2", "1", "8", "SKU2", "상품2", "T3372829"),
             ),
             requested_dispatches=("T3372829",),
             matched_dispatches=("T3372829",),
@@ -443,9 +470,15 @@ class DailyInboundScraperTests(unittest.TestCase):
             tuple(product.dispatch_number for product in updated.products),
             ("T3372829", "T3372829"),
         )
-        self.assertTrue(all(product.box_count == Decimal("20") for product in updated.products))
-        self.assertTrue(all(product.pallet_count == Decimal("1") for product in updated.products))
-        self.assertTrue(any("SKU 2개" in message and "수동 관리" in message for message in logs))
+        self.assertEqual(
+            tuple(product.box_count for product in updated.products),
+            (Decimal("12"), Decimal("8")),
+        )
+        self.assertEqual(
+            tuple(product.pallet_count for product in updated.products),
+            (Decimal("1"), Decimal("1")),
+        )
+        self.assertEqual(logs, [])
 
     def test_truck_detail_sheet_close_uses_truck_profile_href(self) -> None:
         browser = _Browser()

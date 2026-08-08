@@ -768,6 +768,7 @@ class DailyInboundScraper:
 
     def _detail_logical_rows(self) -> tuple[tuple[str, ...], ...]:
         script = r"""
+            const bookingPrefix = String(arguments[0] || '').toUpperCase();
             const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
             const expand = body => {
                 const carries = [];
@@ -800,14 +801,24 @@ class DailyInboundScraper:
                 }
                 return result;
             };
-            const candidates = Array.from(document.querySelectorAll('table tbody'))
+            const tableSelector = bookingPrefix === 'T'
+                ? 'table#truckContainerList tbody'
+                : 'table tbody';
+            const candidates = Array.from(document.querySelectorAll(tableSelector))
                 .map(expand)
-                .filter(rows => rows.some(row => row.length >= 8 && row[6] && row[7]));
+                .filter(rows => rows.some(row => (
+                    bookingPrefix === 'T'
+                        ? row.length >= 9 && row[0] === 'PALLET' && row[4] && row[5]
+                        : row.length >= 8 && row[6] && row[7]
+                )));
             candidates.sort((left, right) => right.length - left.length);
             return candidates.length ? candidates[0] : [];
         """
         try:
-            raw_rows = self.browser._driver.execute_script(script) or []
+            raw_rows = self.browser._driver.execute_script(
+                script,
+                self.profile.booking_prefix,
+            ) or []
         except WebDriverException:
             return ()
         return tuple(tuple(str(value or "") for value in row) for row in raw_rows)
