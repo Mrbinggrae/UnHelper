@@ -30,6 +30,7 @@ a = Analysis(
         "selenium",
         "pythoncom",
         "pywintypes",
+        "win32crypt",
         "win32timezone",
         "win32com.client",
     ],

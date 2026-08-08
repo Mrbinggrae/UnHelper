@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import csv
 import gc
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -30,6 +34,7 @@ class MilkrunExcelImportResult:
     rows: int
     columns: int
     order_numbers: tuple[str, ...]
+    filtered_rows: int = 0
 
 
 class MilkrunExcelImporter:
@@ -44,6 +49,7 @@ class MilkrunExcelImporter:
     START_ROW = 1
     START_COLUMN = 3
     MAX_ROWS = 1000
+    MAX_SOURCE_ROWS = 10_000
     MAX_COLUMNS = 14
     MAX_SOURCE_BYTES = 50 * 1024 * 1024
     TARGET_FILENAME_MARKER = "입고스케줄관리"
@@ -149,6 +155,7 @@ class MilkrunExcelImporter:
         target_workbook: str | Path,
         *,
         cancel_requested: Callable[[], bool] | None = None,
+        exclude_arrival_date: date | None = None,
     ) -> MilkrunExcelImportResult:
         source_path = self.validate_source_path(source_file)
         target_path = self.validate_target_path(target_workbook)
@@ -180,14 +187,37 @@ class MilkrunExcelImporter:
                 source_book = self._open_source_workbook(excel, source_path)
                 values = self._read_excel_values(source_book)
 
-            rows = len(values)
-            columns = max((len(row) for row in values), default=0)
-            if rows == 0 or columns == 0:
+            source_rows = len(values)
+            source_columns = max((len(row) for row in values), default=0)
+            if source_rows == 0 or source_columns == 0:
                 raise ExcelImportError("다운로드 파일에 붙여넣을 값이 없습니다.")
-            if rows > self.MAX_ROWS or columns > self.MAX_COLUMNS:
+            if source_rows > self.MAX_SOURCE_ROWS:
+                raise ExcelImportError(
+                    f"다운로드 데이터가 안전 처리 한도 {self.MAX_SOURCE_ROWS:,}행을 초과합니다. "
+                    "기존 값을 지우지 않았습니다."
+                )
+            if source_columns > self.MAX_COLUMNS:
                 raise ExcelImportError(
                     "다운로드 데이터가 대상 범위보다 큽니다. 기존 값을 지우지 않았습니다.\n"
-                    f"다운로드: {rows}행 × {columns}열 / 대상: {self.MAX_ROWS}행 × {self.MAX_COLUMNS}열"
+                    f"다운로드: {source_rows}행 × {source_columns}열 / "
+                    f"대상: {self.MAX_ROWS}행 × {self.MAX_COLUMNS}열"
+                )
+            filtered_rows = 0
+            if exclude_arrival_date is not None:
+                values, filtered_rows = self._filter_arrival_date_rows(
+                    values,
+                    exclude_arrival_date,
+                )
+                self.log(f"제외 대상 입고일 데이터 {filtered_rows}행을 붙여넣기에서 제외했습니다.")
+
+            rows = len(values)
+            columns = max((len(row) for row in values), default=0)
+            if rows > self.MAX_ROWS:
+                raise ExcelImportError(
+                    "입고일이 어제인 행을 제외한 데이터가 대상 범위보다 큽니다. "
+                    "기존 값을 지우지 않았습니다.\n"
+                    f"반영 대상: {rows}행 × {columns}열 / "
+                    f"대상: {self.MAX_ROWS}행 × {self.MAX_COLUMNS}열"
                 )
             if cancel_requested is not None and cancel_requested():
                 raise ExcelImportCancelled("사용자가 작업을 중지했습니다.")
@@ -249,6 +279,7 @@ class MilkrunExcelImporter:
                 rows=rows,
                 columns=columns,
                 order_numbers=order_numbers,
+                filtered_rows=filtered_rows,
             )
         except (ExcelImportCancelled, ExcelImportError):
             raise
@@ -400,7 +431,24 @@ class MilkrunExcelImporter:
         try:
             sheet = workbook.Worksheets(1)
             used_range = sheet.UsedRange
+            source_rows = int(used_range.Rows.Count)
+            source_columns = int(used_range.Columns.Count)
+            if source_rows > self.MAX_SOURCE_ROWS:
+                raise ExcelImportError(
+                    "다운로드 Excel 파일의 첫 번째 시트 사용 범위가 "
+                    f"안전 처리 한도 {self.MAX_SOURCE_ROWS:,}행을 초과합니다. "
+                    "기존 값을 지우지 않았습니다."
+                )
+            if source_columns > self.MAX_COLUMNS:
+                raise ExcelImportError(
+                    "다운로드 Excel 파일의 첫 번째 시트 사용 범위가 대상 범위보다 큽니다. "
+                    "기존 값을 지우지 않았습니다.\n"
+                    f"다운로드 사용 범위: {source_rows}행 × {source_columns}열 / "
+                    f"대상: {self.MAX_SOURCE_ROWS}행 × {self.MAX_COLUMNS}열"
+                )
             values = self._to_matrix(used_range.Value2)
+        except ExcelImportError:
+            raise
         except Exception as exc:
             raise ExcelImportError(f"다운로드 Excel 파일의 첫 번째 시트를 읽지 못했습니다.\n{exc}") from exc
         return self._trim_empty_edges(values)
@@ -439,9 +487,10 @@ class MilkrunExcelImporter:
                     csv.reader(text_handle, delimiter=delimiter),
                     start=1,
                 ):
-                    if row_number > self.MAX_ROWS:
+                    if row_number > self.MAX_SOURCE_ROWS:
                         raise ExcelImportError(
-                            f"다운로드 데이터가 {self.MAX_ROWS}행을 초과합니다. 기존 값을 지우지 않았습니다."
+                            f"다운로드 데이터가 안전 처리 한도 {self.MAX_SOURCE_ROWS:,}행을 초과합니다. "
+                            "기존 값을 지우지 않았습니다."
                         )
                     if len(row) > self.MAX_COLUMNS:
                         raise ExcelImportError(
@@ -580,6 +629,105 @@ class MilkrunExcelImporter:
         columns: int,
     ) -> tuple[tuple[Any, ...], ...]:
         return tuple(tuple(row) + (None,) * (columns - len(row)) for row in rows)
+
+    @classmethod
+    def _filter_arrival_date_rows(
+        cls,
+        rows: Sequence[Sequence[Any]],
+        exclude_arrival_date: date,
+    ) -> tuple[tuple[tuple[Any, ...], ...], int]:
+        if isinstance(exclude_arrival_date, datetime):
+            excluded_date = exclude_arrival_date.date()
+        elif isinstance(exclude_arrival_date, date):
+            excluded_date = exclude_arrival_date
+        else:
+            raise ExcelImportError("제외할 입고일 설정이 올바르지 않습니다.")
+
+        header = tuple(rows[0])
+        if len(header) < 3:
+            raise ExcelImportError("다운로드 데이터의 C열에서 '입고일' 헤더를 찾을 수 없습니다.")
+        header_text = str(header[2] or "").lstrip("\ufeff").strip()
+        if header_text != "입고일":
+            raise ExcelImportError("다운로드 데이터의 C열 헤더가 '입고일'이 아닙니다. 기존 값을 지우지 않았습니다.")
+
+        kept_rows: list[tuple[Any, ...]] = [header]
+        filtered_rows = 0
+        for row_number, source_row in enumerate(rows[1:], start=2):
+            row = tuple(source_row)
+            if len(row) < 3 or not cls._cell_has_value(row[2]):
+                raise ExcelImportError(
+                    f"다운로드 데이터 {row_number}행의 C열 입고일이 비어 있습니다. 기존 값을 지우지 않았습니다."
+                )
+            arrival_date = cls._parse_arrival_date(row[2])
+            if arrival_date is None:
+                raise ExcelImportError(
+                    f"다운로드 데이터 {row_number}행의 C열 입고일 형식을 확인할 수 없습니다. "
+                    "기존 값을 지우지 않았습니다."
+                )
+            if arrival_date == excluded_date:
+                filtered_rows += 1
+                continue
+            kept_rows.append(row)
+
+        # A header-only matrix remains a valid replacement. This clears stale
+        # target data while preserving the downloaded column structure.
+        return tuple(kept_rows), filtered_rows
+
+    @staticmethod
+    def _parse_arrival_date(value: Any) -> date | None:
+        # Excel automation and openpyxl-style readers may already expose a
+        # proper date/datetime. Handle those before considering numeric serials.
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, bool):
+            return None
+
+        if isinstance(value, (int, float, Decimal)):
+            try:
+                serial = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(serial) or serial < 1 or serial > 2_958_465:
+                return None
+            try:
+                # Excel's 1900 date system includes the historic leap-year
+                # compatibility offset; 1899-12-30 is the conventional epoch.
+                return (datetime(1899, 12, 30) + timedelta(days=serial)).date()
+            except (OverflowError, ValueError):
+                return None
+
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        year_first = re.fullmatch(
+            r"(\d{4})\s*([./-])\s*(\d{1,2})\s*\2\s*(\d{1,2})\s*\.?",
+            text,
+        )
+        if year_first:
+            year, month, day = (
+                int(year_first.group(1)),
+                int(year_first.group(3)),
+                int(year_first.group(4)),
+            )
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+
+        month_first = re.fullmatch(
+            r"(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4})",
+            text,
+        )
+        if month_first:
+            month, day, year = (int(part) for part in month_first.groups())
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+        return None
 
     def _save_workbook(
         self,

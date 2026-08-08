@@ -3,11 +3,13 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QDialog,
     QFileDialog,
@@ -28,7 +30,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from Modules.Common.paths import chromedriver_path, default_download_dir
+from Modules.Common.Credentials import (
+    CredentialError,
+    WMSCredentials,
+    WMSCredentialStore,
+)
+from Modules.Common.paths import chromedriver_path, default_download_dir, product_memory_path
 from Modules.Common.version import CURRENT_VERSION
 from Modules.Common.ErrorReport import FailureDetails
 from Modules.Excel.MilkrunExcelImporter import (
@@ -38,6 +45,7 @@ from Modules.Excel.MilkrunExcelImporter import (
     MilkrunExcelImporter,
 )
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
+from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
 from Modules.Shipments.MilkrunDownloader import (
     AutomationCancelled,
     MilkrunDownloadRequest,
@@ -47,6 +55,19 @@ from Modules.Shipments.DailyInboundScraper import (
     DailyInboundError,
     DailyInboundResult,
     DailyInboundScraper,
+)
+from Modules.WMS.ProductMemory import (
+    MANUAL_CATEGORIES,
+    ProductMemory,
+    ProductMemoryRecord,
+    calculate_pallet_measurement,
+    normalize_product_name,
+    normalize_sku_id,
+)
+from Modules.WMS.ProductWeightWorker import (
+    ProductWeightSummary,
+    ProductWeightWorker,
+    SkuWeightFailure,
 )
 
 
@@ -101,18 +122,30 @@ class MilkrunWorker(QThread):
                 download_result.file_path,
                 self.target_workbook,
                 cancel_requested=self.stop_event.is_set,
+                exclude_arrival_date=download_result.start_date,
             )
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
-            self.log_updated.emit("Excel P열의 발주번호로 오늘 일별 입고 상세를 조회합니다.")
-            daily_result = DailyInboundScraper(
-                self.downloader,
-                evidence_dir=self.request.download_dir,
-            ).run(
-                import_result.order_numbers,
-                center_name=self.request.center_name,
-                schedule_date=download_result.end_date,
-            )
+            if import_result.rows == 1 and not import_result.order_numbers:
+                self.log_updated.emit(
+                    "오늘 반영할 Milkrun 데이터가 없어 일별 입고 상세 조회를 건너뜁니다."
+                )
+                daily_result = DailyInboundResult(
+                    products=(),
+                    requested_orders=(),
+                    matched_orders=(),
+                    unmatched_orders=(),
+                )
+            else:
+                self.log_updated.emit("Excel P열의 발주번호로 오늘 일별 입고 상세를 조회합니다.")
+                daily_result = DailyInboundScraper(
+                    self.downloader,
+                    evidence_dir=self.request.download_dir,
+                ).run(
+                    import_result.order_numbers,
+                    center_name=self.request.center_name,
+                    schedule_date=download_result.end_date,
+                )
             self.completed.emit(MilkrunPipelineResult(import_result, daily_result))
         except (AutomationCancelled, ExcelImportCancelled) as exc:
             if import_result is not None:
@@ -221,14 +254,75 @@ class UpdateDialog(QDialog):
             event.ignore()
 
 
+def _open_product_memory_with_recovery(
+    path: str | Path,
+    parent: QWidget | None,
+) -> ProductMemory | None:
+    memory_path = Path(path)
+    try:
+        return ProductMemory(memory_path)
+    except ValueError as exc:
+        answer = QMessageBox.question(
+            parent,
+            "저장된 상품 메모리 복구",
+            "저장된 상품 무게/분류 파일이 손상되었거나 현재 버전에서 읽을 수 없습니다.\n\n"
+            f"오류: {exc}\n\n"
+            "기존 파일을 같은 폴더에 백업한 뒤 저장 목록을 모두 초기화하시겠습니까?\n"
+            "초기화하면 표의 SKU 무게를 WMS에서 다시 측정합니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return None
+
+        try:
+            backup = ProductMemory.quarantine_and_reset(memory_path)
+            memory = ProductMemory(memory_path)
+        except Exception as recovery_exc:
+            ErrorReportDialog(
+                "상품 메모리 복구 실패",
+                FailureDetails.from_exception(recovery_exc),
+                context={"category": "상품 분류 메모리 복구"},
+                parent=parent,
+            ).exec()
+            return None
+
+        QMessageBox.information(
+            parent,
+            "상품 메모리 복구 완료",
+            "손상된 파일을 백업하고 저장 목록을 초기화했습니다.\n"
+            f"백업 파일: {backup}\n\n"
+            "현재 표의 SKU 무게는 WMS에서 다시 측정합니다.",
+        )
+        return memory
+    except Exception as exc:
+        ErrorReportDialog(
+            "상품 메모리 열기 실패",
+            FailureDetails.from_exception(exc),
+            context={"category": "상품 분류 메모리"},
+            parent=parent,
+        ).exec()
+        return None
+
+
 class SettingsDialog(QDialog):
     beta_changed = Signal(bool)
     update_requested = Signal()
     history_requested = Signal()
+    product_memory_changed = Signal()
 
-    def __init__(self, settings: QSettings, parent=None):
+    def __init__(
+        self,
+        settings: QSettings,
+        parent=None,
+        *,
+        memory_path: str | Path | None = None,
+    ):
         super().__init__(parent)
         self.settings = settings
+        self.memory_path = Path(memory_path) if memory_path else product_memory_path()
+        self.credential_store = WMSCredentialStore(settings)
+        self._credential_load_error: CredentialError | None = None
         self.setWindowTitle("UnHelper 설정")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
@@ -273,6 +367,48 @@ class SettingsDialog(QDialog):
         excel_help.setStyleSheet("color: #A1A1AA;")
         layout.addWidget(excel_help)
 
+        wms_label = QLabel("WMS 로그인 정보")
+        layout.addWidget(wms_label)
+        try:
+            credentials = self.credential_store.load()
+        except CredentialError as exc:
+            credentials = WMSCredentials(
+                wms_id=str(self.settings.value("wms_id", "")),
+                password="",
+            )
+            self._credential_load_error = exc
+
+        wms_id_row = QHBoxLayout()
+        wms_id_row.addWidget(QLabel("ID"))
+        self.wms_id_input = QLineEdit(credentials.wms_id)
+        self.wms_id_input.setPlaceholderText("WMS ID")
+        wms_id_row.addWidget(self.wms_id_input, 1)
+        layout.addLayout(wms_id_row)
+
+        wms_password_row = QHBoxLayout()
+        wms_password_row.addWidget(QLabel("Password"))
+        self.wms_password_input = QLineEdit(credentials.password)
+        self.wms_password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.wms_password_input.setPlaceholderText("WMS Password")
+        self.show_wms_password = QCheckBox("표시")
+        self.show_wms_password.toggled.connect(
+            lambda checked: self.wms_password_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        wms_password_row.addWidget(self.wms_password_input, 1)
+        wms_password_row.addWidget(self.show_wms_password)
+        layout.addLayout(wms_password_row)
+
+        product_memory_row = QHBoxLayout()
+        product_memory_help = QLabel("저장된 상품은 다음 실행에서 WMS 무게 조회를 생략합니다.")
+        product_memory_help.setStyleSheet("color: #A1A1AA;")
+        self.product_memory_button = QPushButton("저장된 상품 분류 목록")
+        self.product_memory_button.clicked.connect(self._show_product_memory)
+        product_memory_row.addWidget(product_memory_help, 1)
+        product_memory_row.addWidget(self.product_memory_button)
+        layout.addLayout(product_memory_row)
+
         self.beta_checkbox = QCheckBox("Beta(테스트 릴리즈) 업데이트 받기")
         self.beta_checkbox.setChecked(self.settings.value("use_prerelease", False, type=bool))
         self.beta_checkbox.setToolTip("끄면 최신 정식 릴리즈로 복구할 수 있습니다.")
@@ -294,6 +430,9 @@ class SettingsDialog(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(close)
         layout.addLayout(buttons)
+
+        if self._credential_load_error is not None:
+            QTimer.singleShot(0, self._show_credential_load_error)
 
     def _browse(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -327,11 +466,53 @@ class SettingsDialog(QDialog):
             except ExcelImportError as exc:
                 QMessageBox.warning(self, "Excel 파일 확인", str(exc))
                 return None
+        try:
+            self.credential_store.save(
+                WMSCredentials(
+                    wms_id=self.wms_id_input.text().strip(),
+                    password=self.wms_password_input.text(),
+                )
+            )
+        except CredentialError as exc:
+            self._show_settings_error("WMS 계정 저장 실패", exc, "WMS 계정 설정")
+            return None
         self.settings.setValue("download_dir", path)
         self.settings.setValue("milkrun_excel_path", excel_path)
         self.settings.setValue("use_prerelease", next_beta)
         self.settings.sync()
         return previous_beta != next_beta, next_beta
+
+    def _show_product_memory(self) -> None:
+        try:
+            memory = _open_product_memory_with_recovery(self.memory_path, self)
+            if memory is None:
+                return
+            dialog = ProductMemoryDialog(memory, self)
+            dialog.memory_changed.connect(self.product_memory_changed.emit)
+            dialog.exec()
+            # Recovery can replace a corrupt cache with an empty one without a
+            # ProductMemoryDialog edit, so always reconcile the current RAW table
+            # once the list closes as well.
+            self.product_memory_changed.emit()
+        except Exception as exc:
+            self._show_settings_error("저장된 상품 목록 열기 실패", exc, "상품 분류 메모리")
+
+    def _show_credential_load_error(self) -> None:
+        if self._credential_load_error is None:
+            return
+        self._show_settings_error(
+            "WMS 비밀번호 불러오기 실패",
+            self._credential_load_error,
+            "WMS 계정 설정",
+        )
+
+    def _show_settings_error(self, title: str, exc: Exception, category: str) -> None:
+        ErrorReportDialog(
+            title,
+            FailureDetails.from_exception(exc),
+            context={"category": category},
+            parent=self,
+        ).exec()
 
     def _request_update(self) -> None:
         persisted = self._persist()
@@ -360,6 +541,18 @@ class MainWindow(QMainWindow):
         self.smoke_test = smoke_test
         self.settings = QSettings("Mrbinggrae", "UnHelper")
         self.milkrun_worker: MilkrunWorker | None = None
+        self.weight_worker: ProductWeightWorker | None = None
+        self.product_memory_file = product_memory_path()
+        self.current_products = ()
+        self.current_pipeline_result: MilkrunPipelineResult | None = None
+        self._weight_records: dict[str, ProductMemoryRecord] = {}
+        self._weight_failures: dict[str, SkuWeightFailure] = {}
+        self._weight_row_errors: dict[str, str] = {}
+        self._credential_load_failure: FailureDetails | None = None
+        self._pending_weight_summary: ProductWeightSummary | None = None
+        self._pending_weight_failure: FailureDetails | None = None
+        self._pending_weight_cancel = ""
+        self._weight_finalize_pending = False
         self.update_check_worker: UpdateCheckWorker | None = None
         self.restore_worker: ReleaseRestoreWorker | None = None
         self.update_download_worker: UpdateDownloadWorker | None = None
@@ -391,7 +584,7 @@ class MainWindow(QMainWindow):
         title_col = QVBoxLayout()
         title = QLabel("UnHelper")
         title.setObjectName("Title")
-        version = QLabel(f"v{CURRENT_VERSION} · Shipments 자동화 도우미")
+        version = QLabel(f"v{CURRENT_VERSION} · Shipments/WMS 자동화 도우미")
         version.setObjectName("Version")
         title_col.addWidget(title)
         title_col.addWidget(version)
@@ -452,32 +645,36 @@ class MainWindow(QMainWindow):
 
         content = QHBoxLayout()
         content.setSpacing(18)
-        self.raw_table = QTableWidget(0, 6)
+        self.raw_table = QTableWidget(0, 10)
         self.raw_table.setHorizontalHeaderLabels(
-            ["거래처 이름", "밀크런 번호", "팔렛트 수", "박스 수", "SKU ID", "SKU 명"]
+            [
+                "거래처 이름",
+                "밀크런 번호",
+                "팔렛트 수",
+                "박스 수",
+                "팔렛트당 박스",
+                "SKU ID",
+                "SKU 명",
+                "상품 무게(g)",
+                "1팔렛트 무게(kg)",
+                "분류",
+            ]
         )
+        self.raw_table.setWordWrap(False)
+        self.raw_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.raw_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.raw_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.raw_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.raw_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.raw_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.raw_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.raw_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        self.raw_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.verticalHeader().setVisible(False)
         self.raw_table.setAlternatingRowColors(True)
-        content.addWidget(self.raw_table, 6)
-
-        categories = QVBoxLayout()
-        categories.setSpacing(7)
-        for _ in range(3):
-            row = QHBoxLayout()
-            for text in ("고단", "중량", "경량", "?"):
-                button = QPushButton(text)
-                button.setObjectName("CategoryButton")
-                button.setEnabled(False)
-                row.addWidget(button)
-            categories.addLayout(row)
-        categories.addStretch(1)
-        content.addLayout(categories, 2)
+        content.addWidget(self.raw_table, 1)
         outer.addLayout(content, 1)
 
         actions = QHBoxLayout()
@@ -507,7 +704,7 @@ class MainWindow(QMainWindow):
         return page
 
     def start_milkrun_download(self) -> None:
-        if self.milkrun_worker and self.milkrun_worker.isRunning():
+        if self._automation_worker_running():
             return
         driver = chromedriver_path()
         if not driver.is_file():
@@ -535,6 +732,13 @@ class MainWindow(QMainWindow):
         request = MilkrunDownloadRequest(download_dir=download_dir, center_name="안산2")
         self.log_view.clear()
         self.raw_table.setRowCount(0)
+        self.current_products = ()
+        self.current_pipeline_result = None
+        self._pending_weight_summary = None
+        self._pending_weight_failure = None
+        self._pending_weight_cancel = ""
+        self._credential_load_failure = None
+        self._weight_finalize_pending = False
         self.append_log("Milkrun 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
         self.append_log(f"연결된 Excel: {target_workbook}")
         self._set_automation_working(True)
@@ -550,61 +754,429 @@ class MainWindow(QMainWindow):
         self.milkrun_worker.start()
 
     def cancel_milkrun_download(self) -> None:
+        requested = False
         if self.milkrun_worker and self.milkrun_worker.isRunning():
+            self.milkrun_worker.request_cancel()
+            requested = True
+        if self.weight_worker and self.weight_worker.isRunning():
+            self.weight_worker.request_cancel()
+            requested = True
+        if requested:
             self.append_log("작업 중지를 요청했습니다.")
             self.status_label.setText("작업 중지 중...")
             self.stop_button.setEnabled(False)
-            self.milkrun_worker.request_cancel()
 
     def _on_milkrun_completed(self, result) -> None:
+        if self._closing_after_cancel:
+            self.append_log("종료 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
+            return
         excel = result.excel
         daily = result.daily_inbound
+        self.current_pipeline_result = result
         self._populate_milkrun_products(daily.products)
         self.append_log(f"다운로드 완료: {excel.source_file}")
         self.append_log(
             f"Excel 반영 완료: {excel.target_workbook} · {excel.sheet_name}!C1 · "
             f"{excel.rows}행 × {excel.columns}열"
         )
+        if excel.filtered_rows:
+            self.append_log(f"입고일이 어제인 행 {excel.filtered_rows}개를 제외했습니다.")
         self.append_log(f"일별 입고 상세 표시 완료: {len(daily.products)}개 상품")
-        missing_text = ""
         if daily.unmatched_orders:
-            missing_text = "\n\n오늘 카드에서 찾지 못한 발주번호: " + ", ".join(
-                f"T{value}" for value in daily.unmatched_orders
+            self.append_log(
+                "오늘 카드에서 찾지 못한 발주번호: "
+                + ", ".join(f"T{value}" for value in daily.unmatched_orders)
             )
-            self.status_label.setText(
-                f"완료 · 상품 {len(daily.products)}개 · 일부 발주 미조회"
-            )
-        else:
-            self.status_label.setText(f"완료 · 상품 {len(daily.products)}개")
-        if not self._closing_after_cancel:
-            message = (
-                "Milkrun 파일을 내려받고 연결된 Excel에 값을 반영한 뒤 "
-                "일별 입고 상세를 표시했습니다.\n\n"
-                f"다운로드: {excel.source_file}\n"
-                f"대상: {excel.target_workbook}\n"
-                f"범위: {excel.sheet_name}!C1 ({excel.rows}행 × {excel.columns}열)\n"
-                f"표시 상품: {len(daily.products)}개{missing_text}"
-            )
-            show_message = QMessageBox.warning if daily.unmatched_orders else QMessageBox.information
-            show_message(
-                self,
-                "Milkrun 작업 완료",
-                message,
-            )
+        self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
+        self._start_weight_lookup(daily.products)
 
     def _populate_milkrun_products(self, products) -> None:
-        self.raw_table.setRowCount(len(products))
-        for row_index, product in enumerate(products):
+        self.current_products = tuple(products)
+        self._weight_records.clear()
+        self._weight_failures.clear()
+        self._weight_row_errors.clear()
+        self.raw_table.setRowCount(len(self.current_products))
+        for row_index, product in enumerate(self.current_products):
             values = (
                 product.vendor_name,
                 product.milkrun_number,
                 product.pallet_count,
                 product.box_count,
+                "-",
                 product.sku_id,
-                product.sku_name,
+                normalize_product_name(product.sku_name),
+                "-",
+                "-",
             )
             for column_index, value in enumerate(values):
-                self.raw_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column_index == 6:
+                    item.setToolTip(str(value))
+                self.raw_table.setItem(row_index, column_index, item)
+            category_button = QPushButton("?")
+            category_button.setObjectName("CategoryButton")
+            category_button.setProperty("classification", "?")
+            category_button.setEnabled(False)
+            category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
+            category_button.clicked.connect(
+                lambda _checked=False, sku_id=product.sku_id: self._cycle_category(sku_id)
+            )
+            self.raw_table.setCellWidget(row_index, 9, category_button)
+
+    def _start_weight_lookup(self, products) -> None:
+        if self.weight_worker and self.weight_worker.isRunning():
+            return
+        self._credential_load_failure = None
+        if self._closing_after_cancel:
+            self.append_log("종료 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
+            return
+        products = tuple(products)
+        if not products:
+            self._pending_weight_summary = ProductWeightSummary(
+                total_skus=0,
+                cache_hits=0,
+                wms_successes=0,
+                failures=(),
+            )
+            self._pending_weight_failure = None
+            self._pending_weight_cancel = ""
+            self._weight_finalize_pending = True
+            self.status_label.setText("오늘 표시할 상품 없음 · WMS 조회 생략")
+            self.append_log("오늘 표시할 상품이 없어 WMS 무게 조회를 건너뜁니다.")
+            self._finalize_weight_if_ready()
+            return
+        memory = _open_product_memory_with_recovery(self.product_memory_file, self)
+        if memory is None:
+            message = (
+                "상품 메모리를 준비하지 못해 WMS 무게 조회를 시작하지 않았습니다. "
+                "복구를 취소했다면 설정에서 저장 목록을 다시 열어 복구할 수 있습니다."
+            )
+            self._pending_weight_failure = FailureDetails(summary=message, detail=message)
+            self._weight_finalize_pending = True
+            self.status_label.setText("부분 완료 · 상품 메모리 복구 취소")
+            self.append_log(message)
+            self._finalize_weight_if_ready()
+            return
+        try:
+            credentials = WMSCredentialStore(self.settings).load()
+        except CredentialError as exc:
+            credentials = WMSCredentials(
+                wms_id=str(self.settings.value("wms_id", "")),
+                password="",
+            )
+            self._credential_load_failure = FailureDetails.from_exception(exc)
+
+        download_dir = Path(
+            str(self.settings.value("download_dir", str(default_download_dir())))
+        ).expanduser()
+        self._pending_weight_summary = None
+        self._pending_weight_failure = None
+        self._pending_weight_cancel = ""
+        self.weight_worker = ProductWeightWorker(
+            products,
+            self.product_memory_file,
+            chromedriver_path(),
+            credentials.wms_id,
+            credentials.password,
+            evidence_dir=download_dir,
+        )
+        self.weight_worker.log_updated.connect(self.append_log)
+        self.weight_worker.record_ready.connect(self._on_weight_record_ready)
+        self.weight_worker.sku_failed.connect(self._on_weight_sku_failed)
+        self.weight_worker.completed.connect(self._on_weight_completed)
+        self.weight_worker.failed.connect(self._on_weight_failed)
+        self.weight_worker.cancelled.connect(self._on_weight_cancelled)
+        self.weight_worker.finished.connect(self._on_weight_finished)
+        self.status_label.setText("WMS 상품 무게 확인 중")
+        self.append_log("표의 SKU별 상품 무게와 팔렛트 분류를 확인합니다.")
+        self._set_automation_working(True)
+        self.weight_worker.start()
+
+    def _on_weight_record_ready(self, record: ProductMemoryRecord, cache_hit: bool) -> None:
+        self._weight_records[record.sku_id] = record
+        self._render_weight_record(record)
+        source = "저장 정보" if cache_hit else "WMS"
+        self.append_log(f"SKU {record.sku_id} 무게 반영: {source}")
+
+    def _render_weight_record(self, record: ProductMemoryRecord) -> None:
+        self._weight_row_errors.pop(record.sku_id, None)
+        for row_index, product in enumerate(self.current_products):
+            try:
+                row_sku = normalize_sku_id(product.sku_id)
+            except ValueError:
+                continue
+            if row_sku != record.sku_id:
+                continue
+
+            category = record.category_override or "?"
+            error_text = ""
+            if record.weight_grams is not None:
+                self._set_table_text(row_index, 7, self._format_decimal(record.weight_grams))
+                try:
+                    boxes_per_pallet, pallet_weight_kg, automatic_category = calculate_pallet_measurement(
+                        record.weight_grams,
+                        product.box_count,
+                        product.pallet_count,
+                    )
+                    self._set_table_text(row_index, 4, self._format_decimal(boxes_per_pallet, 3))
+                    self._set_table_text(row_index, 8, self._format_decimal(pallet_weight_kg, 3))
+                    category = record.category_override or automatic_category
+                except (TypeError, ValueError) as exc:
+                    self._set_table_text(row_index, 4, "-")
+                    self._set_table_text(row_index, 8, "-")
+                    error_text = str(exc)
+                    self._weight_row_errors[record.sku_id] = error_text
+            else:
+                self._set_table_text(row_index, 7, "-")
+                self._set_table_text(row_index, 4, "-")
+                self._set_table_text(row_index, 8, "-")
+
+            button = self.raw_table.cellWidget(row_index, 9)
+            if isinstance(button, QPushButton):
+                self._configure_category_button(
+                    button,
+                    category,
+                    manual=record.category_override is not None,
+                    enabled=not self._automation_worker_running(),
+                    error_text=error_text,
+                )
+
+    def _on_weight_sku_failed(self, failure: SkuWeightFailure) -> None:
+        self._weight_failures[failure.sku_id] = failure
+        self.append_log(f"[WMS 조회 실패] SKU {failure.sku_id}: {failure.details.summary}")
+        for row_index, product in enumerate(self.current_products):
+            try:
+                matches = normalize_sku_id(product.sku_id) == normalize_sku_id(failure.sku_id)
+            except ValueError:
+                matches = str(product.sku_id).strip() == failure.sku_id
+            if not matches:
+                continue
+            button = self.raw_table.cellWidget(row_index, 9)
+            if isinstance(button, QPushButton):
+                button.setToolTip(failure.details.summary)
+
+    def _on_weight_completed(self, summary: ProductWeightSummary) -> None:
+        self._pending_weight_summary = summary
+        self.status_label.setText("WMS 무게 결과 정리 중")
+
+    def _on_weight_failed(self, failure: FailureDetails | object) -> None:
+        self._pending_weight_failure = FailureDetails.coerce(failure)
+        self.append_log(f"[WMS 무게 조회 오류] {self._pending_weight_failure.summary}")
+
+    def _on_weight_cancelled(self, message: str) -> None:
+        self._pending_weight_cancel = message
+        self.append_log(message)
+
+    def _on_weight_finished(self) -> None:
+        worker = self.weight_worker
+        self.weight_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_category_buttons_enabled(not self._automation_worker_running())
+        self._set_automation_working(self._automation_worker_running())
+        if not self._automation_worker_running() and self.current_products:
+            self._set_category_buttons_enabled(True)
+        if self._closing_after_cancel:
+            if not self._automation_worker_running():
+                QTimer.singleShot(0, self.close)
+            return
+        self._weight_finalize_pending = True
+        self._finalize_weight_if_ready()
+
+    def _finalize_weight_if_ready(self) -> None:
+        if not self._weight_finalize_pending or self._automation_worker_running():
+            return
+        self._weight_finalize_pending = False
+        self._finalize_weight_lookup()
+
+    def _finalize_weight_lookup(self) -> None:
+        if self._pending_weight_cancel:
+            self.status_label.setText("부분 완료 · WMS 무게 조회 취소")
+            QMessageBox.information(
+                self,
+                "WMS 무게 조회 취소",
+                "Milkrun 다운로드, Excel 반영과 일별 입고 표시는 완료됐습니다.\n"
+                "이미 확인된 상품 무게는 저장됐으며 나머지는 다음 실행에서 다시 조회합니다.",
+            )
+            return
+
+        problems: list[str] = []
+        details: list[str] = []
+        if self._credential_load_failure is not None:
+            problems.append("저장된 WMS 비밀번호를 불러오지 못했습니다.")
+            details.append(self._credential_load_failure.detail)
+        if self._pending_weight_failure is not None:
+            problems.append(self._pending_weight_failure.summary)
+            details.append(self._pending_weight_failure.detail)
+        summary = self._pending_weight_summary
+        if summary is not None:
+            for failure in summary.failures:
+                problems.append(f"SKU {failure.sku_id}: {failure.details.summary}")
+                details.append(
+                    f"SKU {failure.sku_id} / {failure.product_name}\n{failure.details.detail}"
+                )
+        for sku_id, message in self._weight_row_errors.items():
+            problems.append(f"SKU {sku_id} 팔렛트 계산: {message}")
+            details.append(f"SKU {sku_id} 팔렛트 계산\n{message}")
+
+        if problems:
+            self.status_label.setText(f"부분 완료 · WMS/계산 오류 {len(problems)}건")
+            failure = FailureDetails(
+                summary=(
+                    "Milkrun 다운로드, Excel 반영과 일별 입고 표시는 완료됐지만 "
+                    f"상품 무게 확인 중 {len(problems)}건의 문제가 발생했습니다.\n\n"
+                    + "\n".join(problems[:20])
+                ),
+                detail="\n\n".join(details),
+            )
+            self._show_error_dialog(
+                "WMS 상품 무게 조회 일부 실패",
+                failure,
+                category="Milkrun WMS 무게 조회",
+            )
+            return
+
+        cache_hits = summary.cache_hits if summary is not None else 0
+        wms_successes = summary.wms_successes if summary is not None else 0
+        product_count = len(self.current_products)
+        unmatched = (
+            self.current_pipeline_result.daily_inbound.unmatched_orders
+            if self.current_pipeline_result is not None
+            else ()
+        )
+        self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
+        message = (
+            "Milkrun 다운로드, Excel 값 반영, 일별 입고 상세와 WMS 무게 분류를 완료했습니다.\n\n"
+            f"표시 상품: {product_count}개\n"
+            f"저장된 무게 사용: {cache_hits}개\n"
+            f"WMS 신규 조회: {wms_successes}개"
+        )
+        if unmatched:
+            message += "\n\n오늘 카드에서 찾지 못한 발주번호: " + ", ".join(
+                f"T{value}" for value in unmatched
+            )
+            QMessageBox.warning(self, "Milkrun 작업 완료", message)
+        else:
+            QMessageBox.information(self, "Milkrun 작업 완료", message)
+
+    def _cycle_category(self, sku_value: object) -> None:
+        if self._automation_worker_running():
+            return
+        try:
+            sku_id = normalize_sku_id(sku_value)
+            memory = ProductMemory(self.product_memory_file)
+            record = memory.get(sku_id)
+            override = record.category_override if record is not None else None
+            product_name = ""
+            for product in self.current_products:
+                try:
+                    product_sku_id = normalize_sku_id(product.sku_id)
+                except ValueError:
+                    # An unrelated malformed row is already reported as an
+                    # individual WMS failure. It must not disable classification
+                    # editing for a valid SKU elsewhere in the table.
+                    continue
+                if product_sku_id == sku_id:
+                    product_name = normalize_product_name(product.sku_name)
+                    break
+            if override is None:
+                # Enter manual mode at a deterministic first choice so every
+                # category remains reachable even when the automatic result is
+                # already 중량.
+                next_category = "경량"
+            elif override == "경량":
+                next_category = "중량"
+            elif override == "중량":
+                next_category = "고단"
+            else:
+                next_category = None
+            updated = memory.set_manual_category(sku_id, next_category, product_name)
+        except Exception as exc:
+            self._show_error_dialog(
+                "상품 분류 저장 실패",
+                FailureDetails.from_exception(exc),
+                category="상품 분류 메모리",
+            )
+            return
+
+        if updated is None:
+            self._weight_records.pop(sku_id, None)
+            self._render_unknown_sku(sku_id)
+            self.append_log(f"SKU {sku_id} 수동 분류를 해제했습니다.")
+        else:
+            self._weight_records[sku_id] = updated
+            self._render_weight_record(updated)
+            source = "자동" if updated.category_override is None else "수동"
+            self.append_log(f"SKU {sku_id} 분류 변경: {updated.effective_category or '?'} ({source})")
+
+    def _render_unknown_sku(self, sku_id: str) -> None:
+        for row_index, product in enumerate(self.current_products):
+            try:
+                if normalize_sku_id(product.sku_id) != sku_id:
+                    continue
+            except ValueError:
+                continue
+            self._set_table_text(row_index, 4, "-")
+            self._set_table_text(row_index, 7, "-")
+            self._set_table_text(row_index, 8, "-")
+            button = self.raw_table.cellWidget(row_index, 9)
+            if isinstance(button, QPushButton):
+                self._configure_category_button(button, "?", manual=False, enabled=True)
+
+    def _displayed_category_for_sku(self, sku_id: str) -> str:
+        for row_index, product in enumerate(self.current_products):
+            try:
+                if normalize_sku_id(product.sku_id) != sku_id:
+                    continue
+            except ValueError:
+                continue
+            button = self.raw_table.cellWidget(row_index, 9)
+            if isinstance(button, QPushButton):
+                return button.text()
+        return "?"
+
+    def _set_category_buttons_enabled(self, enabled: bool) -> None:
+        for row_index in range(self.raw_table.rowCount()):
+            button = self.raw_table.cellWidget(row_index, 9)
+            if isinstance(button, QPushButton):
+                button.setEnabled(enabled)
+
+    @staticmethod
+    def _configure_category_button(
+        button: QPushButton,
+        category: str,
+        *,
+        manual: bool,
+        enabled: bool,
+        error_text: str = "",
+    ) -> None:
+        display = category if category in MANUAL_CATEGORIES else "?"
+        button.setText(display)
+        button.setProperty("classification", display)
+        button.setEnabled(enabled)
+        if error_text:
+            tooltip = f"팔렛트 무게 계산 오류: {error_text}\n클릭해 수동 분류할 수 있습니다."
+        elif manual:
+            tooltip = "수동 분류입니다. 클릭하면 다음 분류로 변경됩니다."
+        else:
+            tooltip = "무게 기준 자동 분류입니다. 클릭하면 수동 분류로 변경됩니다."
+        button.setToolTip(tooltip)
+        button.style().unpolish(button)
+        button.style().polish(button)
+
+    def _set_table_text(self, row: int, column: int, value: str) -> None:
+        item = self.raw_table.item(row, column)
+        if item is None:
+            item = QTableWidgetItem()
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.raw_table.setItem(row, column, item)
+        item.setText(value)
+
+    @staticmethod
+    def _format_decimal(value: Decimal, digits: int | None = None) -> str:
+        text = f"{value:.{digits}f}" if digits is not None else format(value, "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
     def _on_milkrun_failed(self, failure: FailureDetails | object) -> None:
         details = FailureDetails.coerce(failure)
@@ -683,10 +1255,23 @@ class MainWindow(QMainWindow):
         self.status_label.setText("작업 취소됨")
 
     def _on_milkrun_finished(self) -> None:
-        self._set_automation_working(False)
+        worker = self.milkrun_worker
         self.milkrun_worker = None
-        if self._closing_after_cancel:
+        if worker is not None:
+            worker.deleteLater()
+        self._set_automation_working(self._automation_worker_running())
+        if not self._automation_worker_running() and self.current_products:
+            self._set_category_buttons_enabled(True)
+        if self._closing_after_cancel and not self._automation_worker_running():
             QTimer.singleShot(0, self.close)
+        elif not self._closing_after_cancel:
+            self._finalize_weight_if_ready()
+
+    def _automation_worker_running(self) -> bool:
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self.milkrun_worker, self.weight_worker)
+        )
 
     def _set_automation_working(self, working: bool) -> None:
         self.get_data_button.setEnabled(not working)
@@ -701,15 +1286,50 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.appendPlainText(f"[{stamp}] {message}")
-        if self.milkrun_worker and self.milkrun_worker.isRunning():
+        if self._automation_worker_running():
             self.status_label.setText(message)
 
     def show_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self)
+        dialog = SettingsDialog(
+            self.settings,
+            self,
+            memory_path=self.product_memory_file,
+        )
         dialog.update_requested.connect(lambda: self.check_for_update(manual=True))
         dialog.beta_changed.connect(self._on_beta_changed)
         dialog.history_requested.connect(self.show_update_history)
+        dialog.product_memory_changed.connect(self._refresh_current_product_memory)
         dialog.exec()
+
+    def _refresh_current_product_memory(self) -> None:
+        if not self.current_products:
+            return
+        try:
+            memory = ProductMemory(self.product_memory_file)
+            self._weight_records.clear()
+            self._weight_row_errors.clear()
+            seen: set[str] = set()
+            for product in self.current_products:
+                try:
+                    sku_id = normalize_sku_id(product.sku_id)
+                except ValueError:
+                    continue
+                if sku_id in seen:
+                    continue
+                seen.add(sku_id)
+                record = memory.get(sku_id)
+                if record is None:
+                    self._render_unknown_sku(sku_id)
+                    continue
+                self._weight_records[sku_id] = record
+                self._render_weight_record(record)
+            self.append_log("설정에서 변경한 상품 분류 메모리를 현재 표에 반영했습니다.")
+        except Exception as exc:
+            self._show_error_dialog(
+                "상품 분류 새로고침 실패",
+                FailureDetails.from_exception(exc),
+                category="상품 분류 메모리",
+            )
 
     def show_update_history(self) -> None:
         UpdateHistoryDialog(self).exec()
@@ -805,11 +1425,22 @@ class MainWindow(QMainWindow):
                 category="정식 릴리즈 복구 확인",
             )
 
+    def _automation_blocks_update(self, *, notify: bool) -> bool:
+        if not self._automation_worker_running():
+            return False
+        message = "Milkrun/WMS 작업 중에는 업데이트를 표시하거나 적용할 수 없습니다."
+        self.append_log(message)
+        if notify and not self._closing_after_workers:
+            QMessageBox.warning(self, "작업 실행 중", message)
+        return True
+
     def _show_update_dialog(self, info) -> None:
         from Modules.Common.AutoUpdater import AutoUpdater
 
         self.manual_update_check = False
         if self._closing_after_workers:
+            return
+        if self._automation_blocks_update(notify=False):
             return
         if self.update_dialog and self.update_dialog.isVisible():
             return
@@ -849,8 +1480,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _download_update(self, info) -> None:
-        if self.milkrun_worker and self.milkrun_worker.isRunning():
-            QMessageBox.warning(self, "작업 실행 중", "Milkrun 작업을 먼저 끝내거나 중지해 주세요.")
+        if self._automation_blocks_update(notify=True):
             return
         if self.update_download_worker and self.update_download_worker.isRunning():
             return
@@ -869,6 +1499,17 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _apply_downloaded_update(self, zip_path: str, info) -> None:
+        if self._automation_blocks_update(notify=True):
+            if hasattr(self, "update_status"):
+                self.update_status.setText("Milkrun/WMS 작업 완료 후 업데이트를 다시 적용해 주세요.")
+            if hasattr(self, "apply_update_button"):
+                self.apply_update_button.setEnabled(True)
+            if hasattr(self, "update_later_button"):
+                self.update_later_button.setEnabled(True)
+            if isinstance(self.update_dialog, UpdateDialog):
+                self.update_dialog.allow_close = True
+            return
+
         from Modules.Common.AutoUpdater import AutoUpdater
 
         self.update_progress.setValue(100)
@@ -927,11 +1568,11 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.milkrun_worker and self.milkrun_worker.isRunning():
+        if self._automation_worker_running():
             answer = QMessageBox.question(
                 self,
                 "작업 중",
-                "진행 중인 Milkrun 다운로드/Excel 반영 작업을 중지하고 종료하시겠습니까?",
+                "진행 중인 Milkrun/WMS 작업을 중지하고 종료하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

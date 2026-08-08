@@ -19,6 +19,7 @@ from Modules.Common.ErrorReport import (
     build_github_issue_url,
     sanitize_report_text,
 )
+from Modules.Common.Credentials import WMSCredentialStore
 from Modules.Excel.MilkrunExcelImporter import ExcelImportError, MilkrunExcelImporter
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
 from Modules.GUI.MainWindow import MainWindow, MilkrunWorker, SettingsDialog
@@ -44,7 +45,8 @@ class ErrorReportTests(unittest.TestCase):
         home = str(Path.home())
         raw = (
             f'File "{home}\\project\\worker.py"\n'
-            "password=plain-secret token:abc123 Authorization: Bearer ghp_realvalue"
+            "password=plain-secret token:abc123 Authorization: Bearer ghp_realvalue "
+            "wms_id=worker123 wms_pw=another-secret"
         )
         sanitized = sanitize_report_text(raw)
 
@@ -53,6 +55,36 @@ class ErrorReportTests(unittest.TestCase):
         self.assertNotIn("plain-secret", sanitized)
         self.assertNotIn("abc123", sanitized)
         self.assertNotIn("ghp_realvalue", sanitized)
+        self.assertNotIn("worker123", sanitized)
+        self.assertNotIn("another-secret", sanitized)
+
+    def test_report_masks_quoted_and_whitespace_credentials_and_authorization_line(self) -> None:
+        raw = (
+            'wms_password="alpha beta, gamma" token=token with spaces\n'
+            "user_password='delta epsilon,zeta'\n"
+            "diagnostic prefix Authorization: Custom quoted token, with tail\n"
+            "safe diagnostic line"
+        )
+
+        sanitized = sanitize_report_text(raw)
+
+        for secret_fragment in (
+            "alpha",
+            "beta",
+            "gamma",
+            "token with spaces",
+            "delta",
+            "epsilon",
+            "zeta",
+            "diagnostic prefix",
+            "Custom quoted token",
+            "with tail",
+        ):
+            self.assertNotIn(secret_fragment, sanitized)
+        self.assertIn("wms_password=***", sanitized)
+        self.assertIn("user_password=***", sanitized)
+        self.assertIn("Authorization: ***", sanitized)
+        self.assertIn("safe diagnostic line", sanitized)
 
     def test_issue_url_targets_unhelper_and_prefills_sanitized_report(self) -> None:
         failure = FailureDetails("실패", "token=do-not-send")

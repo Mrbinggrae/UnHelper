@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +28,17 @@ def default_download_dir() -> Path:
     path = Path.home() / "Downloads" / APP_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def user_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    path = (Path(base) / "Mrbinggrae" / APP_NAME) if base else (Path.home() / f".{APP_NAME.lower()}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def product_memory_path() -> Path:
+    return user_data_dir() / "milkrun_product_memory.json"
 
 
 def release_manifest_path() -> Path:

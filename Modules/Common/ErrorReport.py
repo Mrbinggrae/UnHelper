@@ -45,10 +45,34 @@ def sanitize_report_text(value: object) -> str:
     if home:
         text = re.sub(re.escape(home), "%USERPROFILE%", text, flags=re.IGNORECASE)
 
-    key_names = r"password|passwd|pwd|token|secret|api[_-]?key|session|cookie"
+    key_names = (
+        r"wms[_-]?(?:password|passwd|pwd|pw|id)|"
+        r"user[_-]?(?:password|passwd|pwd|pw|id)|username|"
+        r"password|passwd|pwd|pw|token|secret|api[_-]?key|session|cookie"
+    )
+
+    # Treat an Authorization header as sensitive through the end of its line.
+    # Replacing the whole line also protects malformed headers and values that
+    # contain spaces, commas, quotes, or an unexpected authentication scheme.
+    text = re.sub(
+        r"(?im)^[^\r\n]*\bAuthorization\s*:[^\r\n]*$",
+        "Authorization: ***",
+        text,
+    )
+
+    # A credential value may legitimately contain whitespace and punctuation.
+    # Stop only at the next recognized credential assignment or at the line
+    # boundary; masking just the first whitespace-delimited token can leak the
+    # remainder of a password into a GitHub issue.
+    assignment_pattern = re.compile(
+        rf"(?P<prefix>\b(?:{key_names})\b\s*[:=]\s*)"
+        rf"(?P<value>.*?)"
+        rf"(?=(?:\s+\b(?:{key_names})\b\s*[:=])|$)",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = assignment_pattern.sub(lambda match: f"{match.group('prefix')}***", text)
+
     replacements = (
-        (rf"\b({key_names})\b\s*[:=]\s*([^\s,;]+)", r"\1=***"),
-        (r"(Authorization\s*:\s*(?:Bearer|Basic)\s+)[^\s]+", r"\1***"),
         (r"\b(ghp_|gho_|ghu_|ghs_|github_pat_)[A-Za-z0-9_\-]+", r"\1***"),
         (r"([?&](?:access_)?token=)[^&#\s]+", r"\1***"),
     )

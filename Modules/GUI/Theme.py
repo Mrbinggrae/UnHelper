@@ -103,11 +103,29 @@ QPushButton#StopButton {
 QPushButton#CategoryButton {
     background: #39A91E;
     border-color: #45C42E;
-    font-size: 13pt;
-    padding: 7px 18px;
+    font-size: 11pt;
+    padding: 5px 12px;
 }
 QPushButton#CategoryButton:hover {
     background: #45C42E;
+}
+QPushButton#CategoryButton[classification="중량"] {
+    background: #B45309;
+    border-color: #F59E0B;
+}
+QPushButton#CategoryButton[classification="중량"]:hover {
+    background: #D97706;
+}
+QPushButton#CategoryButton[classification="고단"] {
+    background: #6D28D9;
+    border-color: #8B5CF6;
+}
+QPushButton#CategoryButton[classification="고단"]:hover {
+    background: #7C3AED;
+}
+QPushButton#CategoryButton[classification="?"] {
+    background: #3F3F46;
+    border-color: #71717A;
 }
 QPushButton#SettingsButton {
     background: #F5F5F4;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -58,14 +59,38 @@ class FakeTargetSheet:
         return self.destination
 
 
+class FakeDimension:
+    def __init__(self, count: int) -> None:
+        self.Count = count
+
+
 class FakeUsedRange:
-    def __init__(self, values) -> None:
-        self.Value2 = values
+    def __init__(
+        self,
+        values,
+        *,
+        row_count: int | None = None,
+        column_count: int | None = None,
+    ) -> None:
+        self._values = values
+        self.value2_reads = 0
+        matrix = MilkrunExcelImporter._to_matrix(values)
+        self.Rows = FakeDimension(row_count if row_count is not None else len(matrix))
+        self.Columns = FakeDimension(
+            column_count
+            if column_count is not None
+            else max((len(row) for row in matrix), default=0)
+        )
+
+    @property
+    def Value2(self):
+        self.value2_reads += 1
+        return self._values
 
 
 class FakeSourceSheet:
-    def __init__(self, values) -> None:
-        self.UsedRange = FakeUsedRange(values)
+    def __init__(self, values=None, *, used_range=None) -> None:
+        self.UsedRange = used_range or FakeUsedRange(values)
 
 
 class FakeWorksheets:
@@ -189,6 +214,234 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             pythoncom_module=pythoncom,
         )
         return importer, target_book, excel, pythoncom
+
+    @staticmethod
+    def _excel_source_importer(
+        source: Path,
+        target: Path,
+        target_sheet: FakeTargetSheet,
+        source_values,
+        *,
+        source_range=None,
+    ):
+        target_book = FakeWorkbook(target, FakeWorksheets(target_sheet=target_sheet))
+        source_book = FakeWorkbook(
+            source,
+            FakeWorksheets(
+                source_sheet=FakeSourceSheet(source_values, used_range=source_range)
+            ),
+        )
+        workbooks = FakeWorkbooks(open_books=[target_book], open_results={source: source_book})
+        excel = FakeExcel(workbooks)
+        importer = MilkrunExcelImporter(
+            com_client=FakeComClient(active_excel=excel),
+            pythoncom_module=FakePythonCom(),
+        )
+        return importer, target_book, source_book
+
+    def test_excel_used_range_dimensions_are_rejected_before_value2_read(self) -> None:
+        cases = (
+            (MilkrunExcelImporter.MAX_SOURCE_ROWS + 1, 4, "10,000행"),
+            (2, MilkrunExcelImporter.MAX_COLUMNS + 1, "대상 범위"),
+        )
+        for row_count, column_count, expected_message in cases:
+            with self.subTest(row_count=row_count, column_count=column_count):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    source, target = self._paths(root, "download.xlsx")
+                    source.write_bytes(b"PK\x03\x04placeholder")
+                    target_sheet = FakeTargetSheet()
+                    source_range = FakeUsedRange(
+                        (("센터", "SKU", "입고일", "수량"),),
+                        row_count=row_count,
+                        column_count=column_count,
+                    )
+                    importer, target_book, source_book = self._excel_source_importer(
+                        source,
+                        target,
+                        target_sheet,
+                        (),
+                        source_range=source_range,
+                    )
+
+                    with self.assertRaisesRegex(ExcelImportError, expected_message):
+                        importer.import_values(source, target)
+
+                    self.assertEqual(source_range.value2_reads, 0)
+                    self.assertEqual(target_sheet.clear_range.clear_count, 0)
+                    self.assertEqual(target_book.save_count, 0)
+                    self.assertEqual(source_book.close_calls, [False])
+
+    def test_excluded_arrival_date_rows_are_removed_before_target_paste(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "센터,SKU,입고일,수량\n"
+                "안산2,100,2026-08-07,1\n"
+                "안산2,101,2026. 8. 7.,2\n"
+                "안산2,102,2026/08/08,3\n"
+                "안산2,103,08/08/2026,4\n",
+                encoding="utf-8-sig",
+            )
+            original_source = source.read_bytes()
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+            )
+
+            self.assertEqual((result.rows, result.columns, result.filtered_rows), (3, 4, 2))
+            self.assertEqual(sheet.clear_range.clear_count, 1)
+            self.assertEqual(sheet.destination_coordinates, ((1, 3), (3, 6)))
+            self.assertEqual(
+                sheet.destination.Value2,
+                (
+                    ("센터", "SKU", "입고일", "수량"),
+                    ("안산2", "102", "2026/08/08", "3"),
+                    ("안산2", "103", "08/08/2026", "4"),
+                ),
+            )
+            self.assertEqual(target_book.save_count, 1)
+            self.assertEqual(source.read_bytes(), original_source)
+
+    def test_date_datetime_and_excel_serial_arrival_values_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root, "download.xlsx")
+            source.write_bytes(b"PK\x03\x04placeholder")
+            original_source = source.read_bytes()
+            sheet = FakeTargetSheet()
+            excel_serial = (datetime(2026, 8, 7) - datetime(1899, 12, 30)).days
+            importer, target_book, source_book = self._excel_source_importer(
+                source,
+                target,
+                sheet,
+                (
+                    ("센터", "SKU", "입고일", "수량"),
+                    ("안산2", "100", date(2026, 8, 7), 1),
+                    ("안산2", "101", float(excel_serial), 2),
+                    ("안산2", "102", datetime(2026, 8, 8, 15, 30), 3),
+                ),
+            )
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+            )
+
+            self.assertEqual((result.rows, result.filtered_rows), (2, 2))
+            self.assertEqual(
+                sheet.destination.Value2,
+                (
+                    ("센터", "SKU", "입고일", "수량"),
+                    ("안산2", "102", datetime(2026, 8, 8, 15, 30), 3),
+                ),
+            )
+            self.assertEqual(target_book.save_count, 1)
+            self.assertEqual(source_book.close_calls, [False])
+            self.assertEqual(source.read_bytes(), original_source)
+
+    def test_wrong_arrival_date_header_is_rejected_before_target_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "센터,SKU,날짜,수량\n안산2,100,2026-08-08,1\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "C열 헤더"):
+                importer.import_values(
+                    source,
+                    target,
+                    exclude_arrival_date=date(2026, 8, 7),
+                )
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
+
+    def test_invalid_or_blank_arrival_date_is_rejected_before_target_change(self) -> None:
+        for label, arrival_value in (("blank", ""), ("invalid", "2026-02-30")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source, target = self._paths(root)
+                source.write_text(
+                    f"센터,SKU,입고일,수량\n안산2,100,{arrival_value},1\n",
+                    encoding="utf-8",
+                )
+                sheet = FakeTargetSheet()
+                importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+                with self.assertRaisesRegex(ExcelImportError, "C열 입고일"):
+                    importer.import_values(
+                        source,
+                        target,
+                        exclude_arrival_date=date(2026, 8, 7),
+                    )
+
+                self.assertEqual(sheet.clear_range.clear_count, 0)
+                self.assertEqual(target_book.save_count, 0)
+
+    def test_all_excluded_data_rows_paste_header_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "센터,SKU,입고일,수량\n"
+                "안산2,100,2026.08.07,1\n"
+                "안산2,101,08/07/2026,2\n",
+                encoding="utf-8",
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+            )
+
+            self.assertEqual((result.rows, result.columns, result.filtered_rows), (1, 4, 2))
+            self.assertEqual(sheet.destination_coordinates, ((1, 3), (1, 6)))
+            self.assertEqual(
+                sheet.destination.Value2,
+                (("센터", "SKU", "입고일", "수량"),),
+            )
+            self.assertEqual(sheet.clear_range.clear_count, 1)
+            self.assertEqual(target_book.save_count, 1)
+
+    def test_yesterday_rows_are_filtered_before_target_row_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            lines = [
+                "센터,SKU,입고일,수량",
+                "안산2,1,2026-08-07,1",
+                "안산2,2,2026-08-07,1",
+            ]
+            lines.extend(
+                f"안산2,{1000 + index},2026-08-08,1" for index in range(999)
+            )
+            source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+            )
+
+            self.assertEqual((result.rows, result.filtered_rows), (1000, 2))
+            self.assertEqual(sheet.clear_range.clear_count, 1)
+            self.assertEqual(target_book.save_count, 1)
 
     def test_csv_values_clear_fixed_range_and_paste_at_c1(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

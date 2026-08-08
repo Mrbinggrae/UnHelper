@@ -156,6 +156,55 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(cancelled, [])
         fake_downloader.close.assert_called_once()
 
+    def test_worker_completes_header_only_import_without_daily_scraper(self) -> None:
+        download_result = MilkrunDownloadResult(
+            Path("download.csv"),
+            date(2026, 8, 7),
+            date(2026, 8, 8),
+            "08.07-08.08",
+        )
+        import_result = MilkrunExcelImportResult(
+            source_file=Path("download.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_밀크런",
+            rows=1,
+            columns=14,
+            order_numbers=(),
+            filtered_rows=2,
+        )
+        fake_importer = mock.Mock()
+        fake_importer.validate_workbook.return_value = import_result.target_workbook
+        fake_importer.import_values.return_value = import_result
+        fake_downloader = mock.Mock()
+        fake_downloader.run.return_value = download_result
+        worker = MilkrunWorker(
+            MilkrunDownloadRequest(Path("downloads"), today=date(2026, 8, 8)),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+        )
+        completed = []
+        failures = []
+        logs = []
+        worker.completed.connect(completed.append)
+        worker.detail_failed.connect(lambda *args: failures.append(args))
+        worker.log_updated.connect(logs.append)
+
+        with (
+            mock.patch("Modules.GUI.MainWindow.MilkrunExcelImporter", return_value=fake_importer),
+            mock.patch("Modules.GUI.MainWindow.MilkrunDownloader", return_value=fake_downloader),
+            mock.patch("Modules.GUI.MainWindow.DailyInboundScraper") as scraper_class,
+        ):
+            worker.run()
+
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].excel, import_result)
+        self.assertEqual(completed[0].daily_inbound.products, ())
+        self.assertEqual(completed[0].daily_inbound.requested_orders, ())
+        self.assertEqual(failures, [])
+        self.assertTrue(any("상세 조회를 건너뜁니다" in message for message in logs))
+        scraper_class.assert_not_called()
+        fake_downloader.close.assert_called_once()
+
     def test_fresh_result_requires_dom_change_or_successful_query_request(self) -> None:
         scraper = DailyInboundScraper(_Browser())
         base_state = {
