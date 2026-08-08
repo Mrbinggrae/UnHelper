@@ -207,6 +207,58 @@ class DailyInboundScraperTests(unittest.TestCase):
         scraper_class.assert_not_called()
         fake_downloader.close.assert_called_once()
 
+    def test_worker_emits_completed_only_after_all_milkrun_lists_are_read(self) -> None:
+        download_result = MilkrunDownloadResult(
+            Path("download.csv"),
+            date(2026, 8, 7),
+            date(2026, 8, 8),
+            "08.07-08.08",
+        )
+        import_result = MilkrunExcelImportResult(
+            source_file=Path("download.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_밀크런",
+            rows=2,
+            columns=14,
+            dispatch_numbers=("M3370492", "M3370493"),
+        )
+        fake_importer = mock.Mock()
+        fake_importer.validate_workbook.return_value = import_result.target_workbook
+        fake_importer.import_values.return_value = import_result
+        fake_downloader = mock.Mock()
+        fake_downloader.run.return_value = download_result
+        fake_scraper = mock.Mock()
+        events: list[str] = []
+        fake_scraper.run.side_effect = lambda *args, **kwargs: (
+            events.append("all_milkrun_lists_read")
+            or mock.Mock(
+                products=(),
+                requested_dispatches=import_result.dispatch_numbers,
+                matched_dispatches=import_result.dispatch_numbers,
+                unmatched_dispatches=(),
+            )
+        )
+
+        worker = MilkrunWorker(
+            MilkrunDownloadRequest(Path("downloads"), today=date(2026, 8, 8)),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+        )
+        worker.completed.connect(lambda _result: events.append("wms_can_start"))
+
+        with (
+            mock.patch("Modules.GUI.MainWindow.MilkrunExcelImporter", return_value=fake_importer),
+            mock.patch("Modules.GUI.MainWindow.MilkrunDownloader", return_value=fake_downloader),
+            mock.patch("Modules.GUI.MainWindow.DailyInboundScraper", return_value=fake_scraper),
+        ):
+            worker.run()
+
+        self.assertLess(
+            events.index("all_milkrun_lists_read"),
+            events.index("wms_can_start"),
+        )
+        fake_downloader.close.assert_called_once()
+
     def test_fresh_result_requires_dom_change_or_successful_query_request(self) -> None:
         scraper = DailyInboundScraper(_Browser())
         base_state = {

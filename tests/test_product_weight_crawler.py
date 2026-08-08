@@ -4,6 +4,7 @@ import threading
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 from selenium.common.exceptions import StaleElementReferenceException
@@ -24,16 +25,26 @@ class _Element:
         *,
         value: str = "",
         href: str = "",
+        target: str = "",
         links: list[object] | None = None,
         columns: list[object] | None = None,
         stale: bool = False,
+        on_click: Callable[[], None] | None = None,
     ) -> None:
         self.text = text
         self.value = value
         self.href = href
+        self.target = target
         self.links = links or []
         self.columns = columns or []
         self.stale = stale
+        self.on_click = on_click
+
+    def click(self) -> None:
+        if self.stale:
+            raise StaleElementReferenceException("rerendered")
+        if self.on_click is not None:
+            self.on_click()
 
     def find_elements(self, by, selector):
         if self.stale:
@@ -51,6 +62,8 @@ class _Element:
             return self.value
         if name == "href":
             return self.href
+        if name == "target":
+            return self.target
         return ""
 
     def is_enabled(self) -> bool:
@@ -62,9 +75,16 @@ class _Element:
         return True
 
 
-def _result_row(sku: str, product_name: str, href: str = "/sku/detail") -> _Element:
-    link = _Element(href=href)
-    columns = [_Element() for _ in range(11)]
+def _result_row(
+    sku: str,
+    product_name: str,
+    href: str = "/sku/detail",
+    *,
+    target: str = "",
+    column_count: int = 11,
+) -> _Element:
+    link = _Element(product_name, href=href, target=target)
+    columns = [_Element() for _ in range(column_count)]
     columns[0] = _Element(sku)
     columns[10] = _Element(product_name, links=[link])
     return _Element(columns=columns)
@@ -79,9 +99,15 @@ class _SwitchTo:
 
 
 class _TabDriver:
-    def __init__(self, handles: list[str], current: str) -> None:
+    def __init__(
+        self,
+        handles: list[str],
+        current: str,
+        current_url: str = "https://wms.coupang.com/sku/list",
+    ) -> None:
         self.window_handles = list(handles)
         self.current_window_handle = current
+        self.current_url = current_url
         self.switch_to = _SwitchTo(self)
         self.closed: list[str] = []
         self.back_calls = 0
@@ -117,6 +143,34 @@ class ProductWeightCrawlerTests(unittest.TestCase):
         self.assertIn("/", parsed.product_name)
         self.assertNotIn("\n", parsed.product_name)
 
+    def test_actual_wms_row_uses_eleventh_column_link_without_relying_on_target(self) -> None:
+        row = _result_row(
+            "163108821",
+            "Box*크리넥스 안심 다용도 타월 100매X10개 , 1박스",
+            "/sku/163108821",
+            target="*blank",
+            column_count=16,
+        )
+
+        parsed = ProductWeightCrawler._parse_result_row(row, "163108821")
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.sku_id, "163108821")
+        self.assertEqual(parsed.product_name, "Box*크리넥스 안심 다용도 타월 100매X10개 , 1박스")
+        self.assertEqual(parsed.href, "/sku/163108821")
+        self.assertEqual(parsed.link.get_attribute("target"), "*blank")
+
+    def test_exact_sku_must_come_from_first_column_even_when_link_points_to_it(self) -> None:
+        row = _result_row(
+            "999999999",
+            "다른 SKU 행",
+            "/sku/163108821",
+            target="_blank",
+            column_count=16,
+        )
+
+        self.assertIsNone(ProductWeightCrawler._parse_result_row(row, "163108821"))
+
     def test_sku_normalization_removes_excel_decimal_but_keeps_leading_zero(self) -> None:
         self.assertEqual(ProductWeightCrawler.normalize_sku("1,234.0"), "1234")
         self.assertEqual(ProductWeightCrawler.normalize_sku("00123"), "00123")
@@ -144,6 +198,62 @@ class ProductWeightCrawlerTests(unittest.TestCase):
         crawler = self.make_crawler()
         with mock.patch.object(crawler, "_first_present", return_value=_Element(value="1,250.5")):
             self.assertEqual(crawler._extract_weight_grams(), Decimal("1250.5"))
+
+    def test_actual_hidden_weight_value_is_read_as_grams(self) -> None:
+        crawler = self.make_crawler()
+        with mock.patch.object(crawler, "_first_present", return_value=_Element(value="1450")) as find:
+            self.assertEqual(crawler._extract_weight_grams(), Decimal("1450"))
+
+        find.assert_called_once_with(
+            By.CSS_SELECTOR,
+            "input.hidden-weight",
+            timeout=crawler.timeout,
+        )
+
+    def test_open_product_detail_detects_new_tab_without_reading_target_attribute(self) -> None:
+        crawler = self.make_crawler()
+        driver = _TabDriver(["main"], "main")
+        crawler.driver = driver
+
+        def open_detail_tab() -> None:
+            driver.window_handles.append("detail")
+
+        link = _Element(
+            "상품명",
+            href="/sku/163108821",
+            target="*blank",
+            on_click=open_detail_tab,
+        )
+
+        with mock.patch.object(crawler, "_wait_document_ready"):
+            context = crawler._open_product_detail(link)
+
+        self.assertTrue(context.opened_new_tab)
+        self.assertEqual(context.original_handle, "main")
+        self.assertEqual(context.detail_handle, "detail")
+        self.assertEqual(driver.current_window_handle, "detail")
+
+    def test_open_product_detail_detects_same_tab_navigation(self) -> None:
+        crawler = self.make_crawler()
+        driver = _TabDriver(["main"], "main")
+        crawler.driver = driver
+        link = _Element(
+            "상품명",
+            href="/sku/163108821",
+            on_click=lambda: setattr(
+                driver,
+                "current_url",
+                "https://wms.coupang.com/sku/163108821",
+            ),
+        )
+
+        with mock.patch.object(crawler, "_wait_document_ready"):
+            context = crawler._open_product_detail(link)
+
+        self.assertFalse(context.opened_new_tab)
+        self.assertEqual(context.original_handle, "main")
+        self.assertEqual(context.detail_handle, "main")
+        self.assertEqual(driver.current_window_handle, "main")
 
     def test_new_detail_tab_is_closed_and_original_tab_is_restored(self) -> None:
         crawler = self.make_crawler()

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -327,17 +328,41 @@ class SettingsDialog(QDialog):
         self.credential_store = WMSCredentialStore(settings)
         self._credential_load_error: CredentialError | None = None
         self.setWindowTitle("UnHelper 설정")
-        self.setMinimumWidth(560)
+        self.setObjectName("SettingsDialog")
+        self.resize(700, 650)
+        self.setMinimumWidth(640)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(14)
+        layout.setContentsMargins(26, 24, 26, 22)
+        layout.setSpacing(12)
 
         title = QLabel("설정")
-        title.setStyleSheet("font-size: 18pt; font-weight: 800;")
+        title.setObjectName("DialogTitle")
         layout.addWidget(title)
 
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setObjectName("SettingsViewport")
+        scroll_content = QWidget()
+        scroll_content.setObjectName("SettingsContent")
+        content_layout = QVBoxLayout(scroll_content)
+        content_layout.setContentsMargins(0, 0, 6, 0)
+        content_layout.setSpacing(12)
+
+        file_card = QFrame()
+        file_card.setProperty("card", True)
+        file_layout = QVBoxLayout(file_card)
+        file_layout.setContentsMargins(18, 16, 18, 16)
+        file_layout.setSpacing(9)
+        file_title = QLabel("파일 및 데이터")
+        file_title.setObjectName("SectionTitle")
+        file_layout.addWidget(file_title)
+
         download_label = QLabel("다운로드 파일 저장 폴더")
-        layout.addWidget(download_label)
+        download_label.setObjectName("FieldLabel")
+        file_layout.addWidget(download_label)
         download_row = QHBoxLayout()
         self.download_path = QLineEdit(
             str(self.settings.value("download_dir", str(default_download_dir())))
@@ -346,10 +371,11 @@ class SettingsDialog(QDialog):
         browse.clicked.connect(self._browse)
         download_row.addWidget(self.download_path, 1)
         download_row.addWidget(browse)
-        layout.addLayout(download_row)
+        file_layout.addLayout(download_row)
 
         excel_label = QLabel("Milkrun 데이터를 반영할 Excel 파일")
-        layout.addWidget(excel_label)
+        excel_label.setObjectName("FieldLabel")
+        file_layout.addWidget(excel_label)
         excel_row = QHBoxLayout()
         self.excel_path = QLineEdit(str(self.settings.value("milkrun_excel_path", "")))
         self.excel_path.setReadOnly(True)
@@ -361,17 +387,27 @@ class SettingsDialog(QDialog):
         excel_row.addWidget(self.excel_path, 1)
         excel_row.addWidget(excel_browse)
         excel_row.addWidget(excel_clear)
-        layout.addLayout(excel_row)
+        file_layout.addLayout(excel_row)
 
         excel_help = QLabel(
             "다운로드 완료 후 Raw_밀크런!C1:P1000의 값만 지우고, C1부터 값으로 붙여넣습니다."
         )
         excel_help.setWordWrap(True)
-        excel_help.setStyleSheet("color: #A1A1AA;")
-        layout.addWidget(excel_help)
+        excel_help.setObjectName("HelpText")
+        file_layout.addWidget(excel_help)
+        content_layout.addWidget(file_card)
 
-        wms_label = QLabel("WMS 로그인 정보")
-        layout.addWidget(wms_label)
+        wms_card = QFrame()
+        wms_card.setProperty("card", True)
+        wms_layout = QVBoxLayout(wms_card)
+        wms_layout.setContentsMargins(18, 16, 18, 16)
+        wms_layout.setSpacing(9)
+        wms_label = QLabel("WMS 로그인")
+        wms_label.setObjectName("SectionTitle")
+        wms_layout.addWidget(wms_label)
+        wms_help = QLabel("저장된 계정은 Windows 사용자 계정으로 암호화되어 보관됩니다.")
+        wms_help.setObjectName("HelpText")
+        wms_layout.addWidget(wms_help)
         try:
             credentials = self.credential_store.load()
         except CredentialError as exc:
@@ -382,14 +418,20 @@ class SettingsDialog(QDialog):
             self._credential_load_error = exc
 
         wms_id_row = QHBoxLayout()
-        wms_id_row.addWidget(QLabel("ID"))
+        wms_id_label = QLabel("ID")
+        wms_id_label.setObjectName("FieldLabel")
+        wms_id_label.setMinimumWidth(74)
+        wms_id_row.addWidget(wms_id_label)
         self.wms_id_input = QLineEdit(credentials.wms_id)
         self.wms_id_input.setPlaceholderText("WMS ID")
         wms_id_row.addWidget(self.wms_id_input, 1)
-        layout.addLayout(wms_id_row)
+        wms_layout.addLayout(wms_id_row)
 
         wms_password_row = QHBoxLayout()
-        wms_password_row.addWidget(QLabel("Password"))
+        wms_password_label = QLabel("Password")
+        wms_password_label.setObjectName("FieldLabel")
+        wms_password_label.setMinimumWidth(74)
+        wms_password_row.addWidget(wms_password_label)
         self.wms_password_input = QLineEdit(credentials.password)
         self.wms_password_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.wms_password_input.setPlaceholderText("WMS Password")
@@ -401,30 +443,44 @@ class SettingsDialog(QDialog):
         )
         wms_password_row.addWidget(self.wms_password_input, 1)
         wms_password_row.addWidget(self.show_wms_password)
-        layout.addLayout(wms_password_row)
+        wms_layout.addLayout(wms_password_row)
+        content_layout.addWidget(wms_card)
 
+        app_card = QFrame()
+        app_card.setProperty("card", True)
+        app_layout = QVBoxLayout(app_card)
+        app_layout.setContentsMargins(18, 16, 18, 16)
+        app_layout.setSpacing(10)
+        app_title = QLabel("상품 메모리 및 업데이트")
+        app_title.setObjectName("SectionTitle")
+        app_layout.addWidget(app_title)
         product_memory_row = QHBoxLayout()
         product_memory_help = QLabel("저장된 상품은 다음 실행에서 WMS 무게 조회를 생략합니다.")
-        product_memory_help.setStyleSheet("color: #A1A1AA;")
+        product_memory_help.setObjectName("HelpText")
         self.product_memory_button = QPushButton("저장된 상품 분류 목록")
         self.product_memory_button.clicked.connect(self._show_product_memory)
         product_memory_row.addWidget(product_memory_help, 1)
         product_memory_row.addWidget(self.product_memory_button)
-        layout.addLayout(product_memory_row)
+        app_layout.addLayout(product_memory_row)
 
         self.beta_checkbox = QCheckBox("Beta(테스트 릴리즈) 업데이트 받기")
         self.beta_checkbox.setChecked(self.settings.value("use_prerelease", False, type=bool))
         self.beta_checkbox.setToolTip("끄면 최신 정식 릴리즈로 복구할 수 있습니다.")
-        layout.addWidget(self.beta_checkbox)
+        app_layout.addWidget(self.beta_checkbox)
 
         version = QLabel(f"현재 버전: v{CURRENT_VERSION}")
-        version.setStyleSheet("color: #A1A1AA;")
-        layout.addWidget(version)
+        version.setObjectName("MutedText")
+        app_layout.addWidget(version)
+        content_layout.addWidget(app_card)
+        content_layout.addStretch(1)
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, 1)
 
         buttons = QHBoxLayout()
         update = QPushButton("업데이트 확인")
         self.update_history_button = QPushButton("업데이트 내역")
         close = QPushButton("저장하고 닫기")
+        close.setObjectName("PrimaryButton")
         update.clicked.connect(self._request_update)
         self.update_history_button.clicked.connect(self.history_requested.emit)
         close.clicked.connect(self.accept)
@@ -541,6 +597,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, smoke_test: bool = False):
         super().__init__()
+        self.setObjectName("MainWindow")
         self.smoke_test = smoke_test
         self.settings = QSettings("Mrbinggrae", "UnHelper")
         self.milkrun_worker: MilkrunWorker | None = None
@@ -566,8 +623,8 @@ class MainWindow(QMainWindow):
         self._closing_after_workers = False
 
         self.setWindowTitle(f"UnHelper v{CURRENT_VERSION}")
-        self.resize(1345, 760)
-        self.setMinimumSize(980, 620)
+        self.resize(1400, 820)
+        self.setMinimumSize(1024, 650)
         self._build_ui()
         if not smoke_test:
             QTimer.singleShot(1200, self.check_for_update)
@@ -583,8 +640,15 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("Header")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(28, 14, 28, 14)
+        header_layout.setContentsMargins(28, 15, 28, 15)
+        header_layout.setSpacing(14)
+        brand_mark = QLabel("UH")
+        brand_mark.setObjectName("BrandMark")
+        brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand_mark.setFixedSize(46, 46)
+        header_layout.addWidget(brand_mark)
         title_col = QVBoxLayout()
+        title_col.setSpacing(1)
         title = QLabel("UnHelper")
         title.setObjectName("Title")
         version = QLabel(f"v{CURRENT_VERSION} · Shipments/WMS 자동화 도우미")
@@ -593,9 +657,9 @@ class MainWindow(QMainWindow):
         title_col.addWidget(version)
         header_layout.addLayout(title_col)
         header_layout.addStretch(1)
-        self.settings_button = QPushButton("⚙")
+        self.settings_button = QPushButton("설정")
         self.settings_button.setObjectName("SettingsButton")
-        self.settings_button.setFixedSize(70, 70)
+        self.settings_button.setFixedSize(82, 40)
         self.settings_button.setToolTip("설정")
         self.settings_button.clicked.connect(self.show_settings)
         header_layout.addWidget(self.settings_button)
@@ -603,38 +667,48 @@ class MainWindow(QMainWindow):
 
         self.main_tabs = QTabWidget()
         self.main_tabs.setObjectName("MainTabs")
+        self.main_tabs.tabBar().setObjectName("MainTabBar")
         self.main_tabs.addTab(self._build_arrival_tabs(), "입차순번")
         self.main_tabs.addTab(self._build_raw_tabs(), "RAW")
         self.main_tabs.setCurrentIndex(1)
         layout.addWidget(self.main_tabs, 1)
 
-        footer = QWidget()
+        footer = QFrame()
+        footer.setObjectName("Footer")
         footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(28, 4, 28, 14)
-        footer_layout.setSpacing(6)
+        footer_layout.setContentsMargins(28, 10, 28, 16)
+        footer_layout.setSpacing(8)
         status_row = QHBoxLayout()
+        status_dot = QLabel("●")
+        status_dot.setObjectName("StatusDot")
         self.status_label = QLabel("대기 중")
         self.status_label.setObjectName("Status")
         self.open_folder_button = QPushButton("다운로드 폴더 열기")
         self.open_folder_button.clicked.connect(self.open_download_folder)
+        status_row.addWidget(status_dot)
         status_row.addWidget(self.status_label, 1)
         status_row.addWidget(self.open_folder_button)
         footer_layout.addLayout(status_row)
         self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("LogView")
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumHeight(105)
+        self.log_view.setMaximumHeight(112)
         self.log_view.setPlaceholderText("진행 로그")
         footer_layout.addWidget(self.log_view)
         layout.addWidget(footer)
 
     def _build_arrival_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
+        tabs.setObjectName("ArrivalTabs")
+        tabs.tabBar().setObjectName("SubTabBar")
         tabs.addTab(self._placeholder("입차순번 트럭 기능은 다음 단계에서 연결됩니다."), "트럭")
         tabs.addTab(self._placeholder("입차순번 Milkrun 기능은 다음 단계에서 연결됩니다."), "Milkrun")
         return tabs
 
     def _build_raw_tabs(self) -> QTabWidget:
         self.raw_tabs = QTabWidget()
+        self.raw_tabs.setObjectName("RawTabs")
+        self.raw_tabs.tabBar().setObjectName("SubTabBar")
         self.raw_tabs.addTab(self._placeholder("RAW 트럭 기능은 다음 단계에서 연결됩니다."), "트럭")
         self.raw_tabs.addTab(self._build_raw_milkrun(), "Milkrun")
         self.raw_tabs.setCurrentIndex(1)
@@ -642,13 +716,33 @@ class MainWindow(QMainWindow):
 
     def _build_raw_milkrun(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("Page")
         outer = QVBoxLayout(page)
-        outer.setContentsMargins(36, 14, 28, 4)
-        outer.setSpacing(10)
+        outer.setContentsMargins(28, 12, 28, 14)
+        outer.setSpacing(12)
 
-        content = QHBoxLayout()
-        content.setSpacing(18)
+        section_row = QHBoxLayout()
+        section_copy = QVBoxLayout()
+        section_copy.setSpacing(1)
+        section_title = QLabel("Milkrun 데이터")
+        section_title.setObjectName("SectionTitle")
+        section_description = QLabel(
+            "Shipments 예약 정보와 WMS 상품 무게를 오늘 입고 기준으로 정리합니다."
+        )
+        section_description.setObjectName("SectionDescription")
+        section_copy.addWidget(section_title)
+        section_copy.addWidget(section_description)
+        section_row.addLayout(section_copy)
+        section_row.addStretch(1)
+        outer.addLayout(section_row)
+
+        data_card = QFrame()
+        data_card.setObjectName("DataCard")
+        data_layout = QVBoxLayout(data_card)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.setSpacing(0)
         self.raw_table = QTableWidget(0, 10)
+        self.raw_table.setObjectName("RawTable")
         self.raw_table.setHorizontalHeaderLabels(
             [
                 "거래처 이름",
@@ -676,15 +770,17 @@ class MainWindow(QMainWindow):
         self.raw_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
         self.raw_table.verticalHeader().setVisible(False)
+        self.raw_table.verticalHeader().setDefaultSectionSize(42)
+        self.raw_table.horizontalHeader().setMinimumHeight(42)
         self.raw_table.setAlternatingRowColors(True)
-        content.addWidget(self.raw_table, 1)
-        outer.addLayout(content, 1)
+        data_layout.addWidget(self.raw_table, 1)
+        outer.addWidget(data_card, 1)
 
         actions = QHBoxLayout()
         actions.addStretch(1)
         self.get_data_button = QPushButton("데이터 얻기")
         self.get_data_button.setObjectName("PrimaryButton")
-        self.get_data_button.setMinimumWidth(280)
+        self.get_data_button.setMinimumWidth(210)
         self.get_data_button.clicked.connect(self.start_milkrun_download)
         self.stop_button = QPushButton("작업 중지")
         self.stop_button.setObjectName("StopButton")
@@ -699,10 +795,11 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _placeholder(message: str) -> QWidget:
         page = QWidget()
+        page.setObjectName("Page")
         layout = QVBoxLayout(page)
         label = QLabel(message)
+        label.setObjectName("PlaceholderText")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet("color: #71717A; font-size: 13pt;")
         layout.addWidget(label)
         return page
 
@@ -821,7 +918,7 @@ class MainWindow(QMainWindow):
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if column_index == 6:
+                if column_index in (0, 6):
                     item.setToolTip(str(value))
                 self.raw_table.setItem(row_index, column_index, item)
             category_button = QPushButton("?")
@@ -1467,21 +1564,30 @@ class MainWindow(QMainWindow):
             return
         self.current_update_info = info
         dialog = UpdateDialog(self)
+        dialog.setObjectName("UpdateDialog")
         dialog.setWindowTitle("정식 릴리즈 복구" if getattr(info, "is_release_restore", False) else "업데이트")
-        dialog.setMinimumWidth(480)
+        dialog.setMinimumWidth(520)
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
         action = "정식 릴리즈로 복구" if getattr(info, "is_release_restore", False) else "새 업데이트"
         title = QLabel(f"{action}: v{info.version}")
-        title.setStyleSheet("font-size: 16pt; font-weight: 800;")
+        title.setObjectName("DialogTitle")
         layout.addWidget(title)
+        description = QLabel("변경 내용을 확인한 뒤 원하는 시점에 업데이트를 적용할 수 있습니다.")
+        description.setObjectName("HelpText")
+        layout.addWidget(description)
         changelog = QPlainTextEdit()
+        changelog.setObjectName("DocumentView")
         changelog.setReadOnly(True)
         changelog.setPlainText(info.changelog or "변경사항 없음")
         changelog.setMaximumHeight(180)
         layout.addWidget(changelog)
         mode = "델타" if getattr(info, "patch_mode", "full") == "delta" else "전체"
         size = AutoUpdater.format_size(info.patch_size) if info.patch_size else "알 수 없음"
-        layout.addWidget(QLabel(f"패치: {mode} · {size}"))
+        patch_info = QLabel(f"패치: {mode} · {size}")
+        patch_info.setObjectName("MutedText")
+        layout.addWidget(patch_info)
         self.update_progress = QProgressBar()
         self.update_progress.setVisible(False)
         layout.addWidget(self.update_progress)
@@ -1491,6 +1597,7 @@ class MainWindow(QMainWindow):
         later = QPushButton("나중에")
         self.update_later_button = later
         self.apply_update_button = QPushButton("지금 적용")
+        self.apply_update_button.setObjectName("PrimaryButton")
         later.clicked.connect(dialog.reject)
         self.apply_update_button.clicked.connect(lambda: self._download_update(info))
         buttons.addStretch(1)

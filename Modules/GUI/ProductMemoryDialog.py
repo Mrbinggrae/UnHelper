@@ -47,19 +47,22 @@ class ProductMemoryDialog(QDialog):
         super().__init__(parent)
         self.memory = memory
         self.setWindowTitle("저장된 상품 분류")
+        self.setObjectName("ProductMemoryDialog")
         self.resize(1040, 560)
         self.setMinimumSize(820, 440)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
 
         title_row = QHBoxLayout()
         title = QLabel("저장된 상품 무게와 분류")
-        title.setStyleSheet("font-size: 17pt; font-weight: 800;")
+        title.setObjectName("DialogTitle")
         title_row.addWidget(title)
         title_row.addStretch(1)
-        title_row.addWidget(QLabel("분류"))
+        filter_label = QLabel("분류")
+        filter_label.setObjectName("FieldLabel")
+        title_row.addWidget(filter_label)
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(self.FILTERS)
         self.filter_combo.currentTextChanged.connect(self.refresh)
@@ -71,10 +74,11 @@ class ProductMemoryDialog(QDialog):
             "수동 분류는 메인 표의 분류 버튼으로 변경할 수 있습니다."
         )
         help_label.setWordWrap(True)
-        help_label.setStyleSheet("color: #A1A1AA;")
+        help_label.setObjectName("HelpText")
         layout.addWidget(help_label)
 
         self.table = QTableWidget(0, 7)
+        self.table.setObjectName("StoredProductTable")
         self.table.setHorizontalHeaderLabels(
             ["SKU ID", "상품명", "무게(g)", "분류", "적용 방식", "1팔렛트 중량(kg)", "측정 시각"]
         )
@@ -84,7 +88,9 @@ class ProductMemoryDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(40)
         header = self.table.horizontalHeader()
+        header.setMinimumHeight(42)
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.table, 1)
@@ -93,6 +99,7 @@ class ProductMemoryDialog(QDialog):
         self.import_button = QPushButton("가져오기")
         self.export_button = QPushButton("내보내기")
         self.delete_button = QPushButton("선택 삭제")
+        self.delete_button.setObjectName("DangerButton")
         close_button = QPushButton("닫기")
         self.import_button.clicked.connect(self._import_records)
         self.export_button.clicked.connect(self._export_records)

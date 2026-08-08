@@ -101,6 +101,8 @@ class ProductWeightCrawler:
     SKU_SEARCH_BUTTON_LOCATOR: Locator = (By.CSS_SELECTOR, "button.btn-search")
     RESULT_ROWS_LOCATOR: Locator = (By.CSS_SELECTOR, "#wms__container table tbody tr")
     HIDDEN_WEIGHT_LOCATOR: Locator = (By.CSS_SELECTOR, "input.hidden-weight")
+    RESULT_SKU_COLUMN_INDEX = 0
+    RESULT_PRODUCT_NAME_COLUMN_INDEX = 10
     NO_RESULT_TEXT = "조회 결과가 없습니다"
 
     def __init__(
@@ -478,18 +480,24 @@ class ProductWeightCrawler:
     def _parse_result_row(cls, row: WebElement, sku_id: str) -> _SearchResult | None:
         try:
             columns = row.find_elements(By.TAG_NAME, "td")
-            if len(columns) < 11:
+            if len(columns) <= cls.RESULT_PRODUCT_NAME_COLUMN_INDEX:
                 return None
-            row_sku = cls.normalize_sku(columns[0].text)
+            row_sku = cls.normalize_sku(columns[cls.RESULT_SKU_COLUMN_INDEX].text)
             if row_sku != sku_id:
                 return None
-            links = columns[10].find_elements(By.TAG_NAME, "a")
+            product_column = columns[cls.RESULT_PRODUCT_NAME_COLUMN_INDEX]
+            links = product_column.find_elements(By.TAG_NAME, "a")
             if not links:
                 return None
             link = links[0]
+            product_name = cls.normalize_product_name(link.text)
+            if not product_name:
+                product_name = cls.normalize_product_name(product_column.text)
+            if not product_name:
+                return None
             return _SearchResult(
                 sku_id=row_sku,
-                product_name=cls.normalize_product_name(columns[10].text),
+                product_name=product_name,
                 link=link,
                 href=str(link.get_attribute("href") or ""),
             )
