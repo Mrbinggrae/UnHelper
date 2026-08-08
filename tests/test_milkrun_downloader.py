@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from datetime import date, datetime
+from pathlib import Path
+from unittest import mock
 
-from Modules.Shipments.MilkrunDownloader import HistoryEntry, MilkrunDownloader
+from Modules.Shipments.MilkrunDownloader import (
+    HistoryEntry,
+    MilkrunDownloadRequest,
+    MilkrunDownloader,
+)
 
 
 class MilkrunDownloaderTests(unittest.TestCase):
@@ -77,6 +84,150 @@ class MilkrunDownloaderTests(unittest.TestCase):
             {"https://shipments.coupang.net/ibs/csv-donwload?uuid=old"},
         )
         self.assertEqual(selected.download_href, "https://shipments.coupang.net/ibs/csv-donwload?uuid=new")
+
+    def test_wait_for_download_rejects_unrelated_file_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            unrelated = root / "unrelated.log"
+            unrelated.write_text("not a download", encoding="utf-8")
+            downloader = MilkrunDownloader(root / "chromedriver.exe", log=lambda _message: None)
+            downloader.DOWNLOAD_TIMEOUT_SECONDS = 3
+
+            with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
+                downloader._wait_for_download(root, {})
+
+    def test_wait_for_download_accepts_stable_supported_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            expected = root / "milkrun.csv"
+            expected.write_text("name,value\nitem,1\n", encoding="utf-8")
+            downloader = MilkrunDownloader(root / "chromedriver.exe", log=lambda _message: None)
+            downloader.DOWNLOAD_TIMEOUT_SECONDS = 3
+
+            selected = downloader._wait_for_download(root, {})
+
+            self.assertEqual(selected, expected)
+
+    def test_wait_for_download_ignores_file_disappearing_between_listing_and_stat(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            expected = root / "milkrun.csv"
+            expected.write_text("name,value\nitem,1\n", encoding="utf-8")
+            downloader = MilkrunDownloader(root / "chromedriver.exe", log=lambda _message: None)
+            downloader.DOWNLOAD_TIMEOUT_SECONDS = 3
+            original_stat = Path.stat
+            expected_stat_calls = 0
+
+            def flaky_stat(path, *args, **kwargs):
+                nonlocal expected_stat_calls
+                if path == expected:
+                    expected_stat_calls += 1
+                    if expected_stat_calls == 2:
+                        raise FileNotFoundError(str(path))
+                return original_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", new=flaky_stat):
+                selected = downloader._wait_for_download(root, {})
+
+            self.assertEqual(selected, expected)
+
+    def test_move_staged_download_avoids_overwriting_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            download_dir = Path(temp)
+            staging = download_dir / f"{MilkrunDownloader.STAGING_PREFIX}test"
+            staging.mkdir()
+            source = staging / "milkrun.csv"
+            source.write_text("new", encoding="utf-8")
+            existing = download_dir / "milkrun.csv"
+            existing.write_text("old", encoding="utf-8")
+
+            moved = MilkrunDownloader._move_staged_download(source, download_dir)
+
+            self.assertNotEqual(moved, existing)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+            self.assertEqual(moved.read_text(encoding="utf-8"), "new")
+
+    def test_move_staged_download_retries_atomic_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            download_dir = Path(temp)
+            staging = download_dir / f"{MilkrunDownloader.STAGING_PREFIX}test"
+            staging.mkdir()
+            source = staging / "milkrun.csv"
+            source.write_text("new", encoding="utf-8")
+            original_rename = MilkrunDownloader._rename_no_replace
+            calls = 0
+
+            def collide_once(source_path: Path, destination: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    destination.write_text("racer", encoding="utf-8")
+                    raise FileExistsError(str(destination))
+                original_rename(source_path, destination)
+
+            with mock.patch.object(
+                MilkrunDownloader,
+                "_rename_no_replace",
+                side_effect=collide_once,
+            ):
+                moved = MilkrunDownloader._move_staged_download(source, download_dir)
+
+            self.assertGreaterEqual(calls, 2)
+            self.assertEqual((download_dir / "milkrun.csv").read_text(encoding="utf-8"), "racer")
+            self.assertNotEqual(moved, download_dir / "milkrun.csv")
+            self.assertEqual(moved.read_text(encoding="utf-8"), "new")
+
+    def test_success_can_keep_authenticated_browser_open_for_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            downloader = MilkrunDownloader(root / "chromedriver.exe", log=lambda _message: None)
+            fake_driver = object()
+
+            def create_staged_file(staging_dir: Path, _before) -> Path:
+                staged = staging_dir / "milkrun.csv"
+                staged.write_text("a,b\n1,2\n", encoding="utf-8")
+                return staged
+
+            no_op_methods = (
+                "_open_and_wait_for_login",
+                "_open_milkrun_list",
+                "_set_date_range",
+                "_select_center",
+                "_click_button_text",
+                "_wait_for_query_complete",
+                "_wait_for_text_download_button",
+                "_click_text_download",
+                "_submit_download_reason",
+                "_close_request_confirmation",
+                "_open_download_history",
+                "_download_latest_history_file",
+            )
+            patches = [mock.patch.object(downloader, name) for name in no_op_methods]
+            for patcher in patches:
+                patcher.start()
+            try:
+                with (
+                    mock.patch.object(downloader, "_build_driver", return_value=fake_driver),
+                    mock.patch.object(downloader, "_result_table_signature", return_value=""),
+                    mock.patch.object(downloader, "_snapshot_history_download_hrefs", return_value=set()),
+                    mock.patch.object(downloader, "_download_snapshot", return_value={}),
+                    mock.patch.object(downloader, "_wait_for_download", side_effect=create_staged_file),
+                    mock.patch.object(downloader, "close") as close,
+                ):
+                    result = downloader.run(
+                        MilkrunDownloadRequest(download_dir=root, today=date(2026, 8, 8)),
+                        keep_browser_open=True,
+                    )
+
+                self.assertEqual(result.file_path, root / "milkrun.csv")
+                self.assertIs(downloader.driver, fake_driver)
+                close.assert_not_called()
+                self.assertFalse(
+                    any(path.name.startswith(downloader.STAGING_PREFIX) for path in root.iterdir())
+                )
+            finally:
+                for patcher in reversed(patches):
+                    patcher.stop()
 
 
 if __name__ == "__main__":

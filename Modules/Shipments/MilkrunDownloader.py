@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
+import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -72,6 +75,8 @@ class MilkrunDownloader:
     LOGIN_LOG_INTERVAL_SECONDS = 30
     HISTORY_READY_TIMEOUT_SECONDS = 15 * 60
     DOWNLOAD_TIMEOUT_SECONDS = 5 * 60
+    DOWNLOAD_EXTENSIONS = frozenset({".csv", ".txt", ".tsv", ".xlsx", ".xlsm", ".xlsb", ".xls"})
+    STAGING_PREFIX = ".unhelper-download-"
 
     def __init__(
         self,
@@ -86,16 +91,24 @@ class MilkrunDownloader:
         self.headless = headless
         self.driver: webdriver.Chrome | None = None
 
-    def run(self, request: MilkrunDownloadRequest) -> MilkrunDownloadResult:
+    def run(
+        self,
+        request: MilkrunDownloadRequest,
+        *,
+        keep_browser_open: bool = False,
+    ) -> MilkrunDownloadResult:
         end_date = request.today or date.today()
         start_date = end_date - timedelta(days=1)
         reason = self.format_reason(start_date, end_date)
         download_dir = Path(request.download_dir).expanduser().resolve()
         download_dir.mkdir(parents=True, exist_ok=True)
-        before_downloads = self._download_snapshot(download_dir)
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=self.STAGING_PREFIX, dir=str(download_dir))
+        ).resolve()
+        succeeded = False
 
-        self.driver = self._build_driver(download_dir)
         try:
+            self.driver = self._build_driver(staging_dir)
             self._open_and_wait_for_login()
             self._open_milkrun_list()
             self._set_date_range(start_date, end_date)
@@ -112,22 +125,28 @@ class MilkrunDownloader:
             self._submit_download_reason(reason)
             self._close_request_confirmation()
             self._open_download_history()
+            before_downloads = self._download_snapshot(staging_dir)
             self._download_latest_history_file(reason, request_started_at, known_history_hrefs)
-            file_path = self._wait_for_download(download_dir, before_downloads)
+            staged_file = self._wait_for_download(staging_dir, before_downloads)
+            file_path = self._move_staged_download(staged_file, download_dir)
             self.log(f"다운로드 완료: {file_path}")
-            return MilkrunDownloadResult(
+            result = MilkrunDownloadResult(
                 file_path=file_path,
                 start_date=start_date,
                 end_date=end_date,
                 reason=reason,
             )
+            succeeded = True
+            return result
         except AutomationCancelled:
             raise
         except Exception as exc:
             self._save_failure_snapshot(download_dir, exc)
             raise
         finally:
-            self.close()
+            if not keep_browser_open or not succeeded:
+                self.close()
+            self._cleanup_staging_dir(staging_dir, download_dir)
 
     def close(self) -> None:
         driver, self.driver = self.driver, None
@@ -139,6 +158,10 @@ class MilkrunDownloader:
 
     def cancel(self) -> None:
         self.stop_event.set()
+
+    def save_failure_snapshot(self, output_dir: str | Path, exc: Exception) -> None:
+        """Persist browser evidence for failures in a follow-up authenticated step."""
+        self._save_failure_snapshot(Path(output_dir).expanduser(), exc)
 
     @staticmethod
     def format_reason(start_date: date, end_date: date) -> str:
@@ -699,39 +722,129 @@ class MilkrunDownloader:
     def _wait_for_download(self, download_dir: Path, before: dict[Path, tuple[int, int]]) -> Path:
         self.log("Chrome 파일 다운로드 완료를 기다립니다.")
         deadline = time.monotonic() + self.DOWNLOAD_TIMEOUT_SECONDS
-        stable: dict[Path, tuple[int, int]] = {}
+        stable: dict[Path, tuple[tuple[int, int], int]] = {}
         while time.monotonic() < deadline:
             self._check_cancelled()
             active_partials = []
             for partial in download_dir.glob("*.crdownload"):
-                stat = partial.stat()
+                try:
+                    stat = partial.stat()
+                except FileNotFoundError:
+                    # Chrome atomically renames .crdownload files at the end
+                    # of a download. The name may disappear between glob()
+                    # and stat(), which is a normal completion race.
+                    continue
                 signature = (stat.st_size, stat.st_mtime_ns)
                 if partial not in before or before[partial] != signature:
                     active_partials.append(partial)
             candidates = []
+            unsupported = []
             for path in download_dir.iterdir():
                 if not path.is_file() or path.suffix.lower() == ".crdownload":
                     continue
-                stat = path.stat()
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    # A final name can also be replaced/renamed while the
+                    # directory enumeration is in progress. Retry next poll.
+                    continue
                 signature = (stat.st_size, stat.st_mtime_ns)
                 if path not in before or before[path] != signature:
-                    candidates.append((stat.st_mtime_ns, path, signature))
+                    collection = candidates if path.suffix.lower() in self.DOWNLOAD_EXTENSIONS else unsupported
+                    collection.append((stat.st_mtime_ns, path, signature))
 
             for _mtime, path, signature in sorted(candidates, reverse=True):
-                previous_size, count = stable.get(path, (-1, 0))
-                count = count + 1 if previous_size == signature[0] else 1
-                stable[path] = (signature[0], count)
+                previous_signature, count = stable.get(path, ((-1, -1), 0))
+                count = count + 1 if previous_signature == signature else 1
+                stable[path] = (signature, count)
                 if signature[0] > 0 and count >= 3 and not active_partials:
                     return path
+            for _mtime, path, signature in sorted(unsupported, reverse=True):
+                previous_signature, count = stable.get(path, ((-1, -1), 0))
+                count = count + 1 if previous_signature == signature else 1
+                stable[path] = (signature, count)
+                if signature[0] > 0 and count >= 3 and not active_partials and not candidates:
+                    raise RuntimeError(
+                        f"다운로드된 파일 형식을 지원하지 않습니다: {path.name}"
+                    )
             self.stop_event.wait(0.5)
         raise TimeoutException("5분 안에 Chrome 파일 다운로드가 완료되지 않았습니다.")
+
+    @classmethod
+    def _move_staged_download(cls, source: Path, download_dir: Path) -> Path:
+        source = source.resolve()
+        download_dir = download_dir.resolve()
+        if (
+            source.parent.parent != download_dir
+            or not source.parent.name.startswith(cls.STAGING_PREFIX)
+        ):
+            raise RuntimeError("다운로드 임시 파일 경로가 올바르지 않습니다.")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        for sequence in range(1000):
+            if sequence == 0:
+                destination = download_dir / source.name
+            else:
+                suffix = f"_{stamp}" if sequence == 1 else f"_{stamp}_{sequence}"
+                destination = download_dir / f"{source.stem}{suffix}{source.suffix}"
+            try:
+                cls._rename_no_replace(source, destination)
+                return destination
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EEXIST or getattr(exc, "winerror", None) in {80, 183}:
+                    continue
+                raise RuntimeError(f"다운로드 파일을 최종 폴더로 이동하지 못했습니다.\n{exc}") from exc
+        raise RuntimeError("다운로드 파일의 중복 이름을 만들 수 없습니다.")
+
+    @staticmethod
+    def _rename_no_replace(source: Path, destination: Path) -> None:
+        """Publish a staged file atomically without replacing an existing file."""
+        if os.name == "nt":
+            # Windows MoveFile semantics used by os.rename do not replace an
+            # existing destination, so a collision is safely retryable.
+            source.rename(destination)
+            return
+
+        # Keep tests and non-Windows development no-clobber as well. The
+        # staging directory is a child of download_dir, so this is one volume.
+        os.link(source, destination)
+        try:
+            source.unlink()
+        except Exception:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def _cleanup_staging_dir(cls, staging_dir: Path, download_dir: Path) -> None:
+        try:
+            resolved_staging = staging_dir.resolve()
+            resolved_download = download_dir.resolve()
+            if (
+                resolved_staging.parent != resolved_download
+                or not resolved_staging.name.startswith(cls.STAGING_PREFIX)
+            ):
+                return
+            for child in resolved_staging.iterdir():
+                if child.is_file() or child.is_symlink():
+                    child.unlink(missing_ok=True)
+            resolved_staging.rmdir()
+        except OSError:
+            pass
 
     @staticmethod
     def _download_snapshot(download_dir: Path) -> dict[Path, tuple[int, int]]:
         snapshot: dict[Path, tuple[int, int]] = {}
         for path in download_dir.iterdir():
             if path.is_file():
-                stat = path.stat()
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
                 snapshot[path] = (stat.st_size, stat.st_mtime_ns)
         return snapshot
 

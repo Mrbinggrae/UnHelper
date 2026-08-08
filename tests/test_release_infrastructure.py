@@ -248,6 +248,20 @@ class UpdaterSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "네트워크 오류"):
             updater.check_for_update()
 
+    def test_release_restore_network_failure_preserves_error(self) -> None:
+        updater = AutoUpdater("UnHelper")
+        updater._fetch_json = mock.Mock(side_effect=error.URLError("offline"))  # type: ignore[method-assign]
+        with (
+            mock.patch.object(sys, "frozen", True, create=True),
+            self.assertRaisesRegex(RuntimeError, "네트워크 오류"),
+        ):
+            updater.check_for_release_restore()
+
+    def test_update_apply_failure_is_not_silently_reduced_to_false(self) -> None:
+        updater = AutoUpdater("UnHelper")
+        with self.assertRaisesRegex(RuntimeError, "적용 준비에 실패"):
+            updater.apply_update(Path("missing.zip"), "0.1.1", {})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -174,10 +174,12 @@ class AutoUpdater:
             return True, info, ""
         except error.URLError as exc:
             logger.warning("Release restore check failed (network): %s", exc)
-            return False, None, f"네트워크 오류로 정식 릴리즈를 확인하지 못했습니다: {exc}"
+            raise RuntimeError(
+                f"네트워크 오류로 정식 릴리즈를 확인하지 못했습니다: {exc}"
+            ) from exc
         except Exception as exc:
             logger.warning("Release restore check failed: %s", exc)
-            return False, None, f"정식 릴리즈 확인 중 오류가 발생했습니다: {exc}"
+            raise RuntimeError(f"정식 릴리즈 확인 중 오류가 발생했습니다: {exc}") from exc
 
     def download_patch(
         self,
@@ -301,7 +303,7 @@ class AutoUpdater:
             return True
         except Exception as exc:
             logger.warning("Update apply failed: %s", exc)
-            return False
+            raise RuntimeError(f"업데이트 적용 준비에 실패했습니다: {exc}") from exc
 
     def _release_candidates(
         self,
