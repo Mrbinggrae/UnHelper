@@ -42,6 +42,7 @@ class TruckReservationMetrics:
     unit_count: Decimal
     pallet_count: Decimal
     source_rows: tuple[int, ...]
+    vendor_name: str = ""
 
     @property
     def units_per_pallet(self) -> Decimal | None:
@@ -72,6 +73,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
     MAX_COLUMNS = 19
 
     RESERVATION_COLUMN = 1
+    VENDOR_COLUMN = 5
     UNIT_COUNT_COLUMN = 13
     PALLET_COUNT_COLUMN = 14
     MIN_REQUIRED_COLUMNS = PALLET_COUNT_COLUMN
@@ -140,6 +142,8 @@ class TruckExcelImporter(MilkrunExcelImporter):
         source_rows_by_reservation: dict[str, list[int]] = {}
         metric_values: dict[str, tuple[Decimal, Decimal]] = {}
         metric_source_row: dict[str, int] = {}
+        vendor_by_reservation: dict[str, str] = {}
+        vendor_source_row: dict[str, int] = {}
         current_reservation = ""
 
         for row_number, row in enumerate(values[1:], start=2):
@@ -163,6 +167,22 @@ class TruckExcelImporter(MilkrunExcelImporter):
                 )
 
             source_rows_by_reservation[current_reservation].append(row_number)
+            vendor_name = self._normalize_vendor_name(row[self.VENDOR_COLUMN - 1])
+            if vendor_name:
+                previous_vendor = vendor_by_reservation.get(current_reservation)
+                if previous_vendor is not None and previous_vendor != vendor_name:
+                    previous_row = vendor_source_row[current_reservation]
+                    raise ExcelImportError(
+                        f"트럭 예약번호 {current_reservation}의 E열 거래처 이름이 서로 "
+                        "충돌합니다. 마지막 값을 선택하지 않았으며 기존 값도 지우지 "
+                        "않았습니다.\n"
+                        f"{previous_row}행: {previous_vendor} · "
+                        f"{row_number}행: {vendor_name}"
+                    )
+                if previous_vendor is None:
+                    vendor_by_reservation[current_reservation] = vendor_name
+                    vendor_source_row[current_reservation] = row_number
+
             raw_units = row[self.UNIT_COUNT_COLUMN - 1]
             raw_pallets = row[self.PALLET_COUNT_COLUMN - 1]
             has_units = self._has_import_value(raw_units)
@@ -214,6 +234,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
                     unit_count=pair[0],
                     pallet_count=pair[1],
                     source_rows=tuple(source_rows_by_reservation[reservation_number]),
+                    vendor_name=vendor_by_reservation.get(reservation_number, ""),
                 )
             )
 
@@ -264,6 +285,10 @@ class TruckExcelImporter(MilkrunExcelImporter):
     @staticmethod
     def _normalize_header(value: Any) -> str:
         return re.sub(r"\s+", "", str(value or "").lstrip("\ufeff").strip())
+
+    @staticmethod
+    def _normalize_vendor_name(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()
 
     @staticmethod
     def _has_import_value(value: Any) -> bool:

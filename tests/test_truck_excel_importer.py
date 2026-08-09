@@ -141,6 +141,7 @@ class TruckExcelImporterTests(unittest.TestCase):
         headers = [f"열{index}" for index in range(1, max(count, 19) + 1)]
         headers[0] = "예약번호"
         headers[2] = "주문타입"
+        headers[4] = "거래처 이름"
         headers[12] = "유닛 수"
         headers[13] = "팔렛트 수"
         return headers[:count]
@@ -152,12 +153,15 @@ class TruckExcelImporterTests(unittest.TestCase):
         pallets: object = "",
         *,
         first_value: object = "상품",
+        vendor: object = "Test Vendor",
         count: int = 19,
     ) -> list[object]:
         row: list[object] = [""] * count
         row[0] = reservation
         if count >= 3:
             row[2] = first_value
+        if count >= 5:
+            row[4] = vendor
         if count >= 13:
             row[12] = units
         if count >= 14:
@@ -225,8 +229,57 @@ class TruckExcelImporterTests(unittest.TestCase):
             self.assertEqual((first.unit_count, first.pallet_count), (Decimal("100"), Decimal("2")))
             self.assertEqual(first.units_per_pallet, Decimal("50"))
             self.assertEqual(first.source_rows, (2, 3, 4))
+            self.assertEqual(first.vendor_name, "Test Vendor")
             second = result.metrics_by_reservation["T3370493"]
             self.assertEqual(second.units_per_pallet, Decimal("15"))
+
+    def test_extracts_vendor_from_e_column_with_blank_continuation_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            self._write_csv(
+                source,
+                (
+                    self._headers(),
+                    self._row("3370492", "", "", vendor="  거래처   A  "),
+                    self._row("", "100", "2", vendor=""),
+                    self._row("3370493", "45", "3", vendor="거래처 B"),
+                ),
+            )
+            sheet = _TruckSheet()
+            importer, _workbook = self._importer(target, sheet)
+
+            result = importer.import_values(source, target)
+
+            self.assertEqual(
+                result.metrics_by_reservation["T3370492"].vendor_name,
+                "거래처 A",
+            )
+            self.assertEqual(
+                result.metrics_by_reservation["T3370493"].vendor_name,
+                "거래처 B",
+            )
+
+    def test_conflicting_vendor_for_same_reservation_is_rejected_before_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            self._write_csv(
+                source,
+                (
+                    self._headers(),
+                    self._row("3370492", "100", "2", vendor="거래처 A"),
+                    self._row("T3370492", "100", "2", vendor="거래처 B"),
+                ),
+            )
+            sheet = _TruckSheet()
+            importer, workbook = self._importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "E열 거래처 이름이 서로 충돌"):
+                importer.import_values(source, target)
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(workbook.save_count, 0)
 
     def test_conflicting_duplicate_reservation_is_rejected_before_clear(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

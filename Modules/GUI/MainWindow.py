@@ -358,6 +358,7 @@ class MilkrunWorker(QThread):
             products.append(
                 replace(
                     product,
+                    vendor_name=metric.vendor_name or product.vendor_name,
                     box_count=unit_count,
                     pallet_count=pallet_count,
                 )

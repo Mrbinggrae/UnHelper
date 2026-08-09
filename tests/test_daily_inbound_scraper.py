@@ -471,6 +471,7 @@ class DailyInboundScraperTests(unittest.TestCase):
             unit_count=Decimal("2"),
             pallet_count=Decimal("1"),
             source_rows=(2,),
+            vendor_name="다운로드 거래처",
         )
         import_result = TruckExcelImportResult(
             source_file=Path("truck.csv"),
@@ -542,6 +543,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(completed[0].booking_type, "truck")
         product = completed[0].daily_inbound.products[0]
         self.assertEqual(product.dispatch_number, "T3372829")
+        self.assertEqual(product.vendor_name, "다운로드 거래처")
         self.assertEqual(product.box_count, Decimal("2"))
         self.assertEqual(product.pallet_count, Decimal("1"))
         self.assertNotIn("exclude_arrival_date", fake_importer.import_values.call_args.kwargs)
@@ -556,6 +558,7 @@ class DailyInboundScraperTests(unittest.TestCase):
             unit_count=Decimal("20"),
             pallet_count=Decimal("2"),
             source_rows=(2,),
+            vendor_name="다운로드 거래처",
         )
         import_result = TruckExcelImportResult(
             source_file=Path("truck.csv"),
@@ -599,6 +602,10 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(
             tuple(product.pallet_count for product in updated.products),
             (Decimal("1"), Decimal("1")),
+        )
+        self.assertEqual(
+            tuple(product.vendor_name for product in updated.products),
+            ("다운로드 거래처", "다운로드 거래처"),
         )
         self.assertEqual(logs, [])
 
