@@ -36,6 +36,7 @@ class ProductWeightSummary:
 
 class ProductWeightWorker(QThread):
     log_updated = Signal(str)
+    progress_updated = Signal(int, int)
     record_ready = Signal(object, bool)
     sku_failed = Signal(object)
     completed = Signal(object)
@@ -52,6 +53,8 @@ class ProductWeightWorker(QThread):
         *,
         evidence_dir: str | Path,
         quantity_label: str = "유닛",
+        force_refresh: bool = False,
+        force_refresh_sku_ids: Iterable[object] = (),
         crawler_factory: Callable[..., ProductWeightCrawler] = ProductWeightCrawler,
     ) -> None:
         super().__init__()
@@ -62,6 +65,10 @@ class ProductWeightWorker(QThread):
         self.wms_password = str(wms_password or "")
         self.evidence_dir = Path(evidence_dir)
         self.quantity_label = str(quantity_label or "유닛")
+        self.force_refresh = bool(force_refresh)
+        self.force_refresh_sku_ids = {
+            normalize_sku_id(sku_id) for sku_id in force_refresh_sku_ids
+        }
         self.crawler_factory = crawler_factory
         self.stop_event = threading.Event()
         self.crawler: ProductWeightCrawler | None = None
@@ -73,8 +80,18 @@ class ProductWeightWorker(QThread):
         try:
             unique_products, invalid_failures = self._unique_products(self.products)
             failures = list(invalid_failures)
+            progress_total = len(unique_products) + len(invalid_failures)
+            progress_completed = 0
+            self.progress_updated.emit(0, progress_total)
+
+            def advance_progress() -> None:
+                nonlocal progress_completed
+                progress_completed += 1
+                self.progress_updated.emit(progress_completed, progress_total)
+
             for failure in invalid_failures:
                 self.sku_failed.emit(failure)
+                advance_progress()
 
             memory = ProductMemory(self.memory_path)
             misses: list[MilkrunProductRow] = []
@@ -84,6 +101,9 @@ class ProductWeightWorker(QThread):
             for product in unique_products:
                 self._check_cancelled()
                 record = memory.get(product.sku_id)
+                if self.force_refresh or product.sku_id in self.force_refresh_sku_ids:
+                    misses.append(product)
+                    continue
                 if record is None or record.weight_grams is None:
                     if record is not None:
                         self.record_ready.emit(record, False)
@@ -121,6 +141,7 @@ class ProductWeightWorker(QThread):
                         f"현재 팔렛트당 {self.quantity_label} 수는 계산하지 못했습니다."
                     )
                 self.record_ready.emit(record, True)
+                advance_progress()
 
             if not misses:
                 self.completed.emit(
@@ -138,12 +159,24 @@ class ProductWeightWorker(QThread):
                     )
                     failures.append(failure)
                     self.sku_failed.emit(failure)
+                    advance_progress()
                 self.completed.emit(
                     ProductWeightSummary(len(unique_products), cache_hits, 0, tuple(failures))
                 )
                 return
 
-            self.log_updated.emit(f"저장되지 않은 SKU {len(misses)}개를 WMS에서 조회합니다.")
+            if self.force_refresh:
+                self.log_updated.emit(
+                    f"현재 표의 SKU {len(misses)}개를 WMS에서 처음부터 다시 측정합니다."
+                )
+            elif self.force_refresh_sku_ids:
+                self.log_updated.emit(
+                    f"체크포인트의 미완료 SKU {len(misses)}개를 WMS에서 이어서 측정합니다."
+                )
+            else:
+                self.log_updated.emit(
+                    f"저장되지 않은 SKU {len(misses)}개를 WMS에서 이어서 조회합니다."
+                )
             self.crawler = self.crawler_factory(
                 self.driver_path,
                 self.wms_id,
@@ -191,6 +224,7 @@ class ProductWeightWorker(QThread):
                     if not evidence_saved:
                         self.crawler.save_failure_evidence(self.evidence_dir, exc)
                         evidence_saved = True
+                advance_progress()
 
             self.completed.emit(
                 ProductWeightSummary(

@@ -79,6 +79,32 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window.raw_table.mapTo(page, QPoint(0, 0)).y(),
             )
             self.assertFalse(window.raw_table.wordWrap())
+            self.assertTrue(window.operation_progress.isHidden())
+        finally:
+            window.close()
+
+    def test_operation_progress_shows_completed_and_remaining_percent(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            window._on_detail_progress(1, 4)
+            self.assertFalse(window.operation_progress.isHidden())
+            self.assertEqual(window.operation_progress.value(), 25)
+            self.assertEqual(
+                window.operation_progress.format(),
+                "25% 완료 · 75% 남음",
+            )
+            self.assertEqual(window.status_label.text(), "상세 상품 조회 1/4 · 75% 남음")
+
+            window._on_weight_progress(2, 3)
+            self.assertEqual(window.operation_progress.value(), 66)
+            self.assertEqual(
+                window.operation_progress.format(),
+                "66% 완료 · 34% 남음",
+            )
+            self.assertEqual(window.status_label.text(), "상품 무게 확인 2/3 · 34% 남음")
+
+            window._set_automation_working(False)
+            self.assertTrue(window.operation_progress.isHidden())
         finally:
             window.close()
 
@@ -746,7 +772,51 @@ class MainWindowSmokeTests(unittest.TestCase):
                 saved = BookingSnapshotStore(snapshot_path).get(date(2026, 8, 7))
                 self.assertEqual(saved.milkrun_products, (product,))
                 self.assertEqual(window.raw_table.item(0, 1).text(), "M3370492")
-                start_weight.assert_called_once_with(window.current_products)
+                start_weight.assert_called_once_with(
+                    window.current_products,
+                    retry_mode="resume",
+                )
+            finally:
+                window.close()
+
+    def test_full_pipeline_restart_remeasures_all_skus_after_detail_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=root / "memory.json",
+                snapshot_file=root / "snapshots.json",
+            )
+            product = MilkrunProductRow(
+                "거래처", "10807763", "1", "2", "123", "상품", "M3370492"
+            )
+            result = mock.Mock(
+                booking_type="milkrun",
+                base_date=date(2026, 8, 9),
+                excel=mock.Mock(
+                    source_file=Path("download.csv"),
+                    target_workbook=Path("입고스케줄관리.xlsx"),
+                    sheet_name="Raw_밀크런",
+                    rows=2,
+                    columns=14,
+                    filtered_rows=0,
+                ),
+                daily_inbound=mock.Mock(
+                    products=(product,),
+                    unmatched_dispatches=(),
+                    empty_detail_dispatches=(),
+                ),
+            )
+            try:
+                window._pending_full_pipeline_restart = True
+                with patch.object(window, "_start_weight_lookup") as start_weight:
+                    window._on_milkrun_completed(result)
+
+                start_weight.assert_called_once_with(
+                    window.current_products,
+                    retry_mode="restart",
+                )
+                self.assertFalse(window._pending_full_pipeline_restart)
             finally:
                 window.close()
 
@@ -922,6 +992,51 @@ class MainWindowSmokeTests(unittest.TestCase):
                 message = information.call_args.args[2]
                 self.assertIn("덮어쓰기 1개", message)
                 self.assertIn("기존 값 유지 1개", message)
+            finally:
+                window.close()
+
+    def test_table_bundle_import_does_not_prompt_for_same_duplicate_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = date(2026, 8, 9)
+            source_store = BookingSnapshotStore(root / "source-snapshots.json")
+            product = MilkrunProductRow(
+                "거래처", "100", "1", "2", "123", "동일 상품", "M1"
+            )
+            source_store.save_table(selected, "milkrun", (product,))
+            source_memory = ProductMemory(root / "source-memory.json")
+            source_memory.upsert_measurement("123", "동일 상품", "1500", "2", "1")
+            source_memory.set_manual_category("123", "고단")
+            bundle = root / "same-values.json"
+            source_store.export_bundle(
+                selected,
+                bundle,
+                source_memory.export_payload({"123"}),
+            )
+
+            destination_memory = root / "destination-memory.json"
+            destination = ProductMemory(destination_memory)
+            destination.upsert_measurement("123", "동일 상품", "1500", "2", "1")
+            destination.set_manual_category("123", "고단")
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=destination_memory,
+                snapshot_file=root / "destination-snapshots.json",
+            )
+            try:
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getOpenFileName",
+                        return_value=(str(bundle), ""),
+                    ),
+                    patch.object(window, "_ask_duplicate_memory_action") as ask_duplicate,
+                    patch.object(QMessageBox, "information") as information,
+                ):
+                    window.import_table_snapshot()
+
+                ask_duplicate.assert_not_called()
+                self.assertIn("기존 값 유지 1개", information.call_args.args[2])
             finally:
                 window.close()
 
@@ -1284,6 +1399,207 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertIsNone(window._credential_load_failure)
             self.assertEqual(window._pending_weight_summary.total_skus, 0)
             self.assertEqual(window.status_label.text(), "기준일 표시 상품 없음 · WMS 조회 생략")
+        finally:
+            window.close()
+
+    def test_incomplete_checkpoint_resume_skips_full_shipments_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            memory_path = root / "memory.json"
+            ProductMemory(memory_path).upsert_measurement(
+                "123", "저장 상품", "1000", "2", "1"
+            )
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=memory_path,
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "123", "저장 상품", "M3370492"
+                ),
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "456", "미완료 상품", "M3370492"
+                ),
+            )
+            try:
+                window._populate_milkrun_products(products)
+                window._remember_weight_retry_checkpoint(
+                    products,
+                    memory=ProductMemory(memory_path),
+                )
+                with (
+                    patch.object(
+                        window,
+                        "_ask_weight_retry_action",
+                        return_value="resume",
+                    ) as ask_retry,
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                ):
+                    window._start_booking_download("milkrun")
+
+                ask_retry.assert_called_once_with(cached_count=1, total_count=2)
+                start_weight.assert_called_once_with(products, retry_mode="resume")
+                self.assertEqual(window.current_products, products)
+            finally:
+                window.close()
+
+    def test_weight_problem_choice_routes_resume_or_full_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=root / "memory.json",
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "123", "상품", "M3370492"
+                ),
+            )
+            try:
+                window._populate_milkrun_products(products)
+                ProductMemory(window.product_memory_file).upsert_measurement(
+                    "123", "상품", "1000", "2", "1"
+                )
+                with (
+                    patch.object(window, "_ask_weight_retry_action", return_value="resume"),
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                    patch.object(window, "_start_booking_download") as start_booking,
+                ):
+                    window._offer_weight_retry_after_problem()
+                start_weight.assert_called_once_with(products, retry_mode="resume")
+                start_booking.assert_not_called()
+
+                with (
+                    patch.object(window, "_ask_weight_retry_action", return_value="restart"),
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                    patch.object(window, "_start_booking_download") as start_booking,
+                ):
+                    window._offer_weight_retry_after_problem()
+                start_weight.assert_not_called()
+                start_booking.assert_called_once_with("milkrun", retry_mode="restart")
+            finally:
+                window.close()
+
+    def test_successful_weight_completion_clears_persistent_retry_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=root / "memory.json",
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "123", "상품", "M3370492"
+                ),
+            )
+            try:
+                window._populate_milkrun_products(products)
+                key, _pending = window._remember_weight_retry_checkpoint(products)
+                window._pending_weight_summary = ProductWeightSummary(
+                    total_skus=1,
+                    cache_hits=1,
+                    wms_successes=0,
+                    failures=(),
+                )
+                with patch.object(QMessageBox, "information"):
+                    window._finalize_weight_lookup()
+
+                self.assertNotIn(key, window._read_weight_retry_checkpoints())
+            finally:
+                window.close()
+
+    def test_restart_checkpoint_resume_keeps_only_current_run_successes_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            memory_path = root / "memory.json"
+            memory = ProductMemory(memory_path)
+            memory.upsert_measurement("123", "완료 상품", "1000", "2", "1")
+            memory.upsert_measurement("456", "실패 전 기존 상품", "2000", "2", "1")
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=memory_path,
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow("거래처", "M1", "1", "2", "123", "완료 상품", "M1"),
+                MilkrunProductRow("거래처", "M1", "1", "2", "456", "실패 상품", "M1"),
+            )
+            try:
+                window._populate_milkrun_products(products)
+                _key, initial_pending = window._remember_weight_retry_checkpoint(
+                    products,
+                    memory=memory,
+                    retry_mode="restart",
+                )
+                self.assertEqual(initial_pending, ("123", "456"))
+                window._mark_weight_checkpoint_completed("123")
+
+                _key, resumed_pending = window._remember_weight_retry_checkpoint(
+                    products,
+                    memory=memory,
+                    retry_mode="resume",
+                )
+
+                self.assertEqual(resumed_pending, ("456",))
+                checkpoint = window._read_weight_retry_checkpoints()[
+                    window._weight_checkpoint_key()
+                ]
+                self.assertEqual(checkpoint["completed_sku_ids"], ["123"])
+            finally:
+                window.close()
+
+    def test_partial_weight_failure_offers_retry_choice_after_error_details(self) -> None:
+        window = MainWindow(smoke_test=True)
+        products = (
+            MilkrunProductRow(
+                "거래처", "M1", "1", "2", "123", "상품", "M3370492"
+            ),
+        )
+        try:
+            window._populate_milkrun_products(products)
+            failure = SkuWeightFailure(
+                sku_id="123",
+                product_name="상품",
+                details=FailureDetails(summary="조회 실패", detail="조회 실패"),
+            )
+            window._pending_weight_summary = ProductWeightSummary(
+                total_skus=1,
+                cache_hits=0,
+                wms_successes=0,
+                failures=(failure,),
+            )
+            with (
+                patch.object(window, "_show_error_dialog") as show_error,
+                patch.object(window, "_offer_weight_retry_after_problem") as offer_retry,
+            ):
+                window._finalize_weight_lookup()
+
+            show_error.assert_called_once()
+            offer_retry.assert_called_once_with()
         finally:
             window.close()
 

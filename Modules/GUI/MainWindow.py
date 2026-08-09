@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -109,6 +110,7 @@ class MilkrunPipelineResult:
 
 class MilkrunWorker(QThread):
     log_updated = Signal(str)
+    detail_progress = Signal(int, int)
     completed = Signal(object)
     excel_failed = Signal(object, object)
     excel_close_required = Signal(object, str)
@@ -199,7 +201,10 @@ class MilkrunWorker(QThread):
                     self.log_updated.emit(
                         "다운로드 첫 시트 A열의 배차번호를 M 접두사로 변환해 기준일 일별 입고 상세를 조회합니다."
                     )
-                scraper_kwargs = {"evidence_dir": self.request.download_dir}
+                scraper_kwargs = {
+                    "evidence_dir": self.request.download_dir,
+                    "progress": self.detail_progress.emit,
+                }
                 if is_truck:
                     scraper_kwargs["profile"] = TRUCK_DAILY_INBOUND_PROFILE
                 daily_result = DailyInboundScraper(
@@ -748,6 +753,9 @@ class SettingsDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    WEIGHT_RETRY_CHECKPOINTS_KEY = "weight_retry_checkpoints_v1"
+    MAX_WEIGHT_RETRY_CHECKPOINTS = 8
+
     def __init__(
         self,
         smoke_test: bool = False,
@@ -789,6 +797,8 @@ class MainWindow(QMainWindow):
         self._pending_weight_failure: FailureDetails | None = None
         self._pending_weight_cancel = ""
         self._weight_finalize_pending = False
+        self._active_weight_checkpoint_key = ""
+        self._pending_full_pipeline_restart = False
         self.update_check_worker: UpdateCheckWorker | None = None
         self.restore_worker: ReleaseRestoreWorker | None = None
         self.update_download_worker: UpdateDownloadWorker | None = None
@@ -891,6 +901,13 @@ class MainWindow(QMainWindow):
         status_dot.setObjectName("StatusDot")
         self.status_label = QLabel("대기 중")
         self.status_label.setObjectName("Status")
+        self.operation_progress = QProgressBar()
+        self.operation_progress.setObjectName("OperationProgress")
+        self.operation_progress.setRange(0, 100)
+        self.operation_progress.setValue(0)
+        self.operation_progress.setFormat("0% 완료 · 100% 남음")
+        self.operation_progress.setFixedWidth(170)
+        self.operation_progress.setVisible(False)
         self.log_toggle_button = QPushButton()
         self.log_toggle_button.setObjectName("LogToggleButton")
         self.log_toggle_button.setCheckable(True)
@@ -909,6 +926,7 @@ class MainWindow(QMainWindow):
         self.open_folder_button.clicked.connect(self.open_download_folder)
         status_row.addWidget(status_dot)
         status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.operation_progress)
         status_row.addWidget(self.log_toggle_button)
         status_row.addWidget(self.import_table_button)
         status_row.addWidget(self.export_table_button)
@@ -1391,6 +1409,21 @@ class MainWindow(QMainWindow):
             f"분류: {category}"
         )
 
+    @staticmethod
+    def _memory_records_equivalent(
+        existing: ProductMemoryRecord,
+        incoming: ProductMemoryRecord,
+    ) -> bool:
+        return (
+            existing.sku_id == incoming.sku_id
+            and existing.product_name == incoming.product_name
+            and existing.weight_grams == incoming.weight_grams
+            and existing.automatic_category == incoming.automatic_category
+            and existing.category_override == incoming.category_override
+            and existing.boxes_per_pallet == incoming.boxes_per_pallet
+            and existing.pallet_weight_kg == incoming.pallet_weight_kg
+        )
+
     def _ask_duplicate_memory_action(
         self,
         existing: ProductMemoryRecord,
@@ -1452,6 +1485,7 @@ class MainWindow(QMainWindow):
                 (existing, record)
                 for record in records
                 if (existing := memory.get(record.sku_id)) is not None
+                and not self._memory_records_equivalent(existing, record)
             )
             overwrite_sku_ids: set[str] = set()
             for index, (existing, incoming) in enumerate(duplicates, start=1):
@@ -1491,15 +1525,61 @@ class MainWindow(QMainWindow):
             f"덮어쓰기 {summary.overwritten}개 · 기존 값 유지 {summary.skipped}개",
         )
 
-    def _start_booking_download(self, booking_type: str) -> None:
+    def _start_booking_download(
+        self,
+        booking_type: str,
+        *,
+        retry_mode: str | None = None,
+    ) -> None:
         if self._automation_worker_running():
             return
         is_truck = booking_type == "truck"
         booking_label = "트럭" if is_truck else "Milkrun"
         driver = chromedriver_path()
         if not driver.is_file():
-            QMessageBox.critical(self, "ChromeDriver 없음", f"ChromeDriver를 찾을 수 없습니다.\n{driver}")
+            QMessageBox.critical(
+                self,
+                "ChromeDriver 없음",
+                f"ChromeDriver를 찾을 수 없습니다.\n{driver}",
+            )
             return
+        try:
+            base_date = self._configured_base_date()
+        except ValueError as exc:
+            QMessageBox.warning(self, "기준일 확인", str(exc))
+            self.base_date_mode.setFocus()
+            return
+        effective_base_date = base_date or date.today()
+        checkpoint_key = self._weight_checkpoint_key(
+            booking_type=booking_type,
+            base_date=effective_base_date,
+        )
+        checkpoints = self._read_weight_retry_checkpoints()
+        existing_products = self._products_by_booking.get(booking_type, ())
+        if retry_mode is None and checkpoint_key in checkpoints and existing_products:
+            sku_ids = self._weight_checkpoint_skus(existing_products)
+            cached_count = self._checkpoint_completed_count(
+                checkpoints[checkpoint_key],
+                existing_products,
+            )
+            retry_mode = self._ask_weight_retry_action(
+                cached_count=cached_count,
+                total_count=len(sku_ids),
+            )
+            if retry_mode == "cancel":
+                self.status_label.setText(
+                    "미완료 WMS 무게 측정은 다음에 이어서 진행할 수 있습니다"
+                )
+                return
+            if retry_mode == "resume":
+                self._active_booking_type = booking_type
+                self.current_products = tuple(existing_products)
+                self.current_pipeline_result = self._pipeline_results_by_booking.get(
+                    booking_type
+                )
+                self._automation_cancel_requested = False
+                self._start_weight_lookup(self.current_products, retry_mode="resume")
+                return
 
         configured_workbook = str(self.settings.value("milkrun_excel_path", "")).strip()
         if not configured_workbook:
@@ -1524,12 +1604,6 @@ class MainWindow(QMainWindow):
         download_dir = Path(
             str(self.settings.value("download_dir", str(default_download_dir())))
         ).expanduser()
-        try:
-            base_date = self._configured_base_date()
-        except ValueError as exc:
-            QMessageBox.warning(self, "기준일 확인", str(exc))
-            self.base_date_mode.setFocus()
-            return
         if is_truck:
             from Modules.Shipments.TruckDownloader import TruckDownloadRequest
 
@@ -1560,6 +1634,7 @@ class MainWindow(QMainWindow):
         self._pending_weight_cancel = ""
         self._credential_load_failure = None
         self._weight_finalize_pending = False
+        self._pending_full_pipeline_restart = retry_mode == "restart"
         self.append_log(f"{booking_label} 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
         self.append_log(
             f"조회 기준일: {base_date:%Y-%m-%d} (수동)"
@@ -1575,6 +1650,7 @@ class MainWindow(QMainWindow):
             booking_type=booking_type,
         )
         self.milkrun_worker.log_updated.connect(self.append_log)
+        self.milkrun_worker.detail_progress.connect(self._on_detail_progress)
         self.milkrun_worker.completed.connect(self._on_milkrun_completed)
         self.milkrun_worker.excel_failed.connect(self._on_milkrun_excel_failed)
         self.milkrun_worker.excel_close_required.connect(self._on_excel_close_required)
@@ -1643,7 +1719,14 @@ class MainWindow(QMainWindow):
                 f"상품 데이터가 없어 건너뛴 {number_label}: " + ", ".join(empty_details)
             )
         self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
-        self._start_weight_lookup(self.current_products)
+        weight_retry_mode = (
+            "restart" if self._pending_full_pipeline_restart else "resume"
+        )
+        self._pending_full_pipeline_restart = False
+        self._start_weight_lookup(
+            self.current_products,
+            retry_mode=weight_retry_mode,
+        )
 
     def _populate_milkrun_products(self, products) -> None:
         self._active_booking_type = "milkrun"
@@ -1925,7 +2008,192 @@ class MainWindow(QMainWindow):
         for row_index in range(table.rowCount()):
             table.setRowHidden(row_index, row_index not in visible_rows)
 
-    def _start_weight_lookup(self, products) -> None:
+    @staticmethod
+    def _weight_checkpoint_skus(products) -> tuple[str, ...]:
+        sku_ids: set[str] = set()
+        for product in products:
+            try:
+                sku_ids.add(normalize_sku_id(product.sku_id))
+            except ValueError:
+                continue
+        return tuple(sorted(sku_ids))
+
+    def _weight_checkpoint_key(
+        self,
+        *,
+        booking_type: str | None = None,
+        base_date: date | None = None,
+    ) -> str:
+        kind = booking_type or self._active_booking_type
+        pipeline = self._pipeline_results_by_booking.get(kind)
+        selected_date = (
+            base_date
+            or getattr(pipeline, "base_date", None)
+            or self._selected_snapshot_date()
+        )
+        date_text = selected_date.isoformat() if selected_date is not None else "unknown"
+        return f"{kind}|{date_text}"
+
+    def _read_weight_retry_checkpoints(self) -> dict[str, dict]:
+        raw = self.settings.value(self.WEIGHT_RETRY_CHECKPOINTS_KEY, "")
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(str(raw))
+            if not isinstance(payload, dict):
+                raise ValueError("체크포인트 루트가 객체가 아닙니다.")
+            checkpoints: dict[str, dict] = {}
+            for key, value in payload.items():
+                if not isinstance(key, str) or not isinstance(value, dict):
+                    raise ValueError("체크포인트 항목 형식이 올바르지 않습니다.")
+                sku_ids = value.get("sku_ids")
+                completed_sku_ids = value.get("completed_sku_ids", [])
+                started_at = value.get("started_at")
+                if (
+                    not isinstance(sku_ids, list)
+                    or not all(isinstance(sku_id, str) for sku_id in sku_ids)
+                    or not isinstance(completed_sku_ids, list)
+                    or not all(
+                        isinstance(sku_id, str) for sku_id in completed_sku_ids
+                    )
+                    or not isinstance(started_at, str)
+                ):
+                    raise ValueError("체크포인트 값 형식이 올바르지 않습니다.")
+                checkpoints[key] = {
+                    "sku_ids": list(dict.fromkeys(sku_ids)),
+                    "completed_sku_ids": list(dict.fromkeys(completed_sku_ids)),
+                    "started_at": started_at,
+                }
+            return checkpoints
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.settings.remove(self.WEIGHT_RETRY_CHECKPOINTS_KEY)
+            self.settings.sync()
+            return {}
+
+    def _write_weight_retry_checkpoints(self, checkpoints: dict[str, dict]) -> None:
+        if checkpoints:
+            ordered = dict(
+                sorted(
+                    checkpoints.items(),
+                    key=lambda item: str(item[1].get("started_at", "")),
+                    reverse=True,
+                )[: self.MAX_WEIGHT_RETRY_CHECKPOINTS]
+            )
+            self.settings.setValue(
+                self.WEIGHT_RETRY_CHECKPOINTS_KEY,
+                json.dumps(ordered, ensure_ascii=False, separators=(",", ":")),
+            )
+        else:
+            self.settings.remove(self.WEIGHT_RETRY_CHECKPOINTS_KEY)
+        self.settings.sync()
+
+    def _remember_weight_retry_checkpoint(
+        self,
+        products,
+        *,
+        memory: ProductMemory | None = None,
+        retry_mode: str = "resume",
+    ) -> tuple[str, tuple[str, ...]]:
+        key = self._weight_checkpoint_key()
+        checkpoints = self._read_weight_retry_checkpoints()
+        target_skus = self._weight_checkpoint_skus(products)
+        previous = checkpoints.get(key)
+        if retry_mode == "restart":
+            completed_skus: set[str] = set()
+        elif previous is not None:
+            completed_skus = set(previous.get("completed_sku_ids", ()))
+            completed_skus.intersection_update(target_skus)
+        elif memory is not None:
+            completed_skus = {
+                sku_id
+                for sku_id in target_skus
+                if (record := memory.get(sku_id)) is not None
+                and record.weight_grams is not None
+            }
+        else:
+            completed_skus = set()
+        checkpoints[key] = {
+            "sku_ids": list(target_skus),
+            "completed_sku_ids": sorted(completed_skus),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._write_weight_retry_checkpoints(checkpoints)
+        self._active_weight_checkpoint_key = key
+        pending_skus = tuple(
+            sku_id for sku_id in target_skus if sku_id not in completed_skus
+        )
+        return key, pending_skus
+
+    def _mark_weight_checkpoint_completed(self, sku_id: str) -> None:
+        key = self._active_weight_checkpoint_key
+        if not key:
+            return
+        checkpoints = self._read_weight_retry_checkpoints()
+        checkpoint = checkpoints.get(key)
+        if checkpoint is None or sku_id not in checkpoint.get("sku_ids", ()):
+            return
+        completed = set(checkpoint.get("completed_sku_ids", ()))
+        if sku_id in completed:
+            return
+        completed.add(sku_id)
+        checkpoint["completed_sku_ids"] = sorted(completed)
+        checkpoints[key] = checkpoint
+        self._write_weight_retry_checkpoints(checkpoints)
+
+    @staticmethod
+    def _checkpoint_completed_count(
+        checkpoint: dict,
+        products,
+    ) -> int:
+        target_skus = set(MainWindow._weight_checkpoint_skus(products))
+        completed_skus = set(checkpoint.get("completed_sku_ids", ()))
+        return len(target_skus.intersection(completed_skus))
+
+    def _clear_weight_retry_checkpoint(self, key: str | None = None) -> None:
+        checkpoint_key = key or self._active_weight_checkpoint_key
+        if not checkpoint_key:
+            return
+        checkpoints = self._read_weight_retry_checkpoints()
+        if checkpoint_key in checkpoints:
+            del checkpoints[checkpoint_key]
+            self._write_weight_retry_checkpoints(checkpoints)
+        if checkpoint_key == self._active_weight_checkpoint_key:
+            self._active_weight_checkpoint_key = ""
+
+    def _ask_weight_retry_action(
+        self,
+        *,
+        cached_count: int,
+        total_count: int,
+    ) -> str:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("WMS 무게 측정 다시 진행")
+        dialog.setText("이 기준일의 WMS 무게 측정이 완료되지 않았습니다.")
+        dialog.setInformativeText(
+            f"현재 표 SKU {total_count}개 중 저장된 무게 {cached_count}개를 확인했습니다.\n\n"
+            "이어서 진행: 저장된 무게는 다시 측정하지 않고 미완료 SKU만 조회합니다.\n"
+            "처음부터 다시: Shipments 조회, 파일 다운로드, Excel 반영, 상세 상품 수집과 "
+            "WMS 무게 측정을 모두 처음부터 다시 실행합니다. 재측정에 실패해도 기존 "
+            "저장값은 먼저 삭제하지 않습니다."
+        )
+        resume_button = dialog.addButton("이어서 진행", QMessageBox.ButtonRole.AcceptRole)
+        restart_button = dialog.addButton(
+            "처음부터 다시",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        cancel_button = dialog.addButton("나중에", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(resume_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is restart_button:
+            return "restart"
+        if clicked is resume_button:
+            return "resume"
+        return "cancel"
+
+    def _start_weight_lookup(self, products, *, retry_mode: str | None = None) -> None:
         if self.weight_worker and self.weight_worker.isRunning():
             return
         self._credential_load_failure = None
@@ -1959,6 +2227,7 @@ class MainWindow(QMainWindow):
             self.append_log(message)
             self._finalize_weight_if_ready()
             return
+        retry_mode = retry_mode if retry_mode in {"resume", "restart"} else "resume"
         try:
             credentials = WMSCredentialStore(self.settings).load()
         except CredentialError as exc:
@@ -1974,6 +2243,11 @@ class MainWindow(QMainWindow):
         self._pending_weight_summary = None
         self._pending_weight_failure = None
         self._pending_weight_cancel = ""
+        _checkpoint_key, pending_skus = self._remember_weight_retry_checkpoint(
+            products,
+            memory=memory,
+            retry_mode=retry_mode,
+        )
         self.weight_worker = ProductWeightWorker(
             products,
             self.product_memory_file,
@@ -1982,8 +2256,10 @@ class MainWindow(QMainWindow):
             credentials.password,
             evidence_dir=download_dir,
             quantity_label="유닛",
+            force_refresh_sku_ids=pending_skus,
         )
         self.weight_worker.log_updated.connect(self.append_log)
+        self.weight_worker.progress_updated.connect(self._on_weight_progress)
         self.weight_worker.record_ready.connect(self._on_weight_record_ready)
         self.weight_worker.sku_failed.connect(self._on_weight_sku_failed)
         self.weight_worker.completed.connect(self._on_weight_completed)
@@ -1991,12 +2267,71 @@ class MainWindow(QMainWindow):
         self.weight_worker.cancelled.connect(self._on_weight_cancelled)
         self.weight_worker.finished.connect(self._on_weight_finished)
         self.status_label.setText("WMS 상품 무게 확인 중")
-        self.append_log("표의 SKU별 상품 무게와 팔렛트 분류를 확인합니다.")
+        if retry_mode == "restart":
+            self.append_log("현재 표의 모든 SKU 무게를 WMS에서 처음부터 다시 측정합니다.")
+        else:
+            self.append_log("저장된 무게를 유지하고 미완료 SKU부터 이어서 확인합니다.")
         self._set_automation_working(True)
         self.weight_worker.start()
 
+    def _set_operation_progress(
+        self,
+        stage: str,
+        completed: int,
+        total: int,
+    ) -> None:
+        if total <= 0:
+            self.operation_progress.setVisible(False)
+            return
+        completed = min(max(int(completed), 0), int(total))
+        completed_percent = (completed * 100) // total
+        remaining_percent = 100 - completed_percent
+        self.operation_progress.setValue(completed_percent)
+        self.operation_progress.setFormat(
+            f"{completed_percent}% 완료 · {remaining_percent}% 남음"
+        )
+        self.operation_progress.setVisible(True)
+        self.status_label.setText(
+            f"{stage} {completed}/{total} · {remaining_percent}% 남음"
+        )
+
+    def _on_detail_progress(self, completed: int, total: int) -> None:
+        self._set_operation_progress("상세 상품 조회", completed, total)
+
+    def _on_weight_progress(self, completed: int, total: int) -> None:
+        self._set_operation_progress("상품 무게 확인", completed, total)
+
+    def _offer_weight_retry_after_problem(self) -> None:
+        if not self.current_products or self._automation_worker_running():
+            return
+        memory = _open_product_memory_with_recovery(self.product_memory_file, self)
+        if memory is None:
+            return
+        sku_ids = self._weight_checkpoint_skus(self.current_products)
+        checkpoint = self._read_weight_retry_checkpoints().get(
+            self._weight_checkpoint_key(),
+            {},
+        )
+        cached_count = self._checkpoint_completed_count(
+            checkpoint,
+            self.current_products,
+        )
+        action = self._ask_weight_retry_action(
+            cached_count=cached_count,
+            total_count=len(sku_ids),
+        )
+        if action == "resume":
+            self._start_weight_lookup(self.current_products, retry_mode="resume")
+        elif action == "restart":
+            self._start_booking_download(
+                self._active_booking_type,
+                retry_mode="restart",
+            )
+
     def _on_weight_record_ready(self, record: ProductMemoryRecord, cache_hit: bool) -> None:
         self._weight_records[record.sku_id] = record
+        if record.weight_grams is not None:
+            self._mark_weight_checkpoint_completed(record.sku_id)
         self._render_weight_record(record, self._active_booking_type)
         source = "저장 정보" if cache_hit else "WMS"
         self.append_log(f"SKU {record.sku_id} 무게 반영: {source}")
@@ -2200,6 +2535,11 @@ class MainWindow(QMainWindow):
             problems.append(self._pending_weight_failure.summary)
             details.append(self._pending_weight_failure.detail)
         summary = self._pending_weight_summary
+        retryable_weight_problem = bool(
+            self._credential_load_failure is not None
+            or self._pending_weight_failure is not None
+            or (summary is not None and summary.failures)
+        )
         if summary is not None:
             for failure in summary.failures:
                 problems.append(f"SKU {failure.sku_id}: {failure.details.summary}")
@@ -2225,6 +2565,10 @@ class MainWindow(QMainWindow):
                 failure,
                 category=f"{booking_label} WMS 무게 조회",
             )
+            if retryable_weight_problem and self.current_products:
+                self._offer_weight_retry_after_problem()
+            elif not retryable_weight_problem:
+                self._clear_weight_retry_checkpoint()
             return
 
         cache_hits = summary.cache_hits if summary is not None else 0
@@ -2254,6 +2598,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
+        self._clear_weight_retry_checkpoint()
         completion_text = (
             (
                 "WMS SKU별 유닛 무게 확인을 완료했습니다."
@@ -2734,8 +3079,10 @@ class MainWindow(QMainWindow):
             button.setEnabled(working)
         if working:
             self.status_label.setText("작업 중 · 로그인 화면이면 브라우저에서 직접 인증해 주세요")
-        elif self.status_label.text().startswith("작업 중"):
-            self.status_label.setText("대기 중")
+        else:
+            self.operation_progress.setVisible(False)
+            if self.status_label.text().startswith("작업 중"):
+                self.status_label.setText("대기 중")
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")

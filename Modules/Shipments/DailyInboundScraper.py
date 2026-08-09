@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from selenium.common.exceptions import (
     NoSuchWindowException,
@@ -103,11 +103,13 @@ class DailyInboundScraper:
         *,
         evidence_dir: str | Path | None = None,
         profile: DailyInboundProfile = MILKRUN_DAILY_INBOUND_PROFILE,
+        progress: Callable[[int, int], None] | None = None,
     ):
         self.browser = browser
         self.log = browser.log
         self.evidence_dir = Path(evidence_dir).expanduser() if evidence_dir else None
         self.profile = profile
+        self.progress = progress or (lambda _completed, _total: None)
 
     def run(
         self,
@@ -123,6 +125,8 @@ class DailyInboundScraper:
                 f"{self.profile.display_name} 예약번호를 찾지 못했습니다. "
                 "Excel 값 반영은 완료되었지만 일별 입고 상세 조회는 진행하지 않았습니다."
             )
+        total_dispatches = len(requested)
+        self.progress(0, total_dispatches)
 
         self._open_daily_schedule()
         self._select_center(center_name)
@@ -135,7 +139,7 @@ class DailyInboundScraper:
         empty_details: list[str] = []
         seen_products: set[MilkrunProductRow] = set()
 
-        for dispatch_number in requested:
+        for completed_dispatches, dispatch_number in enumerate(requested, start=1):
             self.browser._check_cancelled()
             matching_count = len(self._matching_slots(dispatch_number))
             if matching_count == 0:
@@ -144,6 +148,7 @@ class DailyInboundScraper:
                     f"일별 입고 카드에서 {self.profile.number_label} "
                     f"{dispatch_number}를 찾지 못했습니다."
                 )
+                self.progress(completed_dispatches, total_dispatches)
                 continue
 
             self.log(
@@ -184,6 +189,7 @@ class DailyInboundScraper:
                     if row not in seen_products:
                         seen_products.add(row)
                         products.append(row)
+            self.progress(completed_dispatches, total_dispatches)
 
         if not products and not empty_details:
             missing = ", ".join(unmatched or requested)

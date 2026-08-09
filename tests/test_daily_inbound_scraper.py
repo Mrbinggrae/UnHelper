@@ -126,7 +126,11 @@ class DailyInboundScraperTests(unittest.TestCase):
                 )
 
         browser = _Browser()
-        scraper = PartiallyEmptyScraper(browser)
+        progress = []
+        scraper = PartiallyEmptyScraper(
+            browser,
+            progress=lambda completed, total: progress.append((completed, total)),
+        )
 
         result = scraper.run(
             ("M3367934", "M3370492"),
@@ -138,6 +142,7 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertEqual(result.products[0].dispatch_number, "M3370492")
         self.assertEqual(result.empty_detail_dispatches, ("M3367934",))
         self.assertIn("건너뛰고 다음 예약", "\n".join(browser.log_messages))
+        self.assertEqual(progress, [(0, 2), (1, 2), (2, 2)])
 
     def test_all_empty_details_complete_without_automation_failure(self) -> None:
         class EmptyScraper(_StubScraper):

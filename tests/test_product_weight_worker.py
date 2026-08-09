@@ -199,7 +199,11 @@ class ProductWeightWorkerTests(unittest.TestCase):
             products = (_product("123", "상품 A/\n상품 B"), _product("123", "다른 표시"))
             worker = self._worker(root, products)
             summaries = []
+            progress = []
             worker.completed.connect(summaries.append)
+            worker.progress_updated.connect(
+                lambda completed, total: progress.append((completed, total))
+            )
 
             worker.run()
 
@@ -210,6 +214,7 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(record.product_name, "상품 A/ 상품 B")
             self.assertEqual(record.weight_grams, Decimal("1000"))
             self.assertEqual(summaries[0].wms_successes, 1)
+            self.assertEqual(progress, [(0, 1), (1, 1)])
 
     def test_multi_sku_truck_wms_results_persist_each_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -561,6 +566,66 @@ class ProductWeightWorkerTests(unittest.TestCase):
             self.assertEqual(summaries[0].wms_successes, 1)
             self.assertEqual(len(summaries[0].failures), 1)
             self.assertEqual(FakeCrawler.instances[0].evidence, 1)
+
+    def test_force_refresh_remeasures_cached_and_uncached_skus_without_deleting_old_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = ProductMemory(root / "memory.json")
+            memory.upsert_measurement("123", "기존 상품", "2000", "10", "1")
+            memory.set_manual_category("123", "고단")
+            products = (_product("123"), _product("456"))
+            worker = ProductWeightWorker(
+                products,
+                root / "memory.json",
+                root / "chromedriver.exe",
+                "id",
+                "pw",
+                evidence_dir=root,
+                force_refresh=True,
+                crawler_factory=FakeCrawler,
+            )
+            progress = []
+            worker.progress_updated.connect(
+                lambda completed, total: progress.append((completed, total))
+            )
+
+            worker.run()
+
+            self.assertEqual(FakeCrawler.instances[0].lookups, ["123", "456"])
+            refreshed = ProductMemory(root / "memory.json").get("123")
+            self.assertEqual(refreshed.weight_grams, Decimal("1000"))
+            self.assertEqual(refreshed.category_override, "고단")
+            self.assertEqual(progress, [(0, 2), (1, 2), (2, 2)])
+
+    def test_resume_forces_only_checkpoint_pending_cached_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = ProductMemory(root / "memory.json")
+            memory.upsert_measurement("123", "완료 상품", "1000", "2", "1")
+            memory.upsert_measurement("456", "이전 값 상품", "2000", "2", "1")
+            products = (_product("123"), _product("456"))
+            worker = ProductWeightWorker(
+                products,
+                root / "memory.json",
+                root / "chromedriver.exe",
+                "id",
+                "pw",
+                evidence_dir=root,
+                force_refresh_sku_ids={"456"},
+                crawler_factory=FakeCrawler,
+            )
+            summaries = []
+            worker.completed.connect(summaries.append)
+
+            worker.run()
+
+            self.assertEqual(FakeCrawler.instances[0].lookups, ["456"])
+            self.assertEqual(summaries[0].cache_hits, 1)
+            self.assertEqual(summaries[0].wms_successes, 1)
+            self.assertEqual(
+                ProductMemory(root / "memory.json").get("456").weight_grams,
+                Decimal("1000"),
+            )
 
     def test_missing_credentials_preserves_manual_placeholder_and_does_not_open_wms(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
