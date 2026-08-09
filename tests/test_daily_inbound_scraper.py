@@ -269,6 +269,50 @@ class DailyInboundScraperTests(unittest.TestCase):
         self.assertNotEqual(result.products[0].vendor_name, result.products[1].vendor_name)
         self.assertEqual(result.unmatched_dispatches, ("M9999999",))
 
+    def test_worker_can_skip_linked_excel_update_and_continue_pipeline(self) -> None:
+        download_result = MilkrunDownloadResult(
+            Path("download.csv"),
+            date(2026, 8, 7),
+            date(2026, 8, 8),
+            "08.07-08.08",
+        )
+        import_result = MilkrunExcelImportResult(
+            source_file=Path("download.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_밀크런",
+            rows=1,
+            columns=14,
+            dispatch_numbers=(),
+            target_updated=False,
+        )
+        fake_importer = mock.Mock()
+        fake_importer.TARGET_SHEET = "Raw_밀크런"
+        fake_importer.import_values.return_value = import_result
+        fake_downloader = mock.Mock()
+        fake_downloader.run.return_value = download_result
+        worker = MilkrunWorker(
+            MilkrunDownloadRequest(Path("downloads"), today=date(2026, 8, 8)),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+            apply_to_excel=False,
+        )
+        completed = []
+        worker.completed.connect(completed.append)
+
+        with (
+            mock.patch("Modules.GUI.MainWindow.MilkrunExcelImporter", return_value=fake_importer),
+            mock.patch("Modules.GUI.MainWindow.MilkrunDownloader", return_value=fake_downloader),
+            mock.patch("Modules.GUI.MainWindow.DailyInboundScraper") as scraper,
+        ):
+            worker.run()
+
+        fake_importer.validate_workbook.assert_not_called()
+        self.assertFalse(fake_importer.import_values.call_args.kwargs["apply_to_target"])
+        scraper.assert_not_called()
+        self.assertEqual(len(completed), 1)
+        self.assertFalse(completed[0].excel.target_updated)
+        fake_downloader.close.assert_called_once()
+
     def test_worker_reports_partial_cancel_after_excel_was_saved(self) -> None:
         download_result = MilkrunDownloadResult(
             Path("download.csv"),

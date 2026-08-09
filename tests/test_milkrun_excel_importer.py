@@ -295,6 +295,88 @@ class FakeComClient:
 
 
 class MilkrunExcelImporterTests(unittest.TestCase):
+    def test_skip_target_update_parses_csv_without_loading_excel_com(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_text(
+                "배차번호,SKU,입고일,수량\n"
+                "3369001,100,2026-08-07,1\n"
+                "3370492,101,2026-08-08,2\n",
+                encoding="utf-8-sig",
+            )
+            original_target = target.read_bytes()
+            logs: list[str] = []
+            importer = MilkrunExcelImporter(log=logs.append)
+
+            with mock.patch.object(
+                importer,
+                "_load_com_modules",
+                side_effect=AssertionError("Excel COM must not be loaded"),
+            ) as load_com:
+                result = importer.import_values(
+                    source,
+                    target,
+                    exclude_arrival_date=date(2026, 8, 7),
+                    apply_to_target=False,
+                )
+
+            load_com.assert_not_called()
+            self.assertFalse(result.target_updated)
+            self.assertEqual((result.rows, result.filtered_rows), (2, 1))
+            self.assertEqual(result.dispatch_numbers, ("M3370492",))
+            self.assertEqual(target.read_bytes(), original_target)
+            self.assertTrue(any("시트 반영을 건너뜁니다" in log for log in logs))
+
+    def test_skip_target_update_opens_only_downloaded_excel_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root, "download.xlsx")
+            source.write_bytes(b"PK\x03\x04placeholder")
+            header = [f"열{index}" for index in range(1, 16)]
+            header[0] = "배차번호"
+            header[2] = "입고일"
+            row = [""] * 15
+            row[0] = 3370492
+            row[1] = "100"
+            row[2] = date(2026, 8, 8)
+            row[14] = "대상 범위 밖 추가 값"
+            source_book = FakeWorkbook(
+                source,
+                FakeWorksheets(
+                    source_sheet=FakeSourceSheet(
+                        (
+                            tuple(header),
+                            tuple(row),
+                        )
+                    )
+                ),
+            )
+            workbooks = FakeWorkbooks(open_results={source: source_book})
+            excel = FakeExcel(workbooks)
+            client = FakeComClient(dispatched_excel=excel)
+            importer = MilkrunExcelImporter(
+                com_client=client,
+                pythoncom_module=FakePythonCom(),
+            )
+
+            result = importer.import_values(
+                source,
+                target,
+                exclude_arrival_date=date(2026, 8, 7),
+                apply_to_target=False,
+            )
+
+            self.assertFalse(result.target_updated)
+            self.assertEqual(result.dispatch_numbers, ("M3370492",))
+            self.assertEqual(result.columns, 15)
+            self.assertEqual(client.dispatch_count, 1)
+            self.assertEqual(len(workbooks.open_calls), 1)
+            self.assertEqual(workbooks.open_calls[0][0], str(source.resolve()))
+            self.assertTrue(workbooks.open_calls[0][1]["ReadOnly"])
+            self.assertEqual(source_book.close_calls, [False])
+            self.assertEqual(excel.quit_count, 1)
+
     def test_reject_open_target_mode_requests_excel_close_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -86,12 +86,14 @@ class TruckExcelImporter(MilkrunExcelImporter):
         target_workbook: str | Path,
         *,
         cancel_requested: Callable[[], bool] | None = None,
+        apply_to_target: bool = True,
     ) -> TruckExcelImportResult:
         result = super().import_values(
             source_file,
             target_workbook,
             cancel_requested=cancel_requested,
             exclude_arrival_date=None,
+            apply_to_target=apply_to_target,
         )
         return cast(TruckExcelImportResult, result)
 
@@ -228,6 +230,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
         dispatch_numbers: tuple[str, ...],
         filtered_rows: int,
         import_metadata: Any,
+        target_updated: bool,
     ) -> TruckExcelImportResult:
         return TruckExcelImportResult(
             source_file=source_file,
@@ -237,6 +240,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
             columns=columns,
             dispatch_numbers=dispatch_numbers,
             filtered_rows=filtered_rows,
+            target_updated=target_updated,
             reservation_metrics=tuple(import_metadata or ()),
         )
 

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 from Modules.Excel import (
     ExcelImportError,
@@ -102,6 +103,39 @@ class _ComClient:
 
 
 class TruckExcelImporterTests(unittest.TestCase):
+    def test_skip_target_update_extracts_truck_metrics_without_excel_com(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            self._write_csv(
+                source,
+                (
+                    self._headers(),
+                    self._row("3370492", "100", "2"),
+                ),
+            )
+            original_target = target.read_bytes()
+            importer = TruckExcelImporter()
+
+            with mock.patch.object(
+                importer,
+                "_load_com_modules",
+                side_effect=AssertionError("Excel COM must not be loaded"),
+            ) as load_com:
+                result = importer.import_values(
+                    source,
+                    target,
+                    apply_to_target=False,
+                )
+
+            load_com.assert_not_called()
+            self.assertFalse(result.target_updated)
+            self.assertEqual(result.dispatch_numbers, ("T3370492",))
+            metric = result.metrics_by_reservation["T3370492"]
+            self.assertEqual(metric.unit_count, Decimal("100"))
+            self.assertEqual(metric.pallet_count, Decimal("2"))
+            self.assertEqual(target.read_bytes(), original_target)
+
     @staticmethod
     def _headers(count: int = 19) -> list[str]:
         headers = [f"열{index}" for index in range(1, max(count, 19) + 1)]

@@ -89,6 +89,31 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_raw_excel_apply_checkbox_is_synchronized_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            settings = QSettings(
+                str(Path(temp) / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            window = MainWindow(smoke_test=True, settings=settings)
+            try:
+                self.assertTrue(window.milkrun_apply_excel_checkbox.isChecked())
+                self.assertTrue(window.truck_apply_excel_checkbox.isChecked())
+
+                window.milkrun_apply_excel_checkbox.setChecked(False)
+
+                self.assertFalse(window.truck_apply_excel_checkbox.isChecked())
+                self.assertFalse(settings.value("apply_raw_to_excel", type=bool))
+            finally:
+                window.close()
+
+            reopened = MainWindow(smoke_test=True, settings=settings)
+            try:
+                self.assertFalse(reopened.milkrun_apply_excel_checkbox.isChecked())
+                self.assertFalse(reopened.truck_apply_excel_checkbox.isChecked())
+            finally:
+                reopened.close()
+
     def test_arrival_tab_has_dashboard_and_requires_raw_before_refresh(self) -> None:
         window = MainWindow(smoke_test=True)
         try:
@@ -1227,6 +1252,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 settings.setValue("milkrun_excel_path", str(workbook))
                 settings.setValue("base_date_mode", "manual")
                 settings.setValue("manual_base_date", "2026-08-08")
+                settings.setValue("apply_raw_to_excel", False)
                 settings.sync()
 
                 window = MainWindow(smoke_test=True, settings=settings)
@@ -1251,6 +1277,9 @@ class MainWindowSmokeTests(unittest.TestCase):
                     self.assertEqual(
                         worker_class.call_args.kwargs["booking_type"],
                         booking_type,
+                    )
+                    self.assertFalse(
+                        worker_class.call_args.kwargs["apply_to_excel"]
                     )
                     fake_worker.start.assert_called_once_with()
                 finally:

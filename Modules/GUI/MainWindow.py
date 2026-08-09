@@ -165,12 +165,14 @@ class MilkrunWorker(QThread):
         target_workbook: Path,
         *,
         booking_type: str = "milkrun",
+        apply_to_excel: bool = True,
     ):
         super().__init__()
         self.request = request
         self.driver_path = driver_path
         self.target_workbook = target_workbook
         self.booking_type = booking_type
+        self.apply_to_excel = apply_to_excel
         self.stop_event = threading.Event()
         self.downloader: MilkrunDownloader | None = None
 
@@ -191,8 +193,13 @@ class MilkrunWorker(QThread):
                     reject_open_target=True,
                 )
             )
-            self.log_updated.emit("연결된 Excel 파일을 확인합니다.")
-            importer.validate_workbook(self.target_workbook)
+            if self.apply_to_excel:
+                self.log_updated.emit("연결된 Excel 파일을 확인합니다.")
+                importer.validate_workbook(self.target_workbook)
+            else:
+                self.log_updated.emit(
+                    f"연결된 Excel의 '{importer.TARGET_SHEET}' 시트 반영을 제외했습니다."
+                )
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
 
@@ -205,12 +212,21 @@ class MilkrunWorker(QThread):
             download_result = self.downloader.run(self.request, keep_browser_open=True)
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
-            self.log_updated.emit("다운로드 데이터를 연결된 Excel 파일에 반영합니다.")
+            if self.apply_to_excel:
+                self.log_updated.emit("다운로드 데이터를 연결된 Excel 파일에 반영합니다.")
+            else:
+                self.log_updated.emit(
+                    "다운로드 데이터를 앱 조회용으로 읽습니다. 연결된 Excel은 변경하지 않습니다."
+                )
+            import_options = {}
+            if not self.apply_to_excel:
+                import_options["apply_to_target"] = False
             if is_truck:
                 import_result = importer.import_values(
                     download_result.file_path,
                     self.target_workbook,
                     cancel_requested=self.stop_event.is_set,
+                    **import_options,
                 )
             else:
                 import_result = importer.import_values(
@@ -218,6 +234,7 @@ class MilkrunWorker(QThread):
                     self.target_workbook,
                     cancel_requested=self.stop_event.is_set,
                     exclude_arrival_date=download_result.start_date,
+                    **import_options,
                 )
             if self.stop_event.is_set():
                 raise AutomationCancelled("사용자가 작업을 중지했습니다.")
@@ -1430,6 +1447,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.close)
 
     def _build_raw_tabs(self) -> QTabWidget:
+        self._raw_excel_apply_checkboxes: list[QCheckBox] = []
+        self._apply_raw_to_excel = self.settings.value(
+            "apply_raw_to_excel",
+            True,
+            type=bool,
+        )
         self.raw_tabs = QTabWidget()
         self.raw_tabs.setObjectName("RawTabs")
         self.raw_tabs.tabBar().setObjectName("SubTabBar")
@@ -1547,6 +1570,16 @@ class MainWindow(QMainWindow):
         outer.addWidget(data_card, 1)
 
         actions = QHBoxLayout()
+        apply_excel_checkbox = QCheckBox("연결된 Excel RAW 시트에 반영")
+        apply_excel_checkbox.setObjectName("ApplyRawToExcelCheckbox")
+        apply_excel_checkbox.setChecked(self._apply_raw_to_excel)
+        apply_excel_checkbox.setToolTip(
+            "체크를 끄면 다운로드·상품 상세·WMS 무게 조회는 진행하지만 "
+            "연결된 Excel의 RAW 시트는 지우거나 저장하지 않습니다."
+        )
+        apply_excel_checkbox.toggled.connect(self._on_apply_raw_to_excel_toggled)
+        self._raw_excel_apply_checkboxes.append(apply_excel_checkbox)
+        actions.addWidget(apply_excel_checkbox)
         actions.addStretch(1)
         get_button = QPushButton("데이터 얻기")
         get_button.setObjectName("PrimaryButton")
@@ -1568,6 +1601,7 @@ class MainWindow(QMainWindow):
             self.truck_search_input = search_input
             self.truck_get_data_button = get_button
             self.truck_stop_button = stop_button
+            self.truck_apply_excel_checkbox = apply_excel_checkbox
         else:
             # Keep the original public attribute names for the Milkrun tests and
             # existing integrations while Truck owns a separate table/state.
@@ -1575,7 +1609,19 @@ class MainWindow(QMainWindow):
             self.milkrun_search_input = search_input
             self.get_data_button = get_button
             self.stop_button = stop_button
+            self.milkrun_apply_excel_checkbox = apply_excel_checkbox
         return page
+
+    def _on_apply_raw_to_excel_toggled(self, checked: bool) -> None:
+        self._apply_raw_to_excel = bool(checked)
+        for checkbox in self._raw_excel_apply_checkboxes:
+            if checkbox.isChecked() == self._apply_raw_to_excel:
+                continue
+            checkbox.blockSignals(True)
+            checkbox.setChecked(self._apply_raw_to_excel)
+            checkbox.blockSignals(False)
+        self.settings.setValue("apply_raw_to_excel", self._apply_raw_to_excel)
+        self.settings.sync()
 
     @staticmethod
     def _placeholder(message: str) -> QWidget:
@@ -2105,7 +2151,14 @@ class MainWindow(QMainWindow):
         self._credential_load_failure = None
         self._weight_finalize_pending = False
         self._pending_full_pipeline_restart = retry_mode == "restart"
-        self.append_log(f"{booking_label} 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
+        apply_to_excel = self._apply_raw_to_excel
+        if apply_to_excel:
+            self.append_log(f"{booking_label} 텍스트 다운로드 및 Excel 반영 작업을 시작합니다.")
+        else:
+            self.append_log(
+                f"{booking_label} 텍스트 다운로드 작업을 시작합니다. "
+                "연결된 Excel RAW 시트 반영은 제외합니다."
+            )
         self.append_log(
             f"조회 기준일: {base_date:%Y-%m-%d} (수동)"
             if base_date is not None
@@ -2118,6 +2171,7 @@ class MainWindow(QMainWindow):
             driver,
             target_workbook,
             booking_type=booking_type,
+            apply_to_excel=apply_to_excel,
         )
         self.milkrun_worker.log_updated.connect(self.append_log)
         self.milkrun_worker.detail_progress.connect(self._on_detail_progress)
@@ -2173,10 +2227,16 @@ class MainWindow(QMainWindow):
                 daily.products,
             )
         self.append_log(f"다운로드 완료: {excel.source_file}")
-        self.append_log(
-            f"Excel 반영 완료: {excel.target_workbook} · {excel.sheet_name}!C1 · "
-            f"{excel.rows}행 × {excel.columns}열"
-        )
+        if getattr(excel, "target_updated", True):
+            self.append_log(
+                f"Excel 반영 완료: {excel.target_workbook} · {excel.sheet_name}!C1 · "
+                f"{excel.rows}행 × {excel.columns}열"
+            )
+        else:
+            self.append_log(
+                "Excel RAW 반영 제외: 연결된 파일은 변경하지 않았습니다. "
+                f"다운로드 데이터 {excel.rows}행 × {excel.columns}열은 앱 조회에만 사용했습니다."
+            )
         if excel.filtered_rows:
             self.append_log(
                 f"입고일이 기준일 전날인 행 {excel.filtered_rows}개를 제외했습니다."
@@ -3574,6 +3634,8 @@ class MainWindow(QMainWindow):
             not working and self.base_date_mode.currentData() == "manual"
         )
         self.arrival_refresh_button.setEnabled(not working)
+        for checkbox in self._raw_excel_apply_checkboxes:
+            checkbox.setEnabled(not working)
         for button in (self.stop_button, self.truck_stop_button):
             button.setVisible(working)
             button.setEnabled(working)

@@ -42,6 +42,7 @@ class MilkrunExcelImportResult:
     columns: int
     dispatch_numbers: tuple[str, ...]
     filtered_rows: int = 0
+    target_updated: bool = True
 
 
 class MilkrunExcelImporter:
@@ -182,6 +183,7 @@ class MilkrunExcelImporter:
         *,
         cancel_requested: Callable[[], bool] | None = None,
         exclude_arrival_date: date | None = None,
+        apply_to_target: bool = True,
     ) -> MilkrunExcelImportResult:
         source_path = self.validate_source_path(source_file)
         target_path = self.validate_target_path(target_workbook)
@@ -189,33 +191,47 @@ class MilkrunExcelImporter:
             raise ExcelImportError("다운로드 파일과 연결된 Excel 파일이 같습니다. 서로 다른 파일을 선택해 주세요.")
         source_kind = self._classify_source(source_path)
 
-        pythoncom, com_client = self._load_com_modules()
+        pythoncom = None
+        com_client = None
+        if apply_to_target or source_kind == "excel":
+            pythoncom, com_client = self._load_com_modules()
         coinitialized = False
         excel = None
         target = None
+        sheet = None
         source_book = None
         owns_excel_instance = False
         owns_target_workbook = False
 
         try:
-            pythoncom.CoInitialize()
-            coinitialized = True
+            if pythoncom is not None:
+                pythoncom.CoInitialize()
+                coinitialized = True
 
-            excel, target, owns_excel_instance, owns_target_workbook = self._open_target_workbook(
-                com_client,
-                target_path,
-            )
-            sheet = self._ensure_target_ready(
-                excel,
-                target,
-                cancel_requested=cancel_requested,
-            )
+            if apply_to_target:
+                excel, target, owns_excel_instance, owns_target_workbook = self._open_target_workbook(
+                    com_client,
+                    target_path,
+                )
+                sheet = self._ensure_target_ready(
+                    excel,
+                    target,
+                    cancel_requested=cancel_requested,
+                )
+            elif source_kind == "excel":
+                excel = com_client.DispatchEx("Excel.Application")
+                owns_excel_instance = True
+                excel.Visible = False
+                excel.DisplayAlerts = False
             self.log(f"다운로드 파일의 값 데이터를 읽습니다: {source_path.name}")
             if source_kind == "text":
                 values = self._read_delimited_values(source_path)
             else:
                 source_book = self._open_source_workbook(excel, source_path)
-                values = self._read_excel_values(source_book)
+                values = self._read_excel_values(
+                    source_book,
+                    enforce_target_width=apply_to_target,
+                )
 
             source_rows = len(values)
             source_columns = max((len(row) for row in values), default=0)
@@ -226,7 +242,7 @@ class MilkrunExcelImporter:
                     f"다운로드 데이터가 안전 처리 한도 {self.MAX_SOURCE_ROWS:,}행을 초과합니다. "
                     "기존 값을 지우지 않았습니다."
                 )
-            if source_columns > self.MAX_COLUMNS:
+            if apply_to_target and source_columns > self.MAX_COLUMNS:
                 raise ExcelImportError(
                     "다운로드 데이터가 대상 범위보다 큽니다. 기존 값을 지우지 않았습니다.\n"
                     f"다운로드: {source_rows}행 × {source_columns}열 / "
@@ -242,7 +258,7 @@ class MilkrunExcelImporter:
 
             rows = len(values)
             columns = max((len(row) for row in values), default=0)
-            if rows > self.MAX_ROWS:
+            if apply_to_target and rows > self.MAX_ROWS:
                 size_description = (
                     "입고일이 기준일 전날인 행을 제외한 데이터"
                     if exclude_arrival_date is not None
@@ -262,6 +278,23 @@ class MilkrunExcelImporter:
                 normalized_values,
                 exclude_arrival_date=exclude_arrival_date,
             )
+            if not apply_to_target:
+                self.log(
+                    f"연결된 Excel의 '{self.TARGET_SHEET}' 시트 반영을 건너뜁니다. "
+                    "다운로드 데이터는 앱 조회에만 사용합니다."
+                )
+                return self._build_import_result(
+                    source_file=source_path,
+                    target_workbook=target_path,
+                    sheet_name=self.TARGET_SHEET,
+                    rows=rows,
+                    columns=columns,
+                    dispatch_numbers=dispatch_numbers,
+                    filtered_rows=filtered_rows,
+                    import_metadata=import_metadata,
+                    target_updated=False,
+                )
+
             clear_range = self._run_excel_com_operation(
                 excel,
                 lambda: sheet.Range(self.CLEAR_RANGE),
@@ -359,6 +392,7 @@ class MilkrunExcelImporter:
                 dispatch_numbers=dispatch_numbers,
                 filtered_rows=filtered_rows,
                 import_metadata=import_metadata,
+                target_updated=True,
             )
         except (ExcelImportCancelled, ExcelImportError):
             raise
@@ -385,7 +419,7 @@ class MilkrunExcelImporter:
             target = None
             excel = None
             gc.collect()
-            if coinitialized:
+            if coinitialized and pythoncom is not None:
                 try:
                     pythoncom.CoUninitialize()
                 except Exception:
@@ -422,6 +456,7 @@ class MilkrunExcelImporter:
         dispatch_numbers: tuple[str, ...],
         filtered_rows: int,
         import_metadata: Any,
+        target_updated: bool,
     ) -> MilkrunExcelImportResult:
         del import_metadata
         return MilkrunExcelImportResult(
@@ -432,6 +467,7 @@ class MilkrunExcelImporter:
             columns=columns,
             dispatch_numbers=dispatch_numbers,
             filtered_rows=filtered_rows,
+            target_updated=target_updated,
         )
 
     def _load_com_modules(self) -> tuple[Any, Any]:
@@ -618,7 +654,12 @@ class MilkrunExcelImporter:
                 except Exception:
                     pass
 
-    def _read_excel_values(self, workbook: Any) -> tuple[tuple[Any, ...], ...]:
+    def _read_excel_values(
+        self,
+        workbook: Any,
+        *,
+        enforce_target_width: bool = True,
+    ) -> tuple[tuple[Any, ...], ...]:
         try:
             sheet = workbook.Worksheets(1)
             used_range = sheet.UsedRange
@@ -630,7 +671,7 @@ class MilkrunExcelImporter:
                     f"안전 처리 한도 {self.MAX_SOURCE_ROWS:,}행을 초과합니다. "
                     "기존 값을 지우지 않았습니다."
                 )
-            if source_columns > self.MAX_COLUMNS:
+            if enforce_target_width and source_columns > self.MAX_COLUMNS:
                 raise ExcelImportError(
                     "다운로드 Excel 파일의 첫 번째 시트 사용 범위가 대상 범위보다 큽니다. "
                     "기존 값을 지우지 않았습니다.\n"
