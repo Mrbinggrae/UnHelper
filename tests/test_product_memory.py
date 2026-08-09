@@ -338,6 +338,31 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertEqual(destination.entries(), before)
         self.assertIsNone(destination.get("300"))
 
+    def test_import_records_can_overwrite_only_user_selected_duplicate_skus(self) -> None:
+        destination = ProductMemory(self.root / "destination-overwrite.json")
+        destination.upsert_measurement("100", "현재 100", "1000", "100", "1")
+        destination.upsert_measurement("200", "현재 200", "900", "100", "1")
+
+        source = ProductMemory(self.root / "source-overwrite.json")
+        source.upsert_measurement("100", "가져온 100", "2000", "150", "1")
+        source.upsert_measurement("200", "가져온 200", "3000", "100", "1")
+        source.upsert_measurement("300", "신규 300", "500", "100", "1")
+
+        summary = destination.import_records(
+            source.entries(),
+            overwrite_sku_ids={"100"},
+        )
+
+        self.assertEqual(
+            (summary.added, summary.overwritten, summary.skipped, summary.total),
+            (1, 1, 1, 3),
+        )
+        self.assertEqual(destination.get("100").product_name, "가져온 100")
+        self.assertEqual(destination.get("100").weight_grams, Decimal("2000"))
+        self.assertEqual(destination.get("200").product_name, "현재 200")
+        self.assertEqual(destination.get("200").weight_grams, Decimal("900"))
+        self.assertEqual(destination.get("300").product_name, "신규 300")
+
     def test_corrupt_cache_can_be_quarantined_and_reset_without_losing_backup(self) -> None:
         path = self.root / "memory.json"
         corrupt_bytes = b'{"type": "broken", "password": "must-stay-local"'

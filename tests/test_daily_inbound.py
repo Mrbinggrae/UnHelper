@@ -125,8 +125,6 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(len(result), 3)
         self.assertEqual(result[0].vendor_name, "주식회사 한티앤에스")
         self.assertEqual(result[1].milkrun_number, "10813478")
-        self.assertEqual(result[0].order_number, "138716974")
-        self.assertEqual(result[1].order_number, "138716975")
         self.assertEqual(result[1].sku_id, "72246115")
         self.assertEqual(result[0].box_count, "504")
         self.assertEqual(result[1].box_count, "216")

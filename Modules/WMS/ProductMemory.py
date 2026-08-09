@@ -70,10 +70,11 @@ class ProductMemoryRecord:
 class ImportSummary:
     added: int
     skipped: int
+    overwritten: int = 0
 
     @property
     def total(self) -> int:
-        return self.added + self.skipped
+        return self.added + self.skipped + self.overwritten
 
 
 def normalize_sku_id(value: Any) -> str:
@@ -653,24 +654,38 @@ class ProductMemory:
     def import_records(
         self,
         records: Iterable[ProductMemoryRecord],
+        *,
+        overwrite_sku_ids: Iterable[Any] = (),
     ) -> ImportSummary:
         validated = tuple(
             _record_from_json(_record_to_json(record), index)
             for index, record in enumerate(records)
         )
+        overwrite = {
+            normalize_sku_id(sku_id)
+            for sku_id in overwrite_sku_ids
+        }
         with self._lock:
             new_records = dict(self._records)
             added = 0
             skipped = 0
+            overwritten = 0
             for record in validated:
                 if record.sku_id in new_records:
-                    skipped += 1
-                    continue
+                    if record.sku_id not in overwrite:
+                        skipped += 1
+                        continue
+                    overwritten += 1
+                else:
+                    added += 1
                 new_records[record.sku_id] = record
-                added += 1
-            if added:
+            if added or overwritten:
                 self._commit(new_records)
-            return ImportSummary(added=added, skipped=skipped)
+            return ImportSummary(
+                added=added,
+                skipped=skipped,
+                overwritten=overwritten,
+            )
 
     def import_payload(self, payload: Mapping[str, Any]) -> ImportSummary:
         return self.import_records(self.validate_payload(payload))

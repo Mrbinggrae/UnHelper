@@ -33,9 +33,9 @@ _PRODUCT_KEYS = frozenset(
         "sku_id",
         "sku_name",
         "dispatch_number",
-        "order_number",
     }
 )
+_LEGACY_PRODUCT_KEYS = _PRODUCT_KEYS | {"order_number"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,16 +79,14 @@ def _product_to_json(product: MilkrunProductRow) -> dict[str, str]:
         "sku_id": str(product.sku_id or ""),
         "sku_name": str(product.sku_name or ""),
         "dispatch_number": str(product.dispatch_number or ""),
-        "order_number": str(product.order_number or ""),
     }
 
 
 def _product_from_json(raw: Any, location: str) -> MilkrunProductRow:
     if not isinstance(raw, dict):
         raise ValueError(f"{location} 행이 객체 형식이 아닙니다.")
-    unexpected = set(raw) - _PRODUCT_KEYS
-    missing = _PRODUCT_KEYS - set(raw)
-    if unexpected or missing:
+    raw_keys = set(raw)
+    if raw_keys not in (_PRODUCT_KEYS, _LEGACY_PRODUCT_KEYS):
         raise ValueError(f"{location} 행의 필드 구성이 올바르지 않습니다.")
     values: dict[str, str] = {}
     for key in _PRODUCT_KEYS:

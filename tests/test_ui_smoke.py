@@ -12,7 +12,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QSettings, QThread
+from PySide6.QtCore import QDate, QPoint, QSettings, QThread
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
@@ -64,11 +64,20 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.get_data_button.text(), "데이터 얻기")
             self.assertEqual(window.raw_table.columnCount(), 10)
             self.assertEqual(window.raw_table.horizontalHeaderItem(0).text(), "거래처 이름")
-            self.assertEqual(window.raw_table.horizontalHeaderItem(1).text(), "발주번호")
+            self.assertEqual(window.raw_table.horizontalHeaderItem(1).text(), "배차번호")
             self.assertEqual(window.raw_table.horizontalHeaderItem(3).text(), "유닛 수")
             self.assertEqual(window.raw_table.horizontalHeaderItem(4).text(), "팔렛트당 유닛")
             self.assertEqual(window.raw_table.horizontalHeaderItem(6).text(), "SKU 명")
             self.assertEqual(window.raw_table.horizontalHeaderItem(9).text(), "분류")
+            page = window.raw_tabs.widget(1)
+            self.assertIs(window.milkrun_search_input.parentWidget().parentWidget(), page)
+            self.assertLess(
+                window.milkrun_search_input.mapTo(
+                    page,
+                    QPoint(0, 0),
+                ).y(),
+                window.raw_table.mapTo(page, QPoint(0, 0)).y(),
+            )
             self.assertFalse(window.raw_table.wordWrap())
         finally:
             window.close()
@@ -194,7 +203,7 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 self.assertEqual(
                     tuple(window.raw_table.item(row, 1).text() for row in range(3)),
-                    ("10813478", "10813478", "10799314"),
+                    ("M3370492", "M3370492", "M3370492"),
                 )
                 self.assertEqual(window.raw_table.rowSpan(0, 0), 2)
                 self.assertEqual(window.raw_table.rowSpan(0, 1), 2)
@@ -712,7 +721,6 @@ class MainWindowSmokeTests(unittest.TestCase):
                 "123",
                 "자동 저장 상품",
                 "M3370492",
-                "138700001",
             )
             result = mock.Mock(
                 booking_type="milkrun",
@@ -737,7 +745,7 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 saved = BookingSnapshotStore(snapshot_path).get(date(2026, 8, 7))
                 self.assertEqual(saved.milkrun_products, (product,))
-                self.assertEqual(window.raw_table.item(0, 1).text(), "138700001")
+                self.assertEqual(window.raw_table.item(0, 1).text(), "M3370492")
                 start_weight.assert_called_once_with(window.current_products)
             finally:
                 window.close()
@@ -851,6 +859,69 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ):
                     window.export_table_snapshot()
                 self.assertTrue(exported.is_file())
+            finally:
+                window.close()
+
+    def test_table_bundle_import_prompts_for_each_duplicate_and_applies_each_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = date(2026, 8, 9)
+            source_store = BookingSnapshotStore(root / "source-snapshots.json")
+            products = (
+                MilkrunProductRow("거래처", "100", "1", "2", "123", "상품 123", "M1"),
+                MilkrunProductRow("거래처", "100", "1", "2", "456", "상품 456", "M1"),
+            )
+            source_store.save_table(selected, "milkrun", products)
+            source_memory = ProductMemory(root / "source-memory.json")
+            source_memory.upsert_measurement("123", "가져온 123", "1500", "200", "1")
+            source_memory.set_manual_category("123", "고단")
+            source_memory.upsert_measurement("456", "가져온 456", "2500", "100", "1")
+            source_memory.set_manual_category("456", "양곡")
+            bundle = root / "shared-duplicates.json"
+            source_store.export_bundle(
+                selected,
+                bundle,
+                source_memory.export_payload({"123", "456"}),
+            )
+
+            destination_memory = root / "destination-memory.json"
+            destination = ProductMemory(destination_memory)
+            destination.upsert_measurement("123", "현재 123", "1000", "100", "1")
+            destination.set_manual_category("123", "양곡")
+            destination.upsert_measurement("456", "현재 456", "900", "100", "1")
+            destination.set_manual_category("456", "고단")
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=destination_memory,
+                snapshot_file=root / "destination-snapshots.json",
+            )
+            try:
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getOpenFileName",
+                        return_value=(str(bundle), ""),
+                    ),
+                    patch.object(
+                        window,
+                        "_ask_duplicate_memory_action",
+                        side_effect=("overwrite", "keep"),
+                    ) as ask_duplicate,
+                    patch.object(QMessageBox, "information") as information,
+                ):
+                    window.import_table_snapshot()
+
+                self.assertEqual(ask_duplicate.call_count, 2)
+                imported = ProductMemory(destination_memory)
+                self.assertEqual(imported.get("123").product_name, "가져온 123")
+                self.assertEqual(imported.get("123").weight_grams, Decimal("1500"))
+                self.assertEqual(imported.get("123").category_override, "고단")
+                self.assertEqual(imported.get("456").product_name, "현재 456")
+                self.assertEqual(imported.get("456").weight_grams, Decimal("900"))
+                self.assertEqual(imported.get("456").category_override, "고단")
+                message = information.call_args.args[2]
+                self.assertIn("덮어쓰기 1개", message)
+                self.assertIn("기존 값 유지 1개", message)
             finally:
                 window.close()
 
@@ -1098,7 +1169,6 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "123",
                     "사과 상품",
                     "M3370492",
-                    "138100001",
                 ),
                 MilkrunProductRow(
                     "거래처 알파",
@@ -1108,7 +1178,6 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "456",
                     "배 상품",
                     "M3370492",
-                    "138100002",
                 ),
                 MilkrunProductRow(
                     "거래처 베타",
@@ -1118,7 +1187,6 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "789",
                     "독립 상품",
                     "M3370493",
-                    "138100003",
                 ),
             )
             window._populate_milkrun_products(milkrun_products)
@@ -1128,11 +1196,10 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertFalse(window.raw_table.isRowHidden(1))
             self.assertTrue(window.raw_table.isRowHidden(2))
 
-            self.assertEqual(window.raw_table.item(0, 1).text(), "138100001")
-            self.assertEqual(window.raw_table.item(1, 1).text(), "138100002")
-            self.assertEqual(window.raw_table.rowSpan(0, 1), 1)
+            self.assertEqual(window.raw_table.item(0, 1).text(), "M3370492")
+            self.assertEqual(window.raw_table.rowSpan(0, 1), 2)
 
-            window.milkrun_search_input.setText("138100003 789")
+            window.milkrun_search_input.setText("M3370493 789")
             self.assertTrue(window.raw_table.isRowHidden(0))
             self.assertTrue(window.raw_table.isRowHidden(1))
             self.assertFalse(window.raw_table.isRowHidden(2))

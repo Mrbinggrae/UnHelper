@@ -972,8 +972,6 @@ class MainWindow(QMainWindow):
         outer.setSpacing(12)
 
         section_row = QHBoxLayout()
-        section_copy = QVBoxLayout()
-        section_copy.setSpacing(1)
         section_title = QLabel("트럭 데이터" if is_truck else "Milkrun 데이터")
         section_title.setObjectName("SectionTitle")
         section_description = QLabel(
@@ -984,21 +982,12 @@ class MainWindow(QMainWindow):
             )
         )
         section_description.setObjectName("SectionDescription")
-        section_copy.addWidget(section_title)
-        section_copy.addWidget(section_description)
-        section_row.addLayout(section_copy)
+        section_row.addWidget(section_title)
         section_row.addStretch(1)
-        outer.addLayout(section_row)
-
-        data_card = QFrame()
-        data_card.setObjectName("DataCard")
-        data_layout = QVBoxLayout(data_card)
-        data_layout.setContentsMargins(0, 0, 0, 0)
-        data_layout.setSpacing(0)
         search_bar = QFrame()
         search_bar.setObjectName("TableSearchBar")
         search_layout = QHBoxLayout(search_bar)
-        search_layout.setContentsMargins(12, 10, 12, 10)
+        search_layout.setContentsMargins(12, 6, 12, 6)
         search_layout.setSpacing(8)
         search_label = QLabel("검색")
         search_label.setObjectName("FieldLabel")
@@ -1008,14 +997,24 @@ class MainWindow(QMainWindow):
         search_input.setPlaceholderText(
             "거래처 이름, 예약번호, SKU ID, SKU 명 검색"
             if is_truck
-            else "거래처 이름, 발주번호, SKU ID, SKU 명 검색"
+            else "거래처 이름, 배차번호, SKU ID, SKU 명 검색"
         )
         search_input.textChanged.connect(
             lambda text, kind=booking_type: self._filter_booking_table(kind, text)
         )
         search_layout.addWidget(search_label)
         search_layout.addWidget(search_input, 1)
-        data_layout.addWidget(search_bar)
+        search_bar.setMinimumWidth(420)
+        search_bar.setMaximumWidth(620)
+        section_row.addWidget(search_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(section_row)
+        outer.addWidget(section_description)
+
+        data_card = QFrame()
+        data_card.setObjectName("DataCard")
+        data_layout = QVBoxLayout(data_card)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.setSpacing(0)
         table = QTableWidget(0, 10)
         table.setObjectName("RawTable")
         table.setHorizontalHeaderLabels(
@@ -1035,7 +1034,7 @@ class MainWindow(QMainWindow):
                 if is_truck
                 else [
                 "거래처 이름",
-                "발주번호",
+                "배차번호",
                 "팔렛트 수",
                 "유닛 수",
                 "팔렛트당 유닛",
@@ -1378,6 +1377,63 @@ class MainWindow(QMainWindow):
             f"{selected_date:%Y-%m-%d} 표를 저장했습니다.\n\n{exported}",
         )
 
+    @staticmethod
+    def _memory_record_description(record: ProductMemoryRecord) -> str:
+        weight = (
+            f"{record.weight_grams}g"
+            if record.weight_grams is not None
+            else "미측정"
+        )
+        category = record.effective_category or "미분류"
+        return (
+            f"상품명: {record.product_name or '-'}\n"
+            f"무게: {weight}\n"
+            f"분류: {category}"
+        )
+
+    def _ask_duplicate_memory_action(
+        self,
+        existing: ProductMemoryRecord,
+        incoming: ProductMemoryRecord,
+        *,
+        index: int,
+        total: int,
+    ) -> str:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("중복 SKU 상품 메모리 확인")
+        dialog.setText(
+            f"SKU {incoming.sku_id}가 이미 저장되어 있습니다. ({index}/{total})\n"
+            "가져온 값으로 덮어쓸까요?"
+        )
+        dialog.setInformativeText(
+            "[현재 저장값]\n"
+            f"{self._memory_record_description(existing)}\n\n"
+            "[가져올 값]\n"
+            f"{self._memory_record_description(incoming)}"
+        )
+        overwrite_button = dialog.addButton(
+            "덮어쓰기",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        keep_button = dialog.addButton(
+            "기존 유지",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        cancel_button = dialog.addButton(
+            "가져오기 취소",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        dialog.setDefaultButton(keep_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is overwrite_button:
+            return "overwrite"
+        if clicked is keep_button:
+            return "keep"
+        return "cancel"
+
     def import_table_snapshot(self) -> None:
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
@@ -1392,8 +1448,29 @@ class MainWindow(QMainWindow):
             records = ProductMemory.validate_payload(product_payload)
             memory = ProductMemory(self.product_memory_file)
             store = BookingSnapshotStore(self.booking_snapshot_file)
+            duplicates = tuple(
+                (existing, record)
+                for record in records
+                if (existing := memory.get(record.sku_id)) is not None
+            )
+            overwrite_sku_ids: set[str] = set()
+            for index, (existing, incoming) in enumerate(duplicates, start=1):
+                action = self._ask_duplicate_memory_action(
+                    existing,
+                    incoming,
+                    index=index,
+                    total=len(duplicates),
+                )
+                if action == "cancel":
+                    self.append_log("RAW 표 가져오기를 사용자가 취소했습니다.")
+                    return
+                if action == "overwrite":
+                    overwrite_sku_ids.add(incoming.sku_id)
             store.save_snapshot(snapshot)
-            summary = memory.import_records(records)
+            summary = memory.import_records(
+                records,
+                overwrite_sku_ids=overwrite_sku_ids,
+            )
             self._set_manual_snapshot_date(snapshot.base_date)
             self._restore_snapshot_for_selected_date(
                 announce=True,
@@ -1410,8 +1487,8 @@ class MainWindow(QMainWindow):
             self,
             "RAW 표 가져오기 완료",
             f"{snapshot.base_date:%Y-%m-%d} 표를 가져왔습니다.\n"
-            f"상품 메모리 추가 {summary.added}개 · 기존 값 유지 {summary.skipped}개\n\n"
-            "기존 SKU 메모리는 덮어쓰지 않았습니다.",
+            f"상품 메모리 추가 {summary.added}개 · "
+            f"덮어쓰기 {summary.overwritten}개 · 기존 값 유지 {summary.skipped}개",
         )
 
     def _start_booking_download(self, booking_type: str) -> None:
@@ -1598,7 +1675,7 @@ class MainWindow(QMainWindow):
         if booking_type == "truck":
             return str(product.dispatch_number or "").strip()
         return normalize_product_name(
-            getattr(product, "order_number", "") or product.milkrun_number
+            product.dispatch_number or product.milkrun_number
         )
 
     def _group_categories_for_booking(self, booking_type: str) -> dict[str, str]:

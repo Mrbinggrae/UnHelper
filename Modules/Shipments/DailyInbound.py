@@ -20,7 +20,6 @@ class MilkrunProductRow:
     sku_id: str
     sku_name: str
     dispatch_number: str = ""
-    order_number: str = ""
 
 
 def normalize_booking_number(value: Any, *, prefix: str) -> str:
@@ -148,12 +147,6 @@ def _clean_vendor_name(value: Any) -> str:
     return _VENDOR_CODE_SUFFIX.sub("", _clean_text(value)).strip()
 
 
-def _clean_order_number(value: Any) -> str:
-    text = _clean_text(value)
-    match = re.search(r"\d{5,20}", text)
-    return match.group(0) if match else text
-
-
 def parse_detail_table_cells(
     rows: Iterable[Sequence[Any]],
     *,
@@ -248,11 +241,9 @@ def parse_detail_table_cells(
         if len(cells) >= 8:
             sku_id = cells[6]
             sku_name = cells[7]
-            order_number = _clean_order_number(cells[4])
         else:
             sku_id = cells[-4]
             sku_name = cells[-3]
-            order_number = _clean_order_number(cells[0])
         unit_count = cells[-1]
         if not sku_id and not sku_name:
             continue
@@ -269,7 +260,6 @@ def parse_detail_table_cells(
                     dispatch_number,
                     prefix=booking_prefix,
                 ),
-                order_number=order_number,
             )
         )
 

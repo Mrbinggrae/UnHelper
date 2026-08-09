@@ -20,7 +20,6 @@ def _product(sku_id: str, dispatch_number: str, *, milkrun_number: str = "100"):
         sku_id=sku_id,
         sku_name=f"상품 / {sku_id}",
         dispatch_number=dispatch_number,
-        order_number=f"138{sku_id}",
     )
 
 
@@ -63,11 +62,20 @@ class BookingSnapshotStoreTests(unittest.TestCase):
                 source_memory.export_payload({"123"}),
             )
 
+            # v0.1.14 briefly stored an order_number field. New versions read
+            # and discard it so existing local/share files remain usable.
+            legacy_payload = json.loads(bundle.read_text(encoding="utf-8"))
+            legacy_payload["snapshot"]["tables"]["milkrun"][0]["order_number"] = "138123"
+            bundle.write_text(
+                json.dumps(legacy_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
             snapshot, payload = BookingSnapshotStore.read_bundle(bundle)
             records = ProductMemory.validate_payload(payload)
             self.assertEqual(snapshot.base_date, selected)
             self.assertEqual(snapshot.milkrun_products[0].milkrun_number, "10/20")
-            self.assertEqual(snapshot.milkrun_products[0].order_number, "138123")
+            self.assertFalse(hasattr(snapshot.milkrun_products[0], "order_number"))
             self.assertEqual([record.sku_id for record in records], ["123"])
 
             destination = ProductMemory(root / "destination-memory.json")
