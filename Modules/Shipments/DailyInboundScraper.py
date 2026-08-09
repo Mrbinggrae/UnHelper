@@ -44,6 +44,10 @@ class DailyInboundError(RuntimeError):
         self.failure_url = failure_url
 
 
+class EmptyDailyInboundDetail(DailyInboundError):
+    """A matched booking has no product rows and may be skipped safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class DailyInboundProfile:
     """Source-specific rules for exact daily-schedule card matching."""
@@ -86,6 +90,7 @@ class DailyInboundResult:
     requested_dispatches: tuple[str, ...]
     matched_dispatches: tuple[str, ...]
     unmatched_dispatches: tuple[str, ...]
+    empty_detail_dispatches: tuple[str, ...] = ()
 
 
 class DailyInboundScraper:
@@ -127,6 +132,7 @@ class DailyInboundScraper:
         products: list[MilkrunProductRow] = []
         matched: list[str] = []
         unmatched: list[str] = []
+        empty_details: list[str] = []
         seen_products: set[MilkrunProductRow] = set()
 
         for dispatch_number in requested:
@@ -154,6 +160,14 @@ class DailyInboundScraper:
                     )
                 try:
                     rows = self._open_detail_and_read(cards[match_index], dispatch_number)
+                except EmptyDailyInboundDetail:
+                    if dispatch_number not in empty_details:
+                        empty_details.append(dispatch_number)
+                    self.log(
+                        f"{self.profile.number_label} {dispatch_number} 상세에 상품 데이터가 없어 "
+                        "건너뛰고 다음 예약을 조회합니다."
+                    )
+                    continue
                 except Exception as exc:
                     if self.browser.stop_event.is_set():
                         raise
@@ -171,7 +185,7 @@ class DailyInboundScraper:
                         seen_products.add(row)
                         products.append(row)
 
-        if not products:
+        if not products and not empty_details:
             missing = ", ".join(unmatched or requested)
             raise DailyInboundError(
                 "기준일 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
@@ -179,11 +193,17 @@ class DailyInboundScraper:
             )
 
         self.log(f"일별 입고 상세 {len(products)}개 상품을 수집했습니다.")
+        if empty_details:
+            self.log(
+                "상품 데이터가 없는 상세 예약을 건너뛰었습니다: "
+                + ", ".join(empty_details)
+            )
         return DailyInboundResult(
             products=tuple(products),
             requested_dispatches=requested,
             matched_dispatches=tuple(matched),
             unmatched_dispatches=tuple(unmatched),
+            empty_detail_dispatches=tuple(empty_details),
         )
 
     def _unique_dispatches(self, values: Iterable[str]) -> tuple[str, ...]:
@@ -707,6 +727,8 @@ class DailyInboundScraper:
             if not products:
                 raise DailyInboundError("예약 상세 표의 SKU 열을 읽지 못했습니다. 사이트 표 구조를 확인해 주세요.")
             return products
+        except EmptyDailyInboundDetail:
+            raise
         except Exception as exc:
             if not self.browser.stop_event.is_set() and self.evidence_dir is not None:
                 failure_url = self._safe_current_url()
@@ -762,7 +784,7 @@ class DailyInboundScraper:
                     if stable_count >= 3:
                         return rows
                 elif self._has_no_result_message():
-                    raise DailyInboundError("예약 상세 페이지에 상품 데이터가 없습니다.")
+                    raise EmptyDailyInboundDetail("예약 상세 페이지에 상품 데이터가 없습니다.")
             self.browser.stop_event.wait(0.4)
         raise TimeoutException("예약 상세 상품 표를 90초 안에 읽지 못했습니다.")
 

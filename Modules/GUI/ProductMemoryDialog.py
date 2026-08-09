@@ -41,7 +41,7 @@ class ProductMemoryDialog(QDialog):
 
     memory_changed = Signal()
 
-    FILTERS = ("전체", "경량", "중량", "고단", "미분류")
+    FILTERS = ("전체", "경량", "중량", "고단", "양곡", "미분류")
 
     def __init__(self, memory: ProductMemory, parent=None):
         super().__init__(parent)

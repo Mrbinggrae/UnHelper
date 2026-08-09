@@ -144,10 +144,10 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 first_button.click()
 
-                self.assertEqual(first_button.text(), "경량")
+                self.assertEqual(first_button.text(), "양곡")
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("123").category_override,
-                    None,
+                    "양곡",
                 )
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("456").category_override,
@@ -216,10 +216,10 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 first_button.click()
 
-                self.assertEqual(first_button.text(), "경량")
+                self.assertEqual(first_button.text(), "양곡")
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("123").category_override,
-                    None,
+                    "양곡",
                 )
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("456").category_override,
@@ -227,7 +227,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 )
 
                 window._refresh_current_product_memory()
-                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "경량")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "양곡")
 
                 window._populate_milkrun_products((products[0],))
                 self.assertEqual(window._milkrun_group_categories, {})
@@ -836,6 +836,85 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_raw_search_filters_supported_fields_and_keeps_vehicle_group_visible(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            milkrun_products = (
+                MilkrunProductRow(
+                    "거래처 알파",
+                    "10807763",
+                    "1",
+                    "10",
+                    "123",
+                    "사과 상품",
+                    "M3370492",
+                ),
+                MilkrunProductRow(
+                    "거래처 알파",
+                    "10807763",
+                    "1",
+                    "20",
+                    "456",
+                    "배 상품",
+                    "M3370492",
+                ),
+                MilkrunProductRow(
+                    "거래처 베타",
+                    "10808888",
+                    "1",
+                    "30",
+                    "789",
+                    "독립 상품",
+                    "M3370493",
+                ),
+            )
+            window._populate_milkrun_products(milkrun_products)
+
+            window.milkrun_search_input.setText("배 상품")
+            self.assertFalse(window.raw_table.isRowHidden(0))
+            self.assertFalse(window.raw_table.isRowHidden(1))
+            self.assertTrue(window.raw_table.isRowHidden(2))
+
+            window.milkrun_search_input.setText("10808888 789")
+            self.assertTrue(window.raw_table.isRowHidden(0))
+            self.assertTrue(window.raw_table.isRowHidden(1))
+            self.assertFalse(window.raw_table.isRowHidden(2))
+
+            truck_products = (
+                MilkrunProductRow(
+                    "트럭 거래처",
+                    "PALLET_1",
+                    "1",
+                    "10",
+                    "1001",
+                    "트럭 상품 A",
+                    "T3372829",
+                ),
+                MilkrunProductRow(
+                    "다른 거래처",
+                    "PALLET_2",
+                    "1",
+                    "20",
+                    "1002",
+                    "트럭 상품 B",
+                    "T3372830",
+                ),
+            )
+            window._populate_truck_products(truck_products)
+            window.truck_search_input.setText("T3372830")
+            self.assertTrue(window.truck_table.isRowHidden(0))
+            self.assertFalse(window.truck_table.isRowHidden(1))
+
+            window.milkrun_search_input.clear()
+            self.assertTrue(
+                all(
+                    not window.raw_table.isRowHidden(row)
+                    for row in range(window.raw_table.rowCount())
+                )
+            )
+        finally:
+            window.close()
+
     def test_same_cached_weight_is_classified_per_row_pallet_ratio_and_high_stays_manual(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
@@ -955,6 +1034,18 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("123").category_override,
                     "고단",
+                )
+
+                window.raw_table.cellWidget(0, 9).click()
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "양곡")
+                self.assertEqual(window.raw_table.cellWidget(1, 9).text(), "양곡")
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "양곡",
+                )
+                self.assertIn(
+                    "이후 데이터 조회에서도 유지",
+                    window.raw_table.cellWidget(0, 9).toolTip(),
                 )
 
                 window.raw_table.cellWidget(0, 9).click()
@@ -1107,6 +1198,21 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(dialog.table.item(0, 2).text(), "1000")
                 self.assertEqual(dialog.table.item(0, 3).text(), "미분류")
                 self.assertEqual(dialog.table.item(0, 4).text(), "무게만")
+            finally:
+                dialog.close()
+
+    def test_product_memory_dialog_filters_grain_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = ProductMemory(Path(temp) / "memory.json")
+            memory.set_manual_category("123", "양곡", "양곡 상품")
+            memory.set_manual_category("456", "고단", "고단 상품")
+            dialog = ProductMemoryDialog(memory)
+            try:
+                self.assertIn("양곡", dialog.FILTERS)
+                dialog.filter_combo.setCurrentText("양곡")
+                self.assertEqual(dialog.table.rowCount(), 1)
+                self.assertEqual(dialog.table.item(0, 0).text(), "123")
+                self.assertEqual(dialog.table.item(0, 3).text(), "양곡")
             finally:
                 dialog.close()
 

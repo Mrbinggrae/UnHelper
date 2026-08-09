@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from Modules.WMS.ProductMemory import (
+    GRAIN_CATEGORY,
     HEAVY_CATEGORY,
     HIGH_CATEGORY,
     LIGHT_CATEGORY,
@@ -143,6 +144,24 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertEqual(recalculated.automatic_category, LIGHT_CATEGORY)
         self.assertEqual(recalculated.category_override, HIGH_CATEGORY)
 
+    def test_grain_override_uses_the_same_persistent_process_as_high(self) -> None:
+        memory = ProductMemory(self.root / "memory.json")
+        memory.upsert_measurement("123", "양곡 상품", "1000", "300", "1")
+        memory.set_manual_category("123", GRAIN_CATEGORY)
+
+        recalculated = memory.update_calculation("123", "2", "1")
+        refreshed = memory.upsert_weight("123", "양곡/ 상품", "1000")
+
+        self.assertEqual(recalculated.automatic_category, LIGHT_CATEGORY)
+        self.assertEqual(recalculated.category_override, GRAIN_CATEGORY)
+        self.assertEqual(refreshed.category_override, GRAIN_CATEGORY)
+        self.assertEqual(refreshed.effective_category, GRAIN_CATEGORY)
+
+        exported = memory.export_to(self.root / "grain.json")
+        restored = ProductMemory(exported).get("123")
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.category_override, GRAIN_CATEGORY)
+
     def test_cached_weight_recalculation_clears_light_or_heavy_manual_override(self) -> None:
         memory = ProductMemory(self.root / "memory.json")
         memory.upsert_measurement("123", "상품", "1000", "300", "1")
@@ -156,7 +175,7 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertIsNone(recalculated.category_override)
         self.assertEqual(recalculated.effective_category, LIGHT_CATEGORY)
 
-    def test_new_measurement_and_weight_refresh_keep_only_high_manual_override(self) -> None:
+    def test_new_measurement_and_weight_refresh_keep_persistent_manual_override(self) -> None:
         memory = ProductMemory(self.root / "memory.json")
         memory.set_manual_category("123", LIGHT_CATEGORY, "상품")
 

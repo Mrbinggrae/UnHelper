@@ -1,4 +1,5 @@
 from .ProductMemory import (
+    GRAIN_CATEGORY,
     HEAVY_CATEGORY,
     HIGH_CATEGORY,
     LIGHT_CATEGORY,
@@ -11,6 +12,7 @@ from .ProductWeightCrawler import ProductWeightCrawler, ProductWeightLookup, WMS
 from .ProductWeightWorker import ProductWeightSummary, ProductWeightWorker, SkuWeightFailure
 
 __all__ = [
+    "GRAIN_CATEGORY",
     "HEAVY_CATEGORY",
     "HIGH_CATEGORY",
     "LIGHT_CATEGORY",

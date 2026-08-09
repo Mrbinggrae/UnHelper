@@ -348,6 +348,15 @@ QPushButton#CategoryButton[classification="고단"]:hover {
     background: #3B2765;
     border-color: #A78BFA;
 }
+QPushButton#CategoryButton[classification="양곡"] {
+    background: #303317;
+    border-color: #78822B;
+    color: #ECFCCB;
+}
+QPushButton#CategoryButton[classification="양곡"]:hover {
+    background: #444A1E;
+    border-color: #A3B83C;
+}
 QPushButton#CategoryButton[classification="?"] {
     background: #263241;
     border-color: #53657A;
@@ -377,6 +386,13 @@ QLineEdit:read-only {
 }
 QLineEdit::placeholder {
     color: #64748B;
+}
+QFrame#TableSearchBar {
+    background: #111821;
+    border-bottom: 1px solid #253244;
+}
+QLineEdit#TableSearchInput {
+    min-height: 32px;
 }
 QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;

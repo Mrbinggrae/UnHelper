@@ -22,6 +22,7 @@ from Modules.Shipments.DailyInboundScraper import (
     TRUCK_DAILY_INBOUND_PROFILE,
     DailyInboundError,
     DailyInboundScraper,
+    EmptyDailyInboundDetail,
 )
 from Modules.Shipments.MilkrunDownloader import (
     AutomationCancelled,
@@ -102,6 +103,62 @@ class _StubScraper(DailyInboundScraper):
 
 
 class DailyInboundScraperTests(unittest.TestCase):
+    def test_empty_detail_is_skipped_and_later_dispatches_continue(self) -> None:
+        class PartiallyEmptyScraper(_StubScraper):
+            def _matching_slots(self, dispatch_number: str):
+                return [object()]
+
+            def _open_detail_and_read(self, card, dispatch_number: str):
+                if dispatch_number == "M3367934":
+                    raise EmptyDailyInboundDetail(
+                        "예약 상세 페이지에 상품 데이터가 없습니다."
+                    )
+                return (
+                    MilkrunProductRow(
+                        "거래처",
+                        "10807763",
+                        "1",
+                        "10",
+                        "123",
+                        "상품",
+                        dispatch_number,
+                    ),
+                )
+
+        browser = _Browser()
+        scraper = PartiallyEmptyScraper(browser)
+
+        result = scraper.run(
+            ("M3367934", "M3370492"),
+            center_name="안산2",
+            schedule_date=date(2026, 8, 7),
+        )
+
+        self.assertEqual(len(result.products), 1)
+        self.assertEqual(result.products[0].dispatch_number, "M3370492")
+        self.assertEqual(result.empty_detail_dispatches, ("M3367934",))
+        self.assertIn("건너뛰고 다음 예약", "\n".join(browser.log_messages))
+
+    def test_all_empty_details_complete_without_automation_failure(self) -> None:
+        class EmptyScraper(_StubScraper):
+            def _matching_slots(self, dispatch_number: str):
+                return [object()]
+
+            def _open_detail_and_read(self, card, dispatch_number: str):
+                raise EmptyDailyInboundDetail(
+                    "예약 상세 페이지에 상품 데이터가 없습니다."
+                )
+
+        result = EmptyScraper(_Browser()).run(
+            ("M3367934",),
+            center_name="안산2",
+            schedule_date=date(2026, 8, 7),
+        )
+
+        self.assertEqual(result.products, ())
+        self.assertEqual(result.matched_dispatches, ("M3367934",))
+        self.assertEqual(result.empty_detail_dispatches, ("M3367934",))
+
     def test_stale_unrelated_card_does_not_discard_an_exact_match(self) -> None:
         browser = _Browser(
             (_Card(stale=True), _Card("M3370492"), _Card("T3370492"), _Card("3370492"))

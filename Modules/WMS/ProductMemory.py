@@ -22,8 +22,12 @@ MAX_ENTRIES = 100_000
 LIGHT_CATEGORY = "경량"
 HEAVY_CATEGORY = "중량"
 HIGH_CATEGORY = "고단"
+GRAIN_CATEGORY = "양곡"
 AUTOMATIC_CATEGORIES = frozenset({LIGHT_CATEGORY, HEAVY_CATEGORY})
-MANUAL_CATEGORIES = frozenset({LIGHT_CATEGORY, HEAVY_CATEGORY, HIGH_CATEGORY})
+PERSISTENT_MANUAL_CATEGORIES = frozenset({HIGH_CATEGORY, GRAIN_CATEGORY})
+MANUAL_CATEGORIES = frozenset(
+    {LIGHT_CATEGORY, HEAVY_CATEGORY, HIGH_CATEGORY, GRAIN_CATEGORY}
+)
 HEAVY_THRESHOLD_KG = Decimal("280")
 CALCULATION_PRECISION = 50
 
@@ -174,7 +178,7 @@ def _validated_override(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or value not in MANUAL_CATEGORIES:
-        raise ValueError("수동 분류는 경량, 중량, 고단 또는 None이어야 합니다.")
+        raise ValueError("수동 분류는 경량, 중량, 고단, 양곡 또는 None이어야 합니다.")
     return value
 
 
@@ -182,8 +186,11 @@ def _override_after_automatic_recalculation(
     previous: ProductMemoryRecord | None,
 ) -> str | None:
     """Keep only the user classification that must survive new pallet inputs."""
-    if previous is not None and previous.category_override == HIGH_CATEGORY:
-        return HIGH_CATEGORY
+    if (
+        previous is not None
+        and previous.category_override in PERSISTENT_MANUAL_CATEGORIES
+    ):
+        return previous.category_override
     return None
 
 

@@ -71,7 +71,10 @@ from Modules.Shipments.DailyInboundScraper import (
 )
 from Modules.WMS.ProductMemory import (
     AUTOMATIC_CATEGORIES,
+    GRAIN_CATEGORY,
+    HIGH_CATEGORY,
     MANUAL_CATEGORIES,
+    PERSISTENT_MANUAL_CATEGORIES,
     ProductMemory,
     ProductMemoryRecord,
     calculate_boxes_per_pallet,
@@ -944,6 +947,27 @@ class MainWindow(QMainWindow):
         data_layout = QVBoxLayout(data_card)
         data_layout.setContentsMargins(0, 0, 0, 0)
         data_layout.setSpacing(0)
+        search_bar = QFrame()
+        search_bar.setObjectName("TableSearchBar")
+        search_layout = QHBoxLayout(search_bar)
+        search_layout.setContentsMargins(12, 10, 12, 10)
+        search_layout.setSpacing(8)
+        search_label = QLabel("검색")
+        search_label.setObjectName("FieldLabel")
+        search_input = QLineEdit()
+        search_input.setObjectName("TableSearchInput")
+        search_input.setClearButtonEnabled(True)
+        search_input.setPlaceholderText(
+            "거래처 이름, 예약번호, SKU ID, SKU 명 검색"
+            if is_truck
+            else "거래처 이름, 밀크런 번호, SKU ID, SKU 명 검색"
+        )
+        search_input.textChanged.connect(
+            lambda text, kind=booking_type: self._filter_booking_table(kind, text)
+        )
+        search_layout.addWidget(search_label)
+        search_layout.addWidget(search_input, 1)
+        data_layout.addWidget(search_bar)
         table = QTableWidget(0, 10)
         table.setObjectName("RawTable")
         table.setHorizontalHeaderLabels(
@@ -1013,12 +1037,14 @@ class MainWindow(QMainWindow):
 
         if is_truck:
             self.truck_table = table
+            self.truck_search_input = search_input
             self.truck_get_data_button = get_button
             self.truck_stop_button = stop_button
         else:
             # Keep the original public attribute names for the Milkrun tests and
             # existing integrations while Truck owns a separate table/state.
             self.raw_table = table
+            self.milkrun_search_input = search_input
             self.get_data_button = get_button
             self.stop_button = stop_button
         return page
@@ -1246,6 +1272,12 @@ class MainWindow(QMainWindow):
                 f"기준일 카드에서 찾지 못한 {number_label}: "
                 + ", ".join(daily.unmatched_dispatches)
             )
+        empty_details = getattr(daily, "empty_detail_dispatches", ())
+        if empty_details:
+            number_label = "예약번호" if booking_type == "truck" else "배차번호"
+            self.append_log(
+                f"상품 데이터가 없어 건너뛴 {number_label}: " + ", ".join(empty_details)
+            )
         self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
         self._start_weight_lookup(self.current_products)
 
@@ -1471,6 +1503,54 @@ class MainWindow(QMainWindow):
             table.setSpan(first_row, 1, len(rows), 1)
 
         self._apply_group_row_tint(table, visual_multi_sku_groups)
+        search_input = self._search_input_for_booking(booking_type)
+        self._filter_booking_table(booking_type, search_input.text())
+
+    def _search_input_for_booking(self, booking_type: str) -> QLineEdit:
+        return (
+            self.truck_search_input
+            if booking_type == "truck"
+            else self.milkrun_search_input
+        )
+
+    def _filter_booking_table(self, booking_type: str, query: str) -> None:
+        table = self._table_for_booking(booking_type)
+        products = self._products_by_booking.get(booking_type, ())
+        tokens = tuple(normalize_product_name(query).casefold().split())
+        if not tokens:
+            for row_index in range(table.rowCount()):
+                table.setRowHidden(row_index, False)
+            return
+
+        visible_rows: set[int] = set()
+        for row_index, product in enumerate(products):
+            booking_number = (
+                product.dispatch_number
+                if booking_type == "truck"
+                else product.milkrun_number
+            )
+            searchable = normalize_product_name(
+                " ".join(
+                    (
+                        str(product.vendor_name or ""),
+                        str(booking_number or ""),
+                        str(product.sku_id or ""),
+                        str(product.sku_name or ""),
+                    )
+                )
+            ).casefold()
+            if all(token in searchable for token in tokens):
+                visible_rows.add(row_index)
+
+        # Vehicle identity cells are merged for multi-SKU groups. If one SKU
+        # matches, keep the entire group visible so those spans stay valid and
+        # the result still reads as one vehicle.
+        for rows in self._visual_multi_sku_groups(products, booking_type).values():
+            if visible_rows.intersection(rows):
+                visible_rows.update(rows)
+
+        for row_index in range(table.rowCount()):
+            table.setRowHidden(row_index, row_index not in visible_rows)
 
     def _start_weight_lookup(self, products) -> None:
         if self.weight_worker and self.weight_worker.isRunning():
@@ -1790,6 +1870,15 @@ class MainWindow(QMainWindow):
             if self.current_pipeline_result is not None
             else ()
         )
+        empty_details = (
+            getattr(
+                self.current_pipeline_result.daily_inbound,
+                "empty_detail_dispatches",
+                (),
+            )
+            if self.current_pipeline_result is not None
+            else ()
+        )
         if manual_groups:
             self.status_label.setText(
                 f"완료 · 상품 {product_count}개 · 수동 분류 필요 {len(manual_groups)}건"
@@ -1822,6 +1911,12 @@ class MainWindow(QMainWindow):
             )
         if unmatched:
             message += f"\n\n기준일 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
+        if empty_details:
+            message += (
+                f"\n\n상품 데이터가 없어 건너뛴 {number_label}: "
+                + ", ".join(empty_details)
+            )
+        if unmatched or empty_details:
             QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
         elif manual_groups:
             QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
@@ -1871,6 +1966,8 @@ class MainWindow(QMainWindow):
                 next_category = "중량"
             elif override == "중량":
                 next_category = "고단"
+            elif override == HIGH_CATEGORY:
+                next_category = GRAIN_CATEGORY
             else:
                 next_category = None
             updated = memory.set_manual_category(sku_id, next_category, product_name)
@@ -1910,6 +2007,8 @@ class MainWindow(QMainWindow):
             next_category = "중량"
         elif current == "중량":
             next_category = "고단"
+        elif current == HIGH_CATEGORY:
+            next_category = GRAIN_CATEGORY
         else:
             next_category = None
 
@@ -2039,8 +2138,8 @@ class MainWindow(QMainWindow):
         button.setEnabled(enabled)
         if error_text:
             tooltip = f"팔렛트 무게 계산 오류: {error_text}\n클릭해 수동 분류할 수 있습니다."
-        elif manual and display == "고단":
-            tooltip = "고단 수동 분류입니다. 이후 데이터 조회에서도 유지됩니다."
+        elif manual and display in PERSISTENT_MANUAL_CATEGORIES:
+            tooltip = f"{display} 수동 분류입니다. 이후 데이터 조회에서도 유지됩니다."
         elif manual:
             tooltip = (
                 "현재 표시의 수동 분류입니다. 다음 데이터 조회에서는 "
