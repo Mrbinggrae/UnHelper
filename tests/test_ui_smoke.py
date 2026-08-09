@@ -12,7 +12,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QPoint, QSettings, QThread
+from PySide6.QtCore import QDate, QPoint, QSettings, QThread, Qt
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QScrollArea
 
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
@@ -122,8 +122,15 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertIsNotNone(window.findChild(QScrollArea, "ArrivalScroll"))
             self.assertEqual(
                 window.arrival_breakdown_tables["outside_waiting"].columnCount(),
-                6,
+                4,
             )
+            summary_table = window.arrival_summary_tables["outside_waiting"]
+            breakdown_table = window.arrival_breakdown_tables["outside_waiting"]
+            for table in (summary_table, breakdown_table):
+                self.assertGreaterEqual(table.minimumHeight(), 122)
+                self.assertGreaterEqual(table.verticalHeader().minimumSectionSize(), 30)
+            self.assertGreaterEqual(summary_table.horizontalHeader().height(), 30)
+            self.assertTrue(breakdown_table.horizontalHeader().isHidden())
             self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
                 "합계",
@@ -148,11 +155,31 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertFalse(hasattr(window, "arrival_detail_table"))
             self.assertGreaterEqual(
                 window.arrival_summary_tables["outside_waiting"].width(),
-                320,
+                240,
             )
             self.assertGreaterEqual(
                 window.arrival_breakdown_tables["outside_waiting"].width(),
-                470,
+                240,
+            )
+            outside = window.arrival_summary_tables["outside_waiting"]
+            departure = window.arrival_summary_tables["departure"]
+            floor_targets = window.arrival_summary_tables["floor_targets"]
+            arrival_page = window.findChild(QScrollArea, "ArrivalScroll").widget()
+            outside_pos = outside.mapTo(arrival_page, QPoint(0, 0))
+            departure_pos = departure.mapTo(arrival_page, QPoint(0, 0))
+            floor_pos = floor_targets.mapTo(arrival_page, QPoint(0, 0))
+            self.assertEqual(outside_pos.y(), departure_pos.y())
+            self.assertEqual(departure_pos.y(), floor_pos.y())
+            self.assertLess(outside_pos.x(), departure_pos.x())
+            self.assertLess(departure_pos.x(), floor_pos.x())
+            arrival_scroll = window.findChild(QScrollArea, "ArrivalScroll")
+            self.assertEqual(
+                arrival_scroll.horizontalScrollBarPolicy(),
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+            )
+            self.assertEqual(
+                arrival_scroll.verticalScrollBarPolicy(),
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded,
             )
         finally:
             window.close()
@@ -228,20 +255,24 @@ class MainWindowSmokeTests(unittest.TestCase):
                 "10",
             )
             self.assertEqual(
-                window.arrival_breakdown_tables["departure"].item(0, 0).text(),
-                "3",
-            )
-            self.assertEqual(
                 window.arrival_breakdown_tables["departure"].item(0, 1).text(),
                 "3",
             )
             self.assertEqual(
-                window.arrival_breakdown_tables["outside_waiting"].item(2, 0).text(),
+                window.arrival_breakdown_tables["departure"].item(0, 0).text(),
+                "1F 총",
+            )
+            self.assertEqual(
+                window.arrival_breakdown_tables["outside_waiting"].item(0, 3).text(),
                 "8",
             )
-            self.assertEqual(window.arrival_floor_table.item(1, 0).text(), "3")
             self.assertEqual(window.arrival_floor_table.item(1, 1).text(), "3")
-            self.assertEqual(window.arrival_floor_table.item(2, 0).text(), "3")
+            self.assertEqual(window.arrival_floor_table.item(1, 3).text(), "3")
+            self.assertEqual(window.arrival_floor_table.item(0, 3).text(), "3")
+            self.assertEqual(
+                window.arrival_breakdown_tables["outside_waiting"].item(0, 2).text(),
+                "전일 총",
+            )
         finally:
             window.close()
 

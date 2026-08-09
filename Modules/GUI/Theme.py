@@ -220,7 +220,7 @@ QTableWidget#ArrivalSummaryTable {
     font-size: 10pt;
 }
 QTableWidget#ArrivalSummaryTable::item {
-    padding: 4px 7px;
+    padding: 2px 7px;
     font-weight: 700;
 }
 QLabel#ArrivalBreakdownTitle {
@@ -237,7 +237,7 @@ QTableWidget#ArrivalBreakdownTable {
     font-size: 10pt;
 }
 QTableWidget#ArrivalBreakdownTable::item {
-    padding: 3px 5px;
+    padding: 2px 5px;
     font-weight: 650;
 }
 QTableWidget#ArrivalFloorTable {
