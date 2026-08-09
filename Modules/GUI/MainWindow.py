@@ -4,7 +4,7 @@ import json
 import threading
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QSettings, QThread, QTimer, Qt, QUrl, Signal
@@ -62,6 +62,12 @@ from Modules.Excel.TruckExcelImporter import (
     TruckExcelImportResult,
     TruckExcelImporter,
 )
+from Modules.Excel.ArrivalSequenceReader import (
+    ArrivalSequenceReader,
+    ArrivalSequenceSnapshot,
+    RawBookingAggregate,
+    build_arrival_vehicles,
+)
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
 from Modules.GUI.Theme import COLORS
@@ -80,6 +86,7 @@ from Modules.Shipments.DailyInboundScraper import (
     DailyInboundScraper,
     TRUCK_DAILY_INBOUND_PROFILE,
 )
+from Modules.Shipments.DailyInbound import normalize_booking_number
 from Modules.WMS.ProductMemory import (
     AUTOMATIC_CATEGORIES,
     GRAIN_CATEGORY,
@@ -106,6 +113,36 @@ class MilkrunPipelineResult:
     daily_inbound: DailyInboundResult
     booking_type: str = "milkrun"
     base_date: date | None = None
+
+
+class ArrivalSequenceWorker(QThread):
+    log_updated = Signal(str)
+    completed = Signal(object)
+    failed = Signal(object)
+    cancelled = Signal(str)
+
+    def __init__(self, workbook_path: Path):
+        super().__init__()
+        self.workbook_path = workbook_path
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        try:
+            reader = ArrivalSequenceReader(log=self.log_updated.emit)
+            result = reader.read(
+                self.workbook_path,
+                cancel_requested=self.stop_event.is_set,
+            )
+            if self.stop_event.is_set():
+                raise ExcelImportCancelled("사용자가 입차순번 새로고침을 중지했습니다.")
+            self.completed.emit(result)
+        except ExcelImportCancelled as exc:
+            self.cancelled.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(FailureDetails.from_exception(exc))
+
+    def request_cancel(self) -> None:
+        self.stop_event.set()
 
 
 class MilkrunWorker(QThread):
@@ -771,6 +808,9 @@ class MainWindow(QMainWindow):
         self._base_date_load_error = ""
         self.milkrun_worker: MilkrunWorker | None = None
         self.weight_worker: ProductWeightWorker | None = None
+        self.arrival_worker: ArrivalSequenceWorker | None = None
+        self._arrival_snapshot: ArrivalSequenceSnapshot | None = None
+        self._arrival_auto_refreshed = False
         self.product_memory_file = (
             Path(product_memory_file) if product_memory_file else product_memory_path()
         )
@@ -889,6 +929,7 @@ class MainWindow(QMainWindow):
         self.main_tabs.addTab(self._build_arrival_tabs(), "입차순번")
         self.main_tabs.addTab(self._build_raw_tabs(), "RAW")
         self.main_tabs.setCurrentIndex(1)
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
         layout.addWidget(self.main_tabs, 1)
 
         footer = QFrame()
@@ -958,13 +999,400 @@ class MainWindow(QMainWindow):
             self.settings.setValue("log_expanded", expanded)
             self.settings.sync()
 
-    def _build_arrival_tabs(self) -> QTabWidget:
-        tabs = QTabWidget()
-        tabs.setObjectName("ArrivalTabs")
-        tabs.tabBar().setObjectName("SubTabBar")
-        tabs.addTab(self._placeholder("입차순번 트럭 기능은 다음 단계에서 연결됩니다."), "트럭")
-        tabs.addTab(self._placeholder("입차순번 Milkrun 기능은 다음 단계에서 연결됩니다."), "Milkrun")
-        return tabs
+    def _build_arrival_tabs(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("Page")
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(28, 16, 28, 18)
+        outer.setSpacing(14)
+
+        header = QHBoxLayout()
+        heading_column = QVBoxLayout()
+        heading_column.setSpacing(2)
+        title = QLabel("입차순번 현황")
+        title.setObjectName("SectionTitle")
+        self.arrival_file_label = QLabel("연결된 Excel의 입차순번 시트를 읽습니다.")
+        self.arrival_file_label.setObjectName("SectionDescription")
+        heading_column.addWidget(title)
+        heading_column.addWidget(self.arrival_file_label)
+        header.addLayout(heading_column)
+        header.addStretch(1)
+        self.arrival_updated_label = QLabel("아직 새로고침하지 않았습니다.")
+        self.arrival_updated_label.setObjectName("MutedText")
+        header.addWidget(self.arrival_updated_label)
+        self.arrival_refresh_button = QPushButton("새로고침")
+        self.arrival_refresh_button.setObjectName("PrimaryButton")
+        self.arrival_refresh_button.setToolTip(
+            "연결된 Excel이 열려 있으면 현재 값을 읽고, 닫혀 있으면 읽기 전용으로 엽니다."
+        )
+        self.arrival_refresh_button.clicked.connect(self.refresh_arrival_sequence)
+        header.addWidget(self.arrival_refresh_button)
+        outer.addLayout(header)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        self.arrival_summary_tables: dict[str, QTableWidget] = {}
+        cards.addWidget(
+            self._build_arrival_summary_card(
+                "outside_waiting",
+                "외부대기",
+                ("T", "M", "이관"),
+                ("1F", "2F", "전일자"),
+            ),
+            1,
+        )
+        cards.addWidget(
+            self._build_arrival_summary_card(
+                "departure",
+                "출차",
+                ("T", "M", "이관"),
+                ("1F", "2F", "전일자"),
+            ),
+            1,
+        )
+        cards.addWidget(
+            self._build_arrival_summary_card(
+                "floor_targets",
+                "각층 목표치",
+                ("T", "M"),
+                ("1F", "2F", "합계"),
+            ),
+            1,
+        )
+        outer.addLayout(cards)
+
+        detail_card = QFrame()
+        detail_card.setObjectName("DataCard")
+        detail_card.setProperty("card", True)
+        detail_layout = QVBoxLayout(detail_card)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(0)
+        detail_header = QHBoxLayout()
+        detail_header.setContentsMargins(16, 12, 16, 10)
+        detail_title = QLabel("차량 상세")
+        detail_title.setObjectName("DialogHeading")
+        self.arrival_detail_count_label = QLabel("0대")
+        self.arrival_detail_count_label.setObjectName("MutedText")
+        detail_header.addWidget(detail_title)
+        detail_header.addStretch(1)
+        detail_header.addWidget(self.arrival_detail_count_label)
+        detail_layout.addLayout(detail_header)
+
+        self.arrival_detail_table = QTableWidget(0, 13)
+        self.arrival_detail_table.setObjectName("ArrivalDetailTable")
+        self.arrival_detail_table.setHorizontalHeaderLabels(
+            (
+                "구분",
+                "상태",
+                "층",
+                "유형",
+                "예약번호",
+                "거래처",
+                "팔렛트",
+                "경량",
+                "중량",
+                "고단",
+                "양곡",
+                "미분류",
+                "비고",
+            )
+        )
+        self.arrival_detail_table.setAlternatingRowColors(True)
+        self.arrival_detail_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.arrival_detail_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.arrival_detail_table.verticalHeader().setVisible(False)
+        self.arrival_detail_table.verticalHeader().setDefaultSectionSize(38)
+        detail_header_view = self.arrival_detail_table.horizontalHeader()
+        for column in range(self.arrival_detail_table.columnCount()):
+            detail_header_view.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+        detail_header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        detail_header_view.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
+        detail_layout.addWidget(self.arrival_detail_table, 1)
+        outer.addWidget(detail_card, 1)
+        return page
+
+    def _build_arrival_summary_card(
+        self,
+        key: str,
+        title: str,
+        columns: tuple[str, ...],
+        rows: tuple[str, ...],
+    ) -> QFrame:
+        card = QFrame()
+        card.setObjectName("ArrivalCard")
+        card.setProperty("card", True)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(8)
+        label = QLabel(title)
+        label.setObjectName("ArrivalCardTitle")
+        layout.addWidget(label)
+        table = QTableWidget(len(rows), len(columns))
+        table.setObjectName("ArrivalSummaryTable")
+        table.setHorizontalHeaderLabels(columns)
+        table.setVerticalHeaderLabels(rows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.verticalHeader().setDefaultSectionSize(31)
+        table.horizontalHeader().setDefaultSectionSize(70)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for row in range(len(rows)):
+            for column in range(len(columns)):
+                item = QTableWidgetItem("-")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, item)
+        table.setFixedHeight(153)
+        self.arrival_summary_tables[key] = table
+        layout.addWidget(table)
+        return card
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        if index != 0 or self._arrival_auto_refreshed:
+            return
+        self.refresh_arrival_sequence(automatic=True)
+
+    def refresh_arrival_sequence(
+        self,
+        _checked: bool = False,
+        *,
+        automatic: bool = False,
+    ) -> None:
+        if self._automation_worker_running():
+            if not automatic:
+                QMessageBox.information(
+                    self,
+                    "작업 진행 중",
+                    "현재 작업이 끝난 뒤 입차순번을 새로고침해 주세요.",
+                )
+            return
+        if not any(self._products_by_booking.values()):
+            QMessageBox.information(
+                self,
+                "RAW 데이터 필요",
+                "입차순번 현황을 계산할 RAW 데이터가 없습니다.\n\n"
+                "먼저 RAW 탭에서 Milkrun 또는 트럭의 '데이터 얻기'를 실행하거나 "
+                "저장된 표를 가져온 뒤 다시 새로고침해 주세요.",
+            )
+            return
+
+        configured_workbook = str(
+            self.settings.value("milkrun_excel_path", "")
+        ).strip()
+        if not configured_workbook:
+            QMessageBox.warning(
+                self,
+                "Excel 파일 연결 필요",
+                "먼저 설정에서 입고스케줄관리 Excel 파일을 연결해 주세요.",
+            )
+            return
+        try:
+            workbook_path = ArrivalSequenceReader.validate_target_path(
+                configured_workbook
+            )
+        except ExcelImportError as exc:
+            QMessageBox.warning(self, "Excel 파일 확인", str(exc))
+            return
+
+        self.arrival_file_label.setText(f"연결된 Excel: {workbook_path.name}")
+        self.arrival_updated_label.setText("Excel 값을 읽는 중...")
+        self.append_log("연결된 Excel의 입차순번 시트를 새로고침합니다.")
+        self.status_label.setText("입차순번 새로고침 중")
+        self.arrival_worker = ArrivalSequenceWorker(workbook_path)
+        self.arrival_worker.log_updated.connect(self.append_log)
+        self.arrival_worker.completed.connect(self._on_arrival_sequence_completed)
+        self.arrival_worker.failed.connect(self._on_arrival_sequence_failed)
+        self.arrival_worker.cancelled.connect(self._on_arrival_sequence_cancelled)
+        self.arrival_worker.finished.connect(self._on_arrival_sequence_finished)
+        self._set_automation_working(True)
+        self.arrival_worker.start()
+
+    @staticmethod
+    def _canonical_raw_booking(value: object, booking_type: str) -> str:
+        prefix = "T" if booking_type == "truck" else "M"
+        normalized = normalize_booking_number(value, prefix=prefix)
+        if normalized:
+            digits = normalized[1:].lstrip("0") or "0"
+            return f"{prefix}{digits}"
+        candidate = str(value or "").strip().replace(" ", "").upper()
+        if candidate.startswith(prefix) and candidate[1:].isdigit():
+            digits = candidate[1:].lstrip("0") or "0"
+            return f"{prefix}{digits}"
+        return ""
+
+    def _raw_booking_aggregates(self) -> dict[str, RawBookingAggregate]:
+        mutable: dict[str, dict[str, object]] = {}
+        valid_categories = {"경량", "중량", "고단", GRAIN_CATEGORY, "?"}
+        for booking_type in ("milkrun", "truck"):
+            products = self._products_by_booking.get(booking_type, ())
+            table = self._table_for_booking(booking_type)
+            multi_groups = self._booking_multi_sku_groups(products, booking_type)
+            group_categories = self._group_categories_for_booking(booking_type)
+            row_to_group = {
+                row_index: group_key
+                for group_key, rows in multi_groups.items()
+                for row_index in rows
+            }
+            for row_index, product in enumerate(products):
+                booking_key = self._canonical_raw_booking(
+                    product.dispatch_number,
+                    booking_type,
+                )
+                if not booking_key:
+                    continue
+                state = mutable.setdefault(
+                    booking_key,
+                    {
+                        "vendors": [],
+                        "pallets": Decimal("0"),
+                        "categories": {},
+                        "missing": 0,
+                    },
+                )
+                vendor = normalize_product_name(product.vendor_name)
+                vendors = state["vendors"]
+                if vendor and vendor not in vendors:
+                    vendors.append(vendor)
+
+                try:
+                    pallets = Decimal(str(product.pallet_count).replace(",", ""))
+                    if not pallets.is_finite() or pallets < 0:
+                        raise ValueError("invalid pallet count")
+                except (InvalidOperation, TypeError, ValueError):
+                    state["missing"] += 1
+                    continue
+
+                state["pallets"] += pallets
+                group_key = row_to_group.get(row_index)
+                if group_key is not None:
+                    category = group_categories.get(group_key, "?")
+                else:
+                    button = table.cellWidget(row_index, 9)
+                    category = button.text() if isinstance(button, QPushButton) else "?"
+                if category not in valid_categories:
+                    category = "?"
+                categories = state["categories"]
+                categories[category] = categories.get(category, Decimal("0")) + pallets
+
+        return {
+            booking_key: RawBookingAggregate(
+                booking_key=booking_key,
+                vendor_names=tuple(state["vendors"]),
+                pallet_count=state["pallets"],
+                category_pallets=tuple(
+                    (category, state["categories"].get(category, Decimal("0")))
+                    for category in ("경량", "중량", "고단", GRAIN_CATEGORY, "?")
+                    if state["categories"].get(category, Decimal("0")) != 0
+                ),
+                missing_pallet_rows=int(state["missing"]),
+            )
+            for booking_key, state in mutable.items()
+        }
+
+    def _on_arrival_sequence_completed(
+        self,
+        snapshot: ArrivalSequenceSnapshot,
+    ) -> None:
+        self._arrival_snapshot = snapshot
+        self._arrival_auto_refreshed = True
+        self._render_arrival_sequence(snapshot)
+        stamp = snapshot.refreshed_at.strftime("%Y-%m-%d %H:%M:%S")
+        self.arrival_updated_label.setText(f"마지막 새로고침 {stamp}")
+        self.status_label.setText(f"입차순번 새로고침 완료 · 차량 {len(snapshot.entries)}대")
+        self.append_log(f"입차순번 현황을 차량 {len(snapshot.entries)}대로 갱신했습니다.")
+
+    def _render_arrival_sequence(self, snapshot: ArrivalSequenceSnapshot) -> None:
+        summaries = {
+            "outside_waiting": snapshot.summary.outside_waiting,
+            "departure": snapshot.summary.departure,
+            "floor_targets": snapshot.summary.floor_targets,
+        }
+        for key, values in summaries.items():
+            table = self.arrival_summary_tables[key]
+            for row_index in range(table.rowCount()):
+                for column_index in range(table.columnCount()):
+                    try:
+                        value = values[row_index][column_index]
+                    except IndexError:
+                        value = ""
+                    item = table.item(row_index, column_index)
+                    item.setText(str(value).strip() or "-")
+
+        vehicles = build_arrival_vehicles(
+            snapshot,
+            self._raw_booking_aggregates(),
+        )
+        table = self.arrival_detail_table
+        table.setRowCount(len(vehicles))
+        category_order = ("경량", "중량", "고단", GRAIN_CATEGORY, "?")
+        for row_index, vehicle in enumerate(vehicles):
+            categories = vehicle.categories
+            values = (
+                vehicle.period,
+                vehicle.status,
+                vehicle.floor or "-",
+                "T" if vehicle.booking_type == "truck" else "M",
+                vehicle.booking_key,
+                vehicle.vendor_name or "-",
+                self._format_decimal(vehicle.pallet_count)
+                if vehicle.pallet_count is not None
+                else "-",
+                *(
+                    self._format_decimal(categories[category])
+                    if category in categories
+                    else "-"
+                    for category in category_order
+                ),
+                vehicle.note,
+            )
+            row_color = QColor(
+                COLORS["group_violet"]
+                if vehicle.period == "전일"
+                else COLORS["group_blue"]
+            )
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setBackground(QBrush(row_color))
+                if column_index not in (5, 12):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column_index in (5, 12):
+                    item.setToolTip(str(value))
+                table.setItem(row_index, column_index, item)
+        self.arrival_detail_count_label.setText(f"{len(vehicles)}대")
+
+    def _on_arrival_sequence_failed(self, failure: FailureDetails | object) -> None:
+        details = FailureDetails.coerce(failure)
+        self.arrival_updated_label.setText("새로고침 실패")
+        self.status_label.setText("입차순번 새로고침 실패")
+        self.append_log(f"[입차순번 오류] {details.summary}")
+        if not self._closing_after_cancel:
+            self._show_error_dialog(
+                "입차순번 새로고침 실패",
+                details,
+                category="입차순번 Excel 읽기",
+            )
+
+    def _on_arrival_sequence_cancelled(self, message: str) -> None:
+        self.arrival_updated_label.setText("새로고침 취소")
+        self.status_label.setText("입차순번 새로고침 취소")
+        self.append_log(message)
+
+    def _on_arrival_sequence_finished(self) -> None:
+        worker = self.arrival_worker
+        self.arrival_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._set_automation_working(self._automation_worker_running())
+        if self._closing_after_cancel and not self._automation_worker_running():
+            QTimer.singleShot(0, self.close)
 
     def _build_raw_tabs(self) -> QTabWidget:
         self.raw_tabs = QTabWidget()
@@ -1669,11 +2097,17 @@ class MainWindow(QMainWindow):
         self.milkrun_worker.start()
 
     def cancel_milkrun_download(self) -> None:
-        requested = self.milkrun_worker is not None or self.weight_worker is not None
+        requested = (
+            self.milkrun_worker is not None
+            or self.weight_worker is not None
+            or self.arrival_worker is not None
+        )
         if self.milkrun_worker is not None:
             self.milkrun_worker.request_cancel()
         if self.weight_worker is not None:
             self.weight_worker.request_cancel()
+        if self.arrival_worker is not None:
+            self.arrival_worker.request_cancel()
         if requested:
             self._automation_cancel_requested = True
             self.append_log("작업 중지를 요청했습니다.")
@@ -3088,7 +3522,11 @@ class MainWindow(QMainWindow):
         # preceding completed signal is still waiting in the GUI event queue;
         # considering that gap idle could close the window and then start WMS
         # from the delayed completion callback.
-        return self.milkrun_worker is not None or self.weight_worker is not None
+        return (
+            self.milkrun_worker is not None
+            or self.weight_worker is not None
+            or self.arrival_worker is not None
+        )
 
     def _set_automation_working(self, working: bool) -> None:
         self.get_data_button.setEnabled(not working)
@@ -3100,6 +3538,7 @@ class MainWindow(QMainWindow):
         self.manual_base_date.setEnabled(
             not working and self.base_date_mode.currentData() == "manual"
         )
+        self.arrival_refresh_button.setEnabled(not working)
         for button in (self.stop_button, self.truck_stop_button):
             button.setVisible(working)
             button.setEnabled(working)

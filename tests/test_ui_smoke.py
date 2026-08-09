@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from decimal import Decimal
 from unittest.mock import patch
@@ -18,6 +18,11 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
 from Modules.Common.Credentials import WMSCredentialStore
 from Modules.Common.ErrorReport import FailureDetails
+from Modules.Excel.ArrivalSequenceReader import (
+    ArrivalSequenceEntry,
+    ArrivalSequenceSnapshot,
+    ArrivalSummary,
+)
 from Modules.GUI.MainWindow import MainWindow, SettingsDialog, _open_product_memory_with_recovery
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
 from Modules.Shipments.DailyInbound import MilkrunProductRow
@@ -80,6 +85,90 @@ class MainWindowSmokeTests(unittest.TestCase):
             )
             self.assertFalse(window.raw_table.wordWrap())
             self.assertTrue(window.operation_progress.isHidden())
+        finally:
+            window.close()
+
+    def test_arrival_tab_has_dashboard_and_requires_raw_before_refresh(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            self.assertEqual(window.main_tabs.tabText(0), "입차순번")
+            self.assertEqual(window.arrival_refresh_button.text(), "새로고침")
+            self.assertEqual(window.arrival_detail_table.columnCount(), 13)
+            self.assertEqual(
+                window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
+                "합계",
+            )
+            with patch.object(QMessageBox, "information") as information:
+                window.refresh_arrival_sequence()
+            information.assert_called_once()
+            self.assertEqual(information.call_args.args[1], "RAW 데이터 필요")
+            self.assertIsNone(window.arrival_worker)
+        finally:
+            window.close()
+
+    def test_arrival_dashboard_uses_raw_for_today_and_excel_only_for_previous(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            product = MilkrunProductRow(
+                "현재 거래처",
+                "10807763",
+                "3",
+                "30",
+                "123",
+                "현재 상품",
+                "M3370492",
+            )
+            window._populate_milkrun_products((product,))
+            button = window.raw_table.cellWidget(0, 9)
+            window._configure_category_button(
+                button,
+                "경량",
+                manual=True,
+                enabled=True,
+            )
+            snapshot = ArrivalSequenceSnapshot(
+                workbook=Path("sample.xlsm"),
+                sheet_name="입차순번",
+                refreshed_at=datetime(2026, 8, 9, 1, 2, 3),
+                summary=ArrivalSummary(
+                    departure=(("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9")),
+                    outside_waiting=(("10", "11", "12"), ("13", "14", "15"), ("16", "17", "18")),
+                    floor_targets=(("20", "21"), ("22", "23"), ("30", "31")),
+                ),
+                entries=(
+                    ArrivalSequenceEntry(
+                        18,
+                        "MBN3370492",
+                        "M3370492",
+                        "milkrun",
+                        "1F",
+                        "99",
+                        "99",
+                    ),
+                    ArrivalSequenceEntry(
+                        19,
+                        "tbn003370493",
+                        "T3370493",
+                        "truck",
+                        "",
+                        "8",
+                        "8",
+                    ),
+                ),
+            )
+
+            window._render_arrival_sequence(snapshot)
+
+            self.assertEqual(window.arrival_detail_table.rowCount(), 2)
+            self.assertEqual(window.arrival_detail_table.item(0, 0).text(), "금일")
+            self.assertEqual(window.arrival_detail_table.item(0, 6).text(), "3")
+            self.assertEqual(window.arrival_detail_table.item(0, 7).text(), "3")
+            self.assertEqual(window.arrival_detail_table.item(1, 0).text(), "전일")
+            self.assertEqual(window.arrival_detail_table.item(1, 6).text(), "8")
+            self.assertEqual(
+                window.arrival_summary_tables["floor_targets"].item(2, 1).text(),
+                "31",
+            )
         finally:
             window.close()
 

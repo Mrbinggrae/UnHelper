@@ -102,6 +102,11 @@ QLabel#DialogHeading, QLabel#SectionTitle {
     font-size: 14pt;
     font-weight: 700;
 }
+QLabel#ArrivalCardTitle {
+    color: #F8FAFC;
+    font-size: 12pt;
+    font-weight: 750;
+}
 QLabel#FieldLabel, QLabel#DetailLabel {
     color: #DCE5EE;
     font-weight: 700;
@@ -197,6 +202,27 @@ QTableWidget, QTableView {
 QFrame#DataCard QTableWidget#RawTable {
     border: 0;
     border-radius: 11px;
+}
+QFrame#ArrivalCard {
+    background: #111821;
+    border: 1px solid #253244;
+    border-radius: 12px;
+}
+QTableWidget#ArrivalSummaryTable {
+    background: #0D141D;
+    border: 0;
+    border-radius: 7px;
+    gridline-color: #253244;
+    font-size: 10pt;
+}
+QTableWidget#ArrivalSummaryTable::item {
+    padding: 4px 7px;
+    font-weight: 700;
+}
+QTableWidget#ArrivalDetailTable {
+    border: 0;
+    border-top: 1px solid #253244;
+    border-radius: 0 0 11px 11px;
 }
 QTableWidget::item, QTableView::item {
     border: 0;
