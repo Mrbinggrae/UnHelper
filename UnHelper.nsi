@@ -46,6 +46,7 @@ Section "Main" SEC_MAIN
     WriteRegStr   HKCU "${REG_KEY}" "DisplayName"      "${APP_NAME}"
     WriteRegStr   HKCU "${REG_KEY}" "DisplayVersion"   "${APP_VERSION}"
     WriteRegStr   HKCU "${REG_KEY}" "Publisher"        "${PUBLISHER}"
+    WriteRegStr   HKCU "${REG_KEY}" "DisplayIcon"      '"$INSTDIR\${APP_EXE}",0'
     WriteRegStr   HKCU "${REG_KEY}" "InstallLocation"  "$INSTDIR"
     WriteRegStr   HKCU "${REG_KEY}" "UninstallString"  '"$INSTDIR\Uninstall.exe"'
     WriteRegDWORD HKCU "${REG_KEY}" "NoModify"         1

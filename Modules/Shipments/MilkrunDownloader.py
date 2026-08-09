@@ -290,9 +290,8 @@ class MilkrunDownloader:
 
     def _login_ready(self) -> bool:
         xpaths = [
-            "//a[@href='/app' and .//span[normalize-space()='입고 스케줄']]",
-            f"//a[@href='{self.BOOKING_LIST_HREF}' "
-            f"and .//span[normalize-space()='{self.BOOKING_LIST_LABEL}']]",
+            f"//a[@href='{self.SCHEDULE_HREF}']",
+            f"//a[@href='{self.BOOKING_LIST_HREF}']",
         ]
         for xpath in xpaths:
             try:
@@ -306,7 +305,7 @@ class MilkrunDownloader:
         self.log("입고 스케줄 메뉴를 클릭합니다.")
         self._click_locator(
             By.XPATH,
-            "//a[@href='/app' and .//span[normalize-space()='입고 스케줄']]",
+            f"//a[@href='{self.SCHEDULE_HREF}']",
             "입고 스케줄",
             timeout=60,
         )
@@ -315,8 +314,7 @@ class MilkrunDownloader:
         self.log(f"{self.BOOKING_LIST_LABEL}을 클릭합니다.")
         self._click_locator(
             By.XPATH,
-            f"//a[@href='{self.BOOKING_LIST_HREF}' "
-            f"and .//span[normalize-space()='{self.BOOKING_LIST_LABEL}']]",
+            f"//a[@href='{self.BOOKING_LIST_HREF}']",
             self.BOOKING_LIST_LABEL,
             timeout=60,
         )

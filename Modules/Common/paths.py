@@ -24,6 +24,10 @@ def chromedriver_path() -> Path:
     return bundled_root() / "chromedriver.exe"
 
 
+def app_icon_path() -> Path:
+    return bundled_root() / "assets" / "app-icon.ico"
+
+
 def default_download_dir() -> Path:
     path = Path.home() / "Downloads" / APP_NAME
     path.mkdir(parents=True, exist_ok=True)

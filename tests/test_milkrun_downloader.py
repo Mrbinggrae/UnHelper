@@ -205,30 +205,62 @@ class MilkrunDownloaderTests(unittest.TestCase):
         self.assertEqual(selected.download_type, "트럭 입고예약 목록")
         self.assertEqual(selected.download_href, "https://shipments.coupang.net/ibs/csv-donwload?uuid=truck")
 
-    def test_truck_opens_exact_booking_list_link(self) -> None:
-        downloader = TruckDownloader(Path("chromedriver.exe"), log=lambda _message: None)
-        expected_xpath = (
-            "//a[@href='/app/inbound-booking/truck/list' "
-            "and .//span[normalize-space()='트럭 입고예약 목록']]"
-        )
-
-        with (
-            mock.patch.object(downloader, "_click_locator") as click_locator,
-            mock.patch.object(downloader, "_wait_document_ready"),
-            mock.patch.object(downloader, "_wait"),
-        ):
-            downloader._open_booking_list()
-
-        self.assertEqual(click_locator.call_count, 2)
-        self.assertEqual(
-            click_locator.call_args_list[1],
-            mock.call(
-                By.XPATH,
-                expected_xpath,
+    def test_booking_navigation_uses_href_without_localized_menu_text(self) -> None:
+        cases = (
+            (
+                MilkrunDownloader(Path("chromedriver.exe"), log=lambda _message: None),
+                "/app/inbound-booking/milkrun/list",
+                "밀크런 입고예약 목록",
+            ),
+            (
+                TruckDownloader(Path("chromedriver.exe"), log=lambda _message: None),
+                "/app/inbound-booking/truck/list",
                 "트럭 입고예약 목록",
-                timeout=60,
             ),
         )
+
+        for downloader, booking_href, label in cases:
+            with self.subTest(booking_href=booking_href):
+                with (
+                    mock.patch.object(downloader, "_click_locator") as click_locator,
+                    mock.patch.object(downloader, "_wait_document_ready"),
+                    mock.patch.object(downloader, "_wait"),
+                ):
+                    downloader._open_booking_list()
+
+                    self.assertEqual(click_locator.call_count, 2)
+                    self.assertEqual(
+                        click_locator.call_args_list[0],
+                        mock.call(By.XPATH, "//a[@href='/app']", "입고 스케줄", timeout=60),
+                    )
+                    self.assertEqual(
+                        click_locator.call_args_list[1],
+                        mock.call(
+                            By.XPATH,
+                            f"//a[@href='{booking_href}']",
+                            label,
+                            timeout=60,
+                        ),
+                    )
+
+    def test_login_ready_uses_href_without_localized_menu_text(self) -> None:
+        downloader = MilkrunDownloader(Path("chromedriver.exe"), log=lambda _message: None)
+        visible = mock.Mock()
+        visible.is_displayed.return_value = True
+        downloader.driver = mock.Mock()
+        downloader.driver.find_elements.side_effect = lambda _by, xpath: (
+            [visible]
+            if xpath == "//a[@href='/app/inbound-booking/milkrun/list']"
+            else []
+        )
+
+        self.assertTrue(downloader._login_ready())
+        requested_xpaths = [call.args[1] for call in downloader.driver.find_elements.call_args_list]
+        self.assertEqual(
+            requested_xpaths,
+            ["//a[@href='/app']", "//a[@href='/app/inbound-booking/milkrun/list']"],
+        )
+        self.assertNotIn("입고", " ".join(requested_xpaths))
 
     def test_center_selection_prefers_center_code_control(self) -> None:
         downloader = MilkrunDownloader(Path("chromedriver.exe"), log=lambda _message: None)
