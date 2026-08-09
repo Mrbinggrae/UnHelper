@@ -103,6 +103,22 @@ class _StubScraper(DailyInboundScraper):
 
 
 class DailyInboundScraperTests(unittest.TestCase):
+    def test_daily_schedule_navigation_uses_href_without_localized_menu_text(self) -> None:
+        browser = mock.Mock()
+        browser.log = mock.Mock()
+        scraper = DailyInboundScraper(browser)
+
+        scraper._open_daily_schedule()
+
+        browser._click_locator.assert_called_once_with(
+            By.XPATH,
+            "//a[@href='/app/inbound-schedule']",
+            "일별 입고 현황",
+            timeout=60,
+        )
+        requested_xpath = browser._click_locator.call_args.args[1]
+        self.assertNotIn("일별 입고 현황", requested_xpath)
+
     def test_empty_detail_is_skipped_and_later_dispatches_continue(self) -> None:
         class PartiallyEmptyScraper(_StubScraper):
             def _matching_slots(self, dispatch_number: str):

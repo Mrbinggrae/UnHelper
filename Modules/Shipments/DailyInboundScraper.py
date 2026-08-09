@@ -229,8 +229,7 @@ class DailyInboundScraper:
         self.log("일별 입고 현황 메뉴로 이동합니다.")
         self.browser._click_locator(
             By.XPATH,
-            "//a[@href='/app/inbound-schedule' "
-            "and .//span[normalize-space()='일별 입고 현황']]",
+            f"//a[@href='{self.DAILY_SCHEDULE_HREF}']",
             "일별 입고 현황",
             timeout=60,
         )
