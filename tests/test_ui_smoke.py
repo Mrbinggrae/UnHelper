@@ -94,7 +94,6 @@ class MainWindowSmokeTests(unittest.TestCase):
         try:
             self.assertEqual(window.main_tabs.tabText(0), "입차순번")
             self.assertEqual(window.arrival_refresh_button.text(), "새로고침")
-            self.assertEqual(window.arrival_detail_table.columnCount(), 13)
             self.assertIsNotNone(window.findChild(QScrollArea, "ArrivalScroll"))
             self.assertEqual(
                 window.arrival_breakdown_tables["outside_waiting"].columnCount(),
@@ -109,6 +108,27 @@ class MainWindowSmokeTests(unittest.TestCase):
             information.assert_called_once()
             self.assertEqual(information.call_args.args[1], "RAW 데이터 필요")
             self.assertIsNone(window.arrival_worker)
+        finally:
+            window.close()
+
+    def test_arrival_cards_use_full_width_without_vehicle_detail_table(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            window._arrival_auto_refreshed = True
+            window.resize(1024, 650)
+            window.main_tabs.setCurrentIndex(0)
+            window.show()
+            self.app.processEvents()
+
+            self.assertFalse(hasattr(window, "arrival_detail_table"))
+            self.assertGreaterEqual(
+                window.arrival_summary_tables["outside_waiting"].width(),
+                320,
+            )
+            self.assertGreaterEqual(
+                window.arrival_breakdown_tables["outside_waiting"].width(),
+                470,
+            )
         finally:
             window.close()
 
@@ -174,12 +194,6 @@ class MainWindowSmokeTests(unittest.TestCase):
 
             window._render_arrival_sequence(snapshot)
 
-            self.assertEqual(window.arrival_detail_table.rowCount(), 2)
-            self.assertEqual(window.arrival_detail_table.item(0, 0).text(), "금일")
-            self.assertEqual(window.arrival_detail_table.item(0, 6).text(), "3")
-            self.assertEqual(window.arrival_detail_table.item(0, 7).text(), "3")
-            self.assertEqual(window.arrival_detail_table.item(1, 0).text(), "전일")
-            self.assertEqual(window.arrival_detail_table.item(1, 6).text(), "8")
             self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].item(2, 1).text(),
                 "31",
@@ -195,6 +209,10 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(
                 window.arrival_breakdown_tables["departure"].item(0, 1).text(),
                 "3",
+            )
+            self.assertEqual(
+                window.arrival_breakdown_tables["outside_waiting"].item(2, 0).text(),
+                "8",
             )
             self.assertEqual(window.arrival_floor_table.item(1, 0).text(), "3")
             self.assertEqual(window.arrival_floor_table.item(1, 1).text(), "3")

@@ -1036,7 +1036,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.arrival_refresh_button)
         outer.addLayout(header)
 
-        cards = QHBoxLayout()
+        cards = QVBoxLayout()
         cards.setSpacing(12)
         self.arrival_summary_tables: dict[str, QTableWidget] = {}
         self.arrival_breakdown_tables: dict[str, QTableWidget] = {}
@@ -1047,7 +1047,6 @@ class MainWindow(QMainWindow):
                 ("T", "M", "이관"),
                 ("1F", "2F", "전일자"),
             ),
-            1,
         )
         cards.addWidget(
             self._build_arrival_summary_card(
@@ -1056,7 +1055,6 @@ class MainWindow(QMainWindow):
                 ("T", "M", "이관"),
                 ("1F", "2F", "전일자"),
             ),
-            1,
         )
         cards.addWidget(
             self._build_arrival_summary_card(
@@ -1065,68 +1063,12 @@ class MainWindow(QMainWindow):
                 ("T", "M"),
                 ("1F", "2F", "합계"),
             ),
-            1,
         )
         outer.addLayout(cards)
         # Kept as an alias for UI integrations that used the original floor-only table.
         self.arrival_floor_table = self.arrival_breakdown_tables["floor_targets"]
 
-        detail_card = QFrame()
-        detail_card.setObjectName("DataCard")
-        detail_card.setProperty("card", True)
-        detail_layout = QVBoxLayout(detail_card)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
-        detail_layout.setSpacing(0)
-        detail_header = QHBoxLayout()
-        detail_header.setContentsMargins(16, 12, 16, 10)
-        detail_title = QLabel("차량 상세")
-        detail_title.setObjectName("DialogHeading")
-        self.arrival_detail_count_label = QLabel("0대")
-        self.arrival_detail_count_label.setObjectName("MutedText")
-        detail_header.addWidget(detail_title)
-        detail_header.addStretch(1)
-        detail_header.addWidget(self.arrival_detail_count_label)
-        detail_layout.addLayout(detail_header)
-
-        self.arrival_detail_table = QTableWidget(0, 13)
-        self.arrival_detail_table.setObjectName("ArrivalDetailTable")
-        self.arrival_detail_table.setHorizontalHeaderLabels(
-            (
-                "구분",
-                "상태",
-                "층",
-                "유형",
-                "예약번호",
-                "거래처",
-                "팔렛트",
-                "경량",
-                "중량",
-                "고단",
-                "양곡",
-                "미분류",
-                "비고",
-            )
-        )
-        self.arrival_detail_table.setAlternatingRowColors(True)
-        self.arrival_detail_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.arrival_detail_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.arrival_detail_table.verticalHeader().setVisible(False)
-        self.arrival_detail_table.verticalHeader().setDefaultSectionSize(38)
-        detail_header_view = self.arrival_detail_table.horizontalHeader()
-        for column in range(self.arrival_detail_table.columnCount()):
-            detail_header_view.setSectionResizeMode(
-                column,
-                QHeaderView.ResizeMode.ResizeToContents,
-            )
-        detail_header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        detail_header_view.setSectionResizeMode(12, QHeaderView.ResizeMode.Stretch)
-        detail_layout.addWidget(self.arrival_detail_table, 1)
-        detail_card.setMinimumHeight(170)
-        outer.addWidget(detail_card, 1)
+        outer.addStretch(1)
         page.setWidget(content)
         return page
 
@@ -1140,13 +1082,15 @@ class MainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("ArrivalCard")
         card.setProperty("card", True)
-        card.setMinimumHeight(268)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 8, 12, 10)
-        layout.setSpacing(6)
+        card.setMinimumHeight(156)
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(18)
+        summary_layout = QVBoxLayout()
+        summary_layout.setSpacing(6)
         label = QLabel(f"{title} · 차량 대수")
         label.setObjectName("ArrivalCardTitle")
-        layout.addWidget(label)
+        summary_layout.addWidget(label)
         table = QTableWidget(len(rows), len(columns))
         table.setObjectName("ArrivalSummaryTable")
         table.setHorizontalHeaderLabels(columns)
@@ -1167,15 +1111,18 @@ class MainWindow(QMainWindow):
                 table.setItem(row, column, item)
         table.setFixedHeight(100)
         self.arrival_summary_tables[key] = table
-        layout.addWidget(table)
+        summary_layout.addWidget(table)
+        layout.addLayout(summary_layout, 4)
 
+        breakdown_layout = QVBoxLayout()
+        breakdown_layout.setSpacing(6)
         breakdown_label = QLabel("팔렛트 상세 · RAW T/M 기준")
         breakdown_label.setObjectName("ArrivalBreakdownTitle")
         breakdown_label.setToolTip(
             "차량 대수 아래에 RAW 표에서 계산한 팔렛트와 분류 수량을 표시합니다. "
             "이관 차량은 RAW T/M 상품 데이터가 없어 상세 합계에서 제외됩니다."
         )
-        layout.addWidget(breakdown_label)
+        breakdown_layout.addWidget(breakdown_label)
         breakdown = QTableWidget(len(rows), 6)
         breakdown.setObjectName("ArrivalBreakdownTable")
         breakdown.setHorizontalHeaderLabels(
@@ -1197,7 +1144,8 @@ class MainWindow(QMainWindow):
                 breakdown.setItem(row, column, item)
         breakdown.setFixedHeight(100)
         self.arrival_breakdown_tables[key] = breakdown
-        layout.addWidget(breakdown)
+        breakdown_layout.addWidget(breakdown)
+        layout.addLayout(breakdown_layout, 6)
         return card
 
     def _on_main_tab_changed(self, index: int) -> None:
@@ -1409,6 +1357,7 @@ class MainWindow(QMainWindow):
                     notes.append(f"팔렛트 수 미입력 {breakdown.missing_pallet_vehicles}대")
                 if breakdown.unmapped_bookings:
                     notes.append("층 미매핑 " + ", ".join(breakdown.unmapped_bookings))
+                notes.extend(breakdown.notes)
                 render_breakdown_row(
                     table,
                     row_index,
@@ -1453,43 +1402,6 @@ class MainWindow(QMainWindow):
             " · ".join(dict.fromkeys(total_notes)),
         )
 
-        table = self.arrival_detail_table
-        table.setRowCount(len(vehicles))
-        for row_index, vehicle in enumerate(vehicles):
-            categories = vehicle.categories
-            values = (
-                vehicle.period,
-                vehicle.status,
-                vehicle.floor or "-",
-                "T" if vehicle.booking_type == "truck" else "M",
-                vehicle.booking_key,
-                vehicle.vendor_name or "-",
-                self._format_decimal(vehicle.pallet_count)
-                if vehicle.pallet_count is not None
-                else "-",
-                *(
-                    self._format_decimal(categories[category])
-                    if category in categories
-                    else "-"
-                    for category in category_order
-                ),
-                vehicle.note,
-            )
-            row_color = QColor(
-                COLORS["group_violet"]
-                if vehicle.period == "전일"
-                else COLORS["group_blue"]
-            )
-            for column_index, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                item.setBackground(QBrush(row_color))
-                if column_index not in (5, 12):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column_index in (5, 12):
-                    item.setToolTip(str(value))
-                table.setItem(row_index, column_index, item)
-        self.arrival_detail_count_label.setText(f"{len(vehicles)}대")
 
     def _on_arrival_sequence_failed(self, failure: FailureDetails | object) -> None:
         details = FailureDetails.coerce(failure)

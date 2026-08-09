@@ -114,6 +114,7 @@ class ArrivalPalletBreakdown:
     category_pallets: tuple[tuple[str, Decimal], ...]
     missing_pallet_vehicles: int = 0
     unmapped_bookings: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
     @property
     def categories(self) -> dict[str, Decimal]:
@@ -322,6 +323,7 @@ def build_status_pallet_breakdowns(
             "categories": {category: Decimal("0") for category in categories},
             "missing": 0,
             "unmapped": [],
+            "notes": [],
         }
         for label in ("1F", "2F", "전일자")
     }
@@ -340,6 +342,8 @@ def build_status_pallet_breakdowns(
         for category, value in vehicle.category_pallets:
             if category in state["categories"]:
                 state["categories"][category] += value
+        if vehicle.note:
+            state["notes"].append(f"{vehicle.booking_key}: {vehicle.note}")
 
     return tuple(
         ArrivalPalletBreakdown(
@@ -352,6 +356,7 @@ def build_status_pallet_breakdowns(
             ),
             missing_pallet_vehicles=int(state["missing"]),
             unmapped_bookings=tuple(state["unmapped"]),
+            notes=tuple(state["notes"]),
         )
         for label, state in states.items()
     )

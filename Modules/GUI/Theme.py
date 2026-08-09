@@ -234,16 +234,11 @@ QTableWidget#ArrivalBreakdownTable {
     border: 1px solid #202C3A;
     border-radius: 7px;
     gridline-color: #202C3A;
-    font-size: 9pt;
+    font-size: 10pt;
 }
 QTableWidget#ArrivalBreakdownTable::item {
     padding: 3px 5px;
     font-weight: 650;
-}
-QTableWidget#ArrivalDetailTable {
-    border: 0;
-    border-top: 1px solid #253244;
-    border-radius: 0 0 11px 11px;
 }
 QTableWidget#ArrivalFloorTable {
     background: #0D141D;
