@@ -208,6 +208,10 @@ QFrame#ArrivalCard {
     border: 1px solid #253244;
     border-radius: 12px;
 }
+QScrollArea#ArrivalScroll {
+    background: #0B0F14;
+    border: 0;
+}
 QTableWidget#ArrivalSummaryTable {
     background: #0D141D;
     border: 0;
@@ -218,6 +222,23 @@ QTableWidget#ArrivalSummaryTable {
 QTableWidget#ArrivalSummaryTable::item {
     padding: 4px 7px;
     font-weight: 700;
+}
+QLabel#ArrivalBreakdownTitle {
+    color: #8FA0B2;
+    font-size: 8.75pt;
+    font-weight: 650;
+    padding-top: 2px;
+}
+QTableWidget#ArrivalBreakdownTable {
+    background: #0A1119;
+    border: 1px solid #202C3A;
+    border-radius: 7px;
+    gridline-color: #202C3A;
+    font-size: 9pt;
+}
+QTableWidget#ArrivalBreakdownTable::item {
+    padding: 3px 5px;
+    font-weight: 650;
 }
 QTableWidget#ArrivalDetailTable {
     border: 0;

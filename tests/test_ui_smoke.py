@@ -13,7 +13,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QPoint, QSettings, QThread
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QScrollArea
 
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
 from Modules.Common.Credentials import WMSCredentialStore
@@ -95,6 +95,11 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.main_tabs.tabText(0), "입차순번")
             self.assertEqual(window.arrival_refresh_button.text(), "새로고침")
             self.assertEqual(window.arrival_detail_table.columnCount(), 13)
+            self.assertIsNotNone(window.findChild(QScrollArea, "ArrivalScroll"))
+            self.assertEqual(
+                window.arrival_breakdown_tables["outside_waiting"].columnCount(),
+                6,
+            )
             self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
                 "합계",
@@ -179,10 +184,21 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window.arrival_summary_tables["floor_targets"].item(2, 1).text(),
                 "31",
             )
-            self.assertEqual(window.arrival_floor_table.item(1, 0).text(), "2F")
-            self.assertEqual(window.arrival_floor_table.item(1, 2).text(), "1")
-            self.assertEqual(window.arrival_floor_table.item(1, 5).text(), "3")
-            self.assertEqual(window.arrival_floor_table.item(1, 6).text(), "3")
+            self.assertEqual(
+                window.arrival_summary_tables["outside_waiting"].item(0, 0).text(),
+                "10",
+            )
+            self.assertEqual(
+                window.arrival_breakdown_tables["departure"].item(0, 0).text(),
+                "3",
+            )
+            self.assertEqual(
+                window.arrival_breakdown_tables["departure"].item(0, 1).text(),
+                "3",
+            )
+            self.assertEqual(window.arrival_floor_table.item(1, 0).text(), "3")
+            self.assertEqual(window.arrival_floor_table.item(1, 1).text(), "3")
+            self.assertEqual(window.arrival_floor_table.item(2, 0).text(), "3")
         finally:
             window.close()
 

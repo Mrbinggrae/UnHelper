@@ -107,6 +107,19 @@ class FloorTargetBreakdown:
         return dict(self.category_pallets)
 
 
+@dataclass(frozen=True)
+class ArrivalPalletBreakdown:
+    label: str
+    pallet_count: Decimal
+    category_pallets: tuple[tuple[str, Decimal], ...]
+    missing_pallet_vehicles: int = 0
+    unmapped_bookings: tuple[str, ...] = ()
+
+    @property
+    def categories(self) -> dict[str, Decimal]:
+        return dict(self.category_pallets)
+
+
 _MILKRUN_SEQUENCE_PATTERN = re.compile(r"^MBN\s*0*(\d+)\s*$", re.IGNORECASE)
 _TRUCK_SEQUENCE_PATTERN = re.compile(r"^TBN00\s*0*(\d+)\s*$", re.IGNORECASE)
 _FLOOR_PATTERN = re.compile(r"\b([12])\s*F\b", re.IGNORECASE)
@@ -293,6 +306,55 @@ def build_arrival_vehicles(
             )
         )
     return tuple(vehicles)
+
+
+def build_status_pallet_breakdowns(
+    vehicles: tuple[ArrivalVehicle, ...],
+    *,
+    status: str,
+) -> tuple[ArrivalPalletBreakdown, ...]:
+    """Summarize pallets below the Excel-provided vehicle-count cards."""
+
+    categories = ("경량", "중량", "고단", "양곡", "?")
+    states = {
+        label: {
+            "pallets": Decimal("0"),
+            "categories": {category: Decimal("0") for category in categories},
+            "missing": 0,
+            "unmapped": [],
+        }
+        for label in ("1F", "2F", "전일자")
+    }
+    for vehicle in vehicles:
+        if vehicle.status != status:
+            continue
+        label = "전일자" if vehicle.period == "전일" else vehicle.floor
+        if label not in states:
+            states["1F"]["unmapped"].append(vehicle.booking_key)
+            continue
+        state = states[label]
+        if vehicle.pallet_count is None:
+            state["missing"] += 1
+        else:
+            state["pallets"] += vehicle.pallet_count
+        for category, value in vehicle.category_pallets:
+            if category in state["categories"]:
+                state["categories"][category] += value
+
+    return tuple(
+        ArrivalPalletBreakdown(
+            label=label,
+            pallet_count=state["pallets"],
+            category_pallets=tuple(
+                (category, state["categories"][category])
+                for category in categories
+                if state["categories"][category] != 0
+            ),
+            missing_pallet_vehicles=int(state["missing"]),
+            unmapped_bookings=tuple(state["unmapped"]),
+        )
+        for label, state in states.items()
+    )
 
 
 class ArrivalSequenceReader(MilkrunExcelImporter):

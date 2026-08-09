@@ -10,10 +10,12 @@ from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceReader,
     ArrivalSequenceSnapshot,
     ArrivalSummary,
+    ArrivalVehicle,
     BookingFloorAssignment,
     RawBookingAggregate,
     build_floor_target_breakdowns,
     build_arrival_vehicles,
+    build_status_pallet_breakdowns,
     normalize_raw_sheet_booking,
     normalize_sequence_booking,
 )
@@ -298,6 +300,54 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
         self.assertEqual((second.floor, second.truck_count), ("2F", 1))
         self.assertEqual(second.categories["고단"], Decimal("4"))
         self.assertEqual(first.unassigned_raw_bookings, ())
+
+    def test_status_breakdowns_keep_vehicle_counts_separate_from_pallet_details(self) -> None:
+        vehicles = (
+            ArrivalVehicle(
+                18,
+                "M123",
+                "milkrun",
+                "거래처 A",
+                "금일",
+                "외부대기",
+                "1F",
+                Decimal("3"),
+                (("경량", Decimal("2")), ("고단", Decimal("1"))),
+            ),
+            ArrivalVehicle(
+                19,
+                "T456",
+                "truck",
+                "거래처 B",
+                "금일",
+                "출차",
+                "2F",
+                Decimal("4"),
+                (("중량", Decimal("4")),),
+            ),
+            ArrivalVehicle(
+                20,
+                "M789",
+                "milkrun",
+                "",
+                "전일",
+                "외부대기",
+                "",
+                Decimal("7"),
+                (),
+            ),
+        )
+
+        waiting = build_status_pallet_breakdowns(vehicles, status="외부대기")
+        departure = build_status_pallet_breakdowns(vehicles, status="출차")
+
+        self.assertEqual(waiting[0].label, "1F")
+        self.assertEqual(waiting[0].pallet_count, Decimal("3"))
+        self.assertEqual(waiting[0].categories["경량"], Decimal("2"))
+        self.assertEqual(waiting[2].label, "전일자")
+        self.assertEqual(waiting[2].pallet_count, Decimal("7"))
+        self.assertEqual(departure[1].pallet_count, Decimal("4"))
+        self.assertEqual(departure[1].categories["중량"], Decimal("4"))
 
 
 if __name__ == "__main__":

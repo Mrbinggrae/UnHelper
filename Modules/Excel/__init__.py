@@ -16,6 +16,7 @@ from Modules.Excel.TruckExcelImporter import (
 from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceEntry,
     ArrivalSequenceError,
+    ArrivalPalletBreakdown,
     ArrivalSequenceReader,
     ArrivalSequenceSnapshot,
     ArrivalSummary,
@@ -25,6 +26,7 @@ from Modules.Excel.ArrivalSequenceReader import (
     RawBookingAggregate,
     build_floor_target_breakdowns,
     build_arrival_vehicles,
+    build_status_pallet_breakdowns,
     normalize_raw_sheet_booking,
     normalize_sequence_booking,
 )
@@ -41,6 +43,7 @@ __all__ = [
     "normalize_truck_reservation_number",
     "ArrivalSequenceEntry",
     "ArrivalSequenceError",
+    "ArrivalPalletBreakdown",
     "ArrivalSequenceReader",
     "ArrivalSequenceSnapshot",
     "ArrivalSummary",
@@ -50,6 +53,7 @@ __all__ = [
     "RawBookingAggregate",
     "build_floor_target_breakdowns",
     "build_arrival_vehicles",
+    "build_status_pallet_breakdowns",
     "normalize_raw_sheet_booking",
     "normalize_sequence_booking",
 ]
