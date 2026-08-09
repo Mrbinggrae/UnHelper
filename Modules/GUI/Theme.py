@@ -224,6 +224,17 @@ QTableWidget#ArrivalDetailTable {
     border-top: 1px solid #253244;
     border-radius: 0 0 11px 11px;
 }
+QTableWidget#ArrivalFloorTable {
+    background: #0D141D;
+    border: 0;
+    border-top: 1px solid #253244;
+    border-radius: 0 0 11px 11px;
+    gridline-color: #253244;
+}
+QTableWidget#ArrivalFloorTable::item {
+    padding: 5px 7px;
+    font-weight: 650;
+}
 QTableWidget::item, QTableView::item {
     border: 0;
     padding: 7px 9px;

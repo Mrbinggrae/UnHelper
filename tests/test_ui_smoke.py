@@ -22,6 +22,7 @@ from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceEntry,
     ArrivalSequenceSnapshot,
     ArrivalSummary,
+    BookingFloorAssignment,
 )
 from Modules.GUI.MainWindow import MainWindow, SettingsDialog, _open_product_memory_with_recovery
 from Modules.GUI.ProductMemoryDialog import ProductMemoryDialog
@@ -155,6 +156,15 @@ class MainWindowSmokeTests(unittest.TestCase):
                         "8",
                     ),
                 ),
+                floor_assignments=(
+                    BookingFloorAssignment(
+                        "M3370492",
+                        "milkrun",
+                        "2F",
+                        "Raw_밀크런",
+                        2,
+                    ),
+                ),
             )
 
             window._render_arrival_sequence(snapshot)
@@ -169,6 +179,10 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window.arrival_summary_tables["floor_targets"].item(2, 1).text(),
                 "31",
             )
+            self.assertEqual(window.arrival_floor_table.item(1, 0).text(), "2F")
+            self.assertEqual(window.arrival_floor_table.item(1, 2).text(), "1")
+            self.assertEqual(window.arrival_floor_table.item(1, 5).text(), "3")
+            self.assertEqual(window.arrival_floor_table.item(1, 6).text(), "3")
         finally:
             window.close()
 

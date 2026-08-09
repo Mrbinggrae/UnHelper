@@ -41,12 +41,23 @@ class ArrivalSequenceEntry:
 
 
 @dataclass(frozen=True)
+class BookingFloorAssignment:
+    booking_key: str
+    booking_type: str
+    floor: str
+    source_sheet: str
+    source_row: int
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class ArrivalSequenceSnapshot:
     workbook: Path
     sheet_name: str
     refreshed_at: datetime
     summary: ArrivalSummary
     entries: tuple[ArrivalSequenceEntry, ...]
+    floor_assignments: tuple[BookingFloorAssignment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,22 @@ class ArrivalVehicle:
     pallet_count: Decimal | None
     category_pallets: tuple[tuple[str, Decimal], ...]
     note: str = ""
+
+    @property
+    def categories(self) -> dict[str, Decimal]:
+        return dict(self.category_pallets)
+
+
+@dataclass(frozen=True)
+class FloorTargetBreakdown:
+    floor: str
+    truck_count: int
+    milkrun_count: int
+    pallet_count: Decimal
+    category_pallets: tuple[tuple[str, Decimal], ...]
+    missing_pallet_rows: int = 0
+    unmapped_bookings: tuple[str, ...] = ()
+    unassigned_raw_bookings: tuple[str, ...] = ()
 
     @property
     def categories(self) -> dict[str, Decimal]:
@@ -115,6 +142,91 @@ def decimal_or_none(value: Any) -> Decimal | None:
     return parsed
 
 
+def normalize_raw_sheet_booking(value: Any, *, prefix: str) -> str:
+    expected_prefix = str(prefix or "").strip().upper()
+    if expected_prefix not in {"M", "T"} or value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        candidate = str(value)
+    elif isinstance(value, float):
+        candidate = str(int(value)) if value.is_integer() else str(value)
+    else:
+        candidate = str(value).strip().replace(",", "")
+    candidate = re.sub(r"\s+", "", candidate).upper()
+    if candidate.startswith(expected_prefix):
+        candidate = candidate[1:]
+    if candidate.endswith(".0") and candidate[:-2].isdigit():
+        candidate = candidate[:-2]
+    if not candidate.isdigit():
+        return ""
+    digits = candidate.lstrip("0") or "0"
+    return f"{expected_prefix}{digits}"
+
+
+def build_floor_target_breakdowns(
+    snapshot: ArrivalSequenceSnapshot,
+    raw_bookings: Mapping[str, RawBookingAggregate],
+) -> tuple[FloorTargetBreakdown, ...]:
+    """Aggregate current RAW vehicles by their B:C floor assignment."""
+
+    categories = ("경량", "중량", "고단", "양곡", "?")
+    states = {
+        "1F": {
+            "truck": 0,
+            "milkrun": 0,
+            "pallets": Decimal("0"),
+            "categories": {category: Decimal("0") for category in categories},
+            "missing": 0,
+            "unmapped": [],
+        },
+        "2F": {
+            "truck": 0,
+            "milkrun": 0,
+            "pallets": Decimal("0"),
+            "categories": {category: Decimal("0") for category in categories},
+            "missing": 0,
+            "unmapped": [],
+        },
+    }
+    seen: set[str] = set()
+    assigned_raw_keys: set[str] = set()
+    for assignment in snapshot.floor_assignments:
+        if assignment.booking_key in seen or assignment.floor not in states:
+            continue
+        seen.add(assignment.booking_key)
+        aggregate = raw_bookings.get(assignment.booking_key)
+        state = states[assignment.floor]
+        if aggregate is None:
+            state["unmapped"].append(assignment.booking_key)
+            continue
+        assigned_raw_keys.add(assignment.booking_key)
+        state[assignment.booking_type] += 1
+        state["pallets"] += aggregate.pallet_count
+        state["missing"] += aggregate.missing_pallet_rows
+        for category, value in aggregate.category_pallets:
+            if category in state["categories"]:
+                state["categories"][category] += value
+
+    unassigned_raw = tuple(sorted(set(raw_bookings) - assigned_raw_keys))
+    return tuple(
+        FloorTargetBreakdown(
+            floor=floor,
+            truck_count=int(state["truck"]),
+            milkrun_count=int(state["milkrun"]),
+            pallet_count=state["pallets"],
+            category_pallets=tuple(
+                (category, state["categories"][category])
+                for category in categories
+                if state["categories"][category] != 0
+            ),
+            missing_pallet_rows=int(state["missing"]),
+            unmapped_bookings=tuple(state["unmapped"]),
+            unassigned_raw_bookings=unassigned_raw,
+        )
+        for floor, state in states.items()
+    )
+
+
 def build_arrival_vehicles(
     snapshot: ArrivalSequenceSnapshot,
     raw_bookings: Mapping[str, RawBookingAggregate],
@@ -122,17 +234,26 @@ def build_arrival_vehicles(
     """Combine live Excel status with current-day RAW pallet classifications."""
 
     vehicles: list[ArrivalVehicle] = []
+    floor_assignments = {
+        assignment.booking_key: assignment
+        for assignment in snapshot.floor_assignments
+    }
     for entry in snapshot.entries:
         floor_match = _FLOOR_PATTERN.search(entry.unloading_floor)
-        floor = f"{floor_match.group(1)}F" if floor_match else ""
+        assignment = floor_assignments.get(entry.booking_key)
+        floor = (
+            f"{floor_match.group(1)}F"
+            if floor_match
+            else (assignment.floor if assignment is not None else "")
+        )
         status = "출차" if entry.unloading_floor.strip() else "외부대기"
         current = raw_bookings.get(entry.booking_key)
         if current is not None:
-            note = (
-                f"팔렛트 수 미입력 SKU {current.missing_pallet_rows}행"
-                if current.missing_pallet_rows
-                else ""
-            )
+            notes = [assignment.note] if assignment is not None and assignment.note else []
+            if current.missing_pallet_rows:
+                notes.append(
+                    f"팔렛트 수 미입력 SKU {current.missing_pallet_rows}행"
+                )
             vehicles.append(
                 ArrivalVehicle(
                     excel_row=entry.excel_row,
@@ -144,7 +265,7 @@ def build_arrival_vehicles(
                     floor=floor,
                     pallet_count=current.pallet_count,
                     category_pallets=current.category_pallets,
-                    note=note,
+                    note=" · ".join(notes),
                 )
             )
             continue
@@ -152,11 +273,11 @@ def build_arrival_vehicles(
         ap_value = decimal_or_none(entry.previous_ap_value)
         aw_value = decimal_or_none(entry.previous_aw_value)
         previous_value = ap_value if ap_value is not None else aw_value
-        note = ""
+        notes = [assignment.note] if assignment is not None and assignment.note else []
         if ap_value is not None and aw_value is not None and ap_value != aw_value:
-            note = f"전일 팔렛트 값 확인 필요 (AP {ap_value} / AW {aw_value})"
+            notes.append(f"전일 팔렛트 값 확인 필요 (AP {ap_value} / AW {aw_value})")
         elif previous_value is None:
-            note = "전일 팔렛트 수 미입력"
+            notes.append("전일 팔렛트 수 미입력")
         vehicles.append(
             ArrivalVehicle(
                 excel_row=entry.excel_row,
@@ -168,7 +289,7 @@ def build_arrival_vehicles(
                 floor=floor,
                 pallet_count=previous_value,
                 category_pallets=(),
-                note=note,
+                note=" · ".join(notes),
             )
         )
     return tuple(vehicles)
@@ -180,6 +301,7 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
     TARGET_SHEET = "입차순번"
     FIRST_DETAIL_ROW = 18
     MAX_DETAIL_ROW = 5000
+    MAX_RAW_ROW = 10000
     _XL_UP = -4162
 
     def __init__(
@@ -249,6 +371,11 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
                 refreshed_at=datetime.now(),
                 summary=self._parse_summary(summary_values),
                 entries=self._parse_entries(detail_values),
+                floor_assignments=self._read_floor_assignments(
+                    excel,
+                    workbook,
+                    cancel_requested=cancel_requested,
+                ),
             )
             self.log(
                 f"입차순번 시트에서 차량 {len(snapshot.entries)}건을 읽었습니다."
@@ -365,6 +492,96 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
             cancel_requested=cancel_requested,
         )
         return min(max(int(last_row), self.FIRST_DETAIL_ROW - 1), self.MAX_DETAIL_ROW)
+
+    def _read_floor_assignments(
+        self,
+        excel: Any,
+        workbook: Any,
+        *,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> tuple[BookingFloorAssignment, ...]:
+        assignments: list[BookingFloorAssignment] = []
+        for sheet_name, booking_type, prefix in (
+            ("Raw_트럭", "truck", "T"),
+            ("Raw_밀크런", "milkrun", "M"),
+        ):
+            sheet = self._run_excel_com_operation(
+                excel,
+                lambda name=sheet_name: workbook.Worksheets(name),
+                f"{sheet_name} 시트 확인",
+                cancel_requested=cancel_requested,
+            )
+            last_row = self._run_excel_com_operation(
+                excel,
+                lambda target=sheet: max(
+                    int(target.Cells(int(target.Rows.Count), column).End(self._XL_UP).Row)
+                    for column in (2, 3)
+                ),
+                f"{sheet_name} 마지막 행 확인",
+                cancel_requested=cancel_requested,
+            )
+            last_row = min(max(int(last_row), 1), self.MAX_RAW_ROW)
+            if last_row < 2:
+                continue
+            values = self._run_excel_com_operation(
+                excel,
+                lambda target=sheet, end=last_row: target.Range(f"B2:C{end}").Value2,
+                f"{sheet_name} 층·번호 읽기",
+                cancel_requested=cancel_requested,
+            )
+            for offset, row in enumerate(self._matrix(values)):
+                floor_text = str(row[0] or "").strip() if len(row) > 0 else ""
+                floor_match = _FLOOR_PATTERN.search(floor_text)
+                booking_key = normalize_raw_sheet_booking(
+                    row[1] if len(row) > 1 else None,
+                    prefix=prefix,
+                )
+                if not booking_key:
+                    continue
+                assignments.append(
+                    BookingFloorAssignment(
+                        booking_key=booking_key,
+                        booking_type=booking_type,
+                        floor=f"{floor_match.group(1)}F" if floor_match else "",
+                        source_sheet=sheet_name,
+                        source_row=2 + offset,
+                        note="" if floor_match else f"층 정보 확인 필요: {floor_text or '(빈값)'}",
+                    )
+                )
+        return self._deduplicate_floor_assignments(assignments)
+
+    @staticmethod
+    def _deduplicate_floor_assignments(
+        assignments: list[BookingFloorAssignment],
+    ) -> tuple[BookingFloorAssignment, ...]:
+        result: list[BookingFloorAssignment] = []
+        positions: dict[str, int] = {}
+        for assignment in assignments:
+            position = positions.get(assignment.booking_key)
+            if position is None:
+                positions[assignment.booking_key] = len(result)
+                result.append(assignment)
+                continue
+            previous = result[position]
+            if not previous.floor and assignment.floor:
+                result[position] = assignment
+                continue
+            if previous.floor and not assignment.floor:
+                continue
+            if previous.floor == assignment.floor:
+                continue
+            floors = "/".join(
+                value for value in dict.fromkeys((previous.floor, assignment.floor)) if value
+            ) or "미입력"
+            result[position] = BookingFloorAssignment(
+                booking_key=previous.booking_key,
+                booking_type=previous.booking_type,
+                floor="",
+                source_sheet=previous.source_sheet,
+                source_row=previous.source_row,
+                note=f"층 정보 충돌: {floors}",
+            )
+        return tuple(result)
 
     @staticmethod
     def _matrix(values: Any) -> tuple[tuple[Any, ...], ...]:

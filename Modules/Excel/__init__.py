@@ -20,8 +20,12 @@ from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceSnapshot,
     ArrivalSummary,
     ArrivalVehicle,
+    BookingFloorAssignment,
+    FloorTargetBreakdown,
     RawBookingAggregate,
+    build_floor_target_breakdowns,
     build_arrival_vehicles,
+    normalize_raw_sheet_booking,
     normalize_sequence_booking,
 )
 
@@ -41,7 +45,11 @@ __all__ = [
     "ArrivalSequenceSnapshot",
     "ArrivalSummary",
     "ArrivalVehicle",
+    "BookingFloorAssignment",
+    "FloorTargetBreakdown",
     "RawBookingAggregate",
+    "build_floor_target_breakdowns",
     "build_arrival_vehicles",
+    "normalize_raw_sheet_booking",
     "normalize_sequence_booking",
 ]

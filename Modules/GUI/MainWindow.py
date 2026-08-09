@@ -66,6 +66,7 @@ from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceReader,
     ArrivalSequenceSnapshot,
     RawBookingAggregate,
+    build_floor_target_breakdowns,
     build_arrival_vehicles,
 )
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
@@ -1061,6 +1062,56 @@ class MainWindow(QMainWindow):
         )
         outer.addLayout(cards)
 
+        floor_card = QFrame()
+        floor_card.setObjectName("DataCard")
+        floor_card.setProperty("card", True)
+        floor_layout = QVBoxLayout(floor_card)
+        floor_layout.setContentsMargins(0, 0, 0, 0)
+        floor_layout.setSpacing(0)
+        floor_title_row = QHBoxLayout()
+        floor_title_row.setContentsMargins(16, 10, 16, 8)
+        floor_title = QLabel("각층 목표 배치 상세")
+        floor_title.setObjectName("DialogHeading")
+        floor_help = QLabel("Excel B열 층 · C열 번호를 RAW의 T/M 예약번호와 연결")
+        floor_help.setObjectName("MutedText")
+        floor_title_row.addWidget(floor_title)
+        floor_title_row.addStretch(1)
+        floor_title_row.addWidget(floor_help)
+        floor_layout.addLayout(floor_title_row)
+        self.arrival_floor_table = QTableWidget(2, 12)
+        self.arrival_floor_table.setObjectName("ArrivalFloorTable")
+        self.arrival_floor_table.setHorizontalHeaderLabels(
+            (
+                "층",
+                "T 차량",
+                "M 차량",
+                "목표 T",
+                "목표 M",
+                "총 팔렛트",
+                "경량",
+                "중량",
+                "고단",
+                "양곡",
+                "미분류",
+                "비고",
+            )
+        )
+        self.arrival_floor_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.arrival_floor_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.arrival_floor_table.verticalHeader().setVisible(False)
+        self.arrival_floor_table.verticalHeader().setDefaultSectionSize(34)
+        floor_header = self.arrival_floor_table.horizontalHeader()
+        for column in range(self.arrival_floor_table.columnCount()):
+            floor_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        floor_header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        self.arrival_floor_table.setFixedHeight(104)
+        floor_layout.addWidget(self.arrival_floor_table)
+        outer.addWidget(floor_card)
+
         detail_card = QFrame()
         detail_card.setObjectName("DataCard")
         detail_card.setProperty("card", True)
@@ -1129,8 +1180,8 @@ class MainWindow(QMainWindow):
         card.setObjectName("ArrivalCard")
         card.setProperty("card", True)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 12, 14, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 8, 12, 10)
+        layout.setSpacing(6)
         label = QLabel(title)
         label.setObjectName("ArrivalCardTitle")
         layout.addWidget(label)
@@ -1141,7 +1192,10 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        table.verticalHeader().setDefaultSectionSize(31)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.verticalHeader().setDefaultSectionSize(22)
+        table.horizontalHeader().setFixedHeight(25)
         table.horizontalHeader().setDefaultSectionSize(70)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         for row in range(len(rows)):
@@ -1149,7 +1203,7 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem("-")
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 table.setItem(row, column, item)
-        table.setFixedHeight(153)
+        table.setFixedHeight(100)
         self.arrival_summary_tables[key] = table
         layout.addWidget(table)
         return card
@@ -1325,13 +1379,51 @@ class MainWindow(QMainWindow):
                     item = table.item(row_index, column_index)
                     item.setText(str(value).strip() or "-")
 
-        vehicles = build_arrival_vehicles(
-            snapshot,
-            self._raw_booking_aggregates(),
-        )
+        raw_bookings = self._raw_booking_aggregates()
+        vehicles = build_arrival_vehicles(snapshot, raw_bookings)
+        floor_breakdowns = build_floor_target_breakdowns(snapshot, raw_bookings)
+        floor_table = self.arrival_floor_table
+        category_order = ("경량", "중량", "고단", GRAIN_CATEGORY, "?")
+        for row_index, breakdown in enumerate(floor_breakdowns):
+            targets = snapshot.summary.floor_targets[row_index]
+            categories = breakdown.categories
+            notes: list[str] = []
+            if breakdown.missing_pallet_rows:
+                notes.append(f"팔렛트 수 미입력 {breakdown.missing_pallet_rows}행")
+            if breakdown.unmapped_bookings:
+                notes.append("RAW 미매칭 " + ", ".join(breakdown.unmapped_bookings))
+            if row_index == 0 and breakdown.unassigned_raw_bookings:
+                missing_keys = breakdown.unassigned_raw_bookings
+                preview = ", ".join(missing_keys[:10])
+                if len(missing_keys) > 10:
+                    preview += f" 외 {len(missing_keys) - 10}건"
+                notes.append("층 미매핑 " + preview)
+            values = (
+                breakdown.floor,
+                str(breakdown.truck_count),
+                str(breakdown.milkrun_count),
+                targets[0] or "-",
+                targets[1] or "-",
+                self._format_decimal(breakdown.pallet_count),
+                *(
+                    self._format_decimal(categories[category])
+                    if category in categories
+                    else "-"
+                    for category in category_order
+                ),
+                " · ".join(notes),
+            )
+            for column_index, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column_index != 11:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column_index == 11:
+                    item.setToolTip(str(value))
+                floor_table.setItem(row_index, column_index, item)
+
         table = self.arrival_detail_table
         table.setRowCount(len(vehicles))
-        category_order = ("경량", "중량", "고단", GRAIN_CATEGORY, "?")
         for row_index, vehicle in enumerate(vehicles):
             categories = vehicle.categories
             values = (

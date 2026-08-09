@@ -10,8 +10,11 @@ from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceReader,
     ArrivalSequenceSnapshot,
     ArrivalSummary,
+    BookingFloorAssignment,
     RawBookingAggregate,
+    build_floor_target_breakdowns,
     build_arrival_vehicles,
+    normalize_raw_sheet_booking,
     normalize_sequence_booking,
 )
 
@@ -75,12 +78,29 @@ class FakeSheet:
 
 class FakeWorksheets:
     def __init__(self, sheet: FakeSheet) -> None:
-        self.sheet = sheet
+        truck_values = (("1F", 456),)
+        milkrun_values = (("2F", 123),)
+        self.sheets = {
+            "입차순번": sheet,
+            "Raw_트럭": FakeFloorSheet(truck_values),
+            "Raw_밀크런": FakeFloorSheet(milkrun_values),
+        }
 
     def __call__(self, key):
-        if key == "입차순번":
-            return self.sheet
-        raise RuntimeError("sheet not found")
+        try:
+            return self.sheets[key]
+        except KeyError as exc:
+            raise RuntimeError("sheet not found") from exc
+
+
+class FakeFloorSheet:
+    def __init__(self, values) -> None:
+        self.Rows = FakeRows()
+        self.Cells = FakeCells(len(values) + 1)
+        self.values = values
+
+    def Range(self, _address: str) -> FakeRange:
+        return FakeRange(self.values)
 
 
 class FakeWorkbook:
@@ -164,6 +184,9 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
         self.assertEqual(normalize_sequence_booking("tbn00123"), ("T123", "truck"))
         self.assertEqual(normalize_sequence_booking("TBN0000456"), ("T456", "truck"))
         self.assertEqual(normalize_sequence_booking("M123"), ("", ""))
+        self.assertEqual(normalize_raw_sheet_booking(123, prefix="M"), "M123")
+        self.assertEqual(normalize_raw_sheet_booking("00123", prefix="T"), "T123")
+        self.assertEqual(normalize_raw_sheet_booking("T123", prefix="T"), "T123")
 
     def test_reads_live_open_workbook_without_closing_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -182,6 +205,10 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
 
             self.assertEqual(result.summary.floor_targets[2], ("100", "200"))
             self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+            self.assertEqual(
+                [(entry.booking_key, entry.floor) for entry in result.floor_assignments],
+                [("T456", "1F"), ("M123", "2F")],
+            )
             self.assertEqual(workbook.close_calls, [])
             self.assertEqual(excel.quit_count, 0)
             self.assertEqual(pythoncom.initialized, 1)
@@ -236,6 +263,41 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
         self.assertEqual(vehicles[1].status, "외부대기")
         self.assertEqual(vehicles[2].pallet_count, Decimal("7"))
         self.assertIn("확인 필요", vehicles[2].note)
+
+    def test_floor_target_breakdown_uses_excel_floor_and_app_raw_prefixes(self) -> None:
+        snapshot = ArrivalSequenceSnapshot(
+            workbook=Path("sample.xlsm"),
+            sheet_name="입차순번",
+            refreshed_at=__import__("datetime").datetime.now(),
+            summary=ArrivalSummary((), (), ()),
+            entries=(),
+            floor_assignments=(
+                BookingFloorAssignment("T123", "truck", "1F", "Raw_트럭", 2),
+                BookingFloorAssignment("M456", "milkrun", "1F", "Raw_밀크런", 2),
+                BookingFloorAssignment("T789", "truck", "2F", "Raw_트럭", 3),
+            ),
+        )
+        raw = {
+            "T123": RawBookingAggregate(
+                "T123", ("트럭",), Decimal("2"), (("중량", Decimal("2")),)
+            ),
+            "M456": RawBookingAggregate(
+                "M456", ("밀크런",), Decimal("3"), (("경량", Decimal("3")),)
+            ),
+            "T789": RawBookingAggregate(
+                "T789", ("트럭2",), Decimal("4"), (("고단", Decimal("4")),)
+            ),
+        }
+
+        first, second = build_floor_target_breakdowns(snapshot, raw)
+
+        self.assertEqual((first.floor, first.truck_count, first.milkrun_count), ("1F", 1, 1))
+        self.assertEqual(first.pallet_count, Decimal("5"))
+        self.assertEqual(first.categories["경량"], Decimal("3"))
+        self.assertEqual(first.categories["중량"], Decimal("2"))
+        self.assertEqual((second.floor, second.truck_count), ("2F", 1))
+        self.assertEqual(second.categories["고단"], Decimal("4"))
+        self.assertEqual(first.unassigned_raw_bookings, ())
 
 
 if __name__ == "__main__":
