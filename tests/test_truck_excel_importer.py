@@ -232,6 +232,35 @@ class TruckExcelImporterTests(unittest.TestCase):
             self.assertEqual(sheet.destination_coordinates, ((1, 3), (1, 21)))
             self.assertEqual(workbook.save_count, 1)
 
+    def test_zero_csv_metrics_are_preserved_for_raw_and_daily_detail_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            rows = (
+                self._headers(),
+                self._row("3370492", "0", "2"),
+                self._row("3370493", "0", "0"),
+            )
+            self._write_csv(source, rows)
+            sheet = _TruckSheet()
+            logs: list[str] = []
+            importer, workbook = self._importer(target, sheet)
+            importer.log = logs.append
+
+            result = importer.import_values(source, target)
+
+            self.assertEqual(result.dispatch_numbers, ("T3370492", "T3370493"))
+            first = result.metrics_by_reservation["T3370492"]
+            second = result.metrics_by_reservation["T3370493"]
+            self.assertEqual((first.unit_count, first.pallet_count), (Decimal("0"), Decimal("2")))
+            self.assertEqual(first.units_per_pallet, Decimal("0"))
+            self.assertEqual((second.unit_count, second.pallet_count), (Decimal("0"), Decimal("0")))
+            self.assertIsNone(second.units_per_pallet)
+            self.assertEqual(sheet.destination.Value2[1][12:14], ("0", "2"))
+            self.assertEqual(sheet.destination.Value2[2][12:14], ("0", "0"))
+            self.assertEqual(workbook.save_count, 1)
+            self.assertEqual(sum("컨테이너 상세 수량" in message for message in logs), 2)
+
     def test_wrong_or_missing_required_headers_are_rejected_before_clear(self) -> None:
         cases = (
             (0, "발주번호", "A열 예약번호"),
@@ -270,7 +299,7 @@ class TruckExcelImporterTests(unittest.TestCase):
     def test_invalid_counts_and_orphan_continuation_are_rejected_before_clear(self) -> None:
         cases = (
             (self._row("3370492", "100", ""), "한쪽만"),
-            (self._row("3370492", "0", "2"), "0보다 큰"),
+            (self._row("3370492", "-1", "2"), "0 이상의"),
             (self._row("3370492", "NaN", "2"), "유한한"),
             (self._row("", "100", "2"), "직전 예약"),
         )

@@ -44,7 +44,9 @@ class TruckReservationMetrics:
     source_rows: tuple[int, ...]
 
     @property
-    def units_per_pallet(self) -> Decimal:
+    def units_per_pallet(self) -> Decimal | None:
+        if self.pallet_count == 0:
+            return None
         with localcontext() as context:
             context.prec = 28
             return self.unit_count / self.pallet_count
@@ -171,8 +173,13 @@ class TruckExcelImporter(MilkrunExcelImporter):
             if not has_units:
                 continue
 
-            units = self._positive_decimal(raw_units, "M열 유닛 수", row_number)
-            pallets = self._positive_decimal(raw_pallets, "N열 팔렛트 수", row_number)
+            units = self._nonnegative_decimal(raw_units, "M열 유닛 수", row_number)
+            pallets = self._nonnegative_decimal(raw_pallets, "N열 팔렛트 수", row_number)
+            if units == 0 or pallets == 0:
+                self.log(
+                    f"트럭 다운로드 데이터 {row_number}행의 M/N 수량에 0이 포함되어 있습니다. "
+                    "RAW 값은 그대로 반영하고 SKU 계산에는 일별 입고 컨테이너 상세 수량을 사용합니다."
+                )
             candidate = (units, pallets)
             previous = metric_values.get(current_reservation)
             if previous is not None and previous != candidate:
@@ -263,7 +270,7 @@ class TruckExcelImporter(MilkrunExcelImporter):
         return True
 
     @staticmethod
-    def _positive_decimal(value: Any, label: str, row_number: int) -> Decimal:
+    def _nonnegative_decimal(value: Any, label: str, row_number: int) -> Decimal:
         if isinstance(value, bool):
             raise ExcelImportError(
                 f"트럭 다운로드 데이터 {row_number}행의 {label} 값이 숫자가 아닙니다. "
@@ -277,9 +284,9 @@ class TruckExcelImporter(MilkrunExcelImporter):
                 f"트럭 다운로드 데이터 {row_number}행의 {label} 값이 숫자가 아닙니다: {value!r}. "
                 "기존 값을 지우지 않았습니다."
             ) from exc
-        if not result.is_finite() or result <= 0:
+        if not result.is_finite() or result < 0:
             raise ExcelImportError(
-                f"트럭 다운로드 데이터 {row_number}행의 {label} 값은 0보다 큰 유한한 숫자여야 합니다: "
+                f"트럭 다운로드 데이터 {row_number}행의 {label} 값은 0 이상의 유한한 숫자여야 합니다: "
                 f"{value!r}. 기존 값을 지우지 않았습니다."
             )
         return result
