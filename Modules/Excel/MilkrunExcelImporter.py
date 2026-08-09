@@ -25,6 +25,10 @@ class ExcelImportError(RuntimeError):
     """Raised when downloaded Milkrun values cannot be written safely."""
 
 
+class ExcelWorkbookOpenError(ExcelImportError):
+    """Raised when UnHelper requires the linked workbook to be closed."""
+
+
 class ExcelImportCancelled(RuntimeError):
     """Raised before the target workbook mutation starts."""
 
@@ -91,10 +95,12 @@ class MilkrunExcelImporter:
         *,
         com_client: Any | None = None,
         pythoncom_module: Any | None = None,
+        reject_open_target: bool = False,
     ):
         self.log = log or (lambda _message: None)
         self._com_client = com_client
         self._pythoncom = pythoncom_module
+        self._reject_open_target = reject_open_target
 
     @classmethod
     def validate_target_path(cls, value: str | Path) -> Path:
@@ -454,6 +460,12 @@ class MilkrunExcelImporter:
         if active_excel is not None:
             open_target = self._find_open_workbook(active_excel, target_path)
             if open_target is not None:
+                if self._reject_open_target:
+                    raise ExcelWorkbookOpenError(
+                        "연결된 입고스케줄 Excel 파일이 열려 있습니다.\n"
+                        "Excel에서 해당 파일을 닫은 뒤 다시 시도해 주세요.\n"
+                        f"파일: {target_path.name}"
+                    )
                 self.log(f"열려 있는 Excel 파일에 연결했습니다: {target_path.name}")
                 return active_excel, open_target, False, False
 

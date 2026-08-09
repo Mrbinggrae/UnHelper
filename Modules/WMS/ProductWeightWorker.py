@@ -51,7 +51,7 @@ class ProductWeightWorker(QThread):
         wms_password: str,
         *,
         evidence_dir: str | Path,
-        quantity_label: str = "박스",
+        quantity_label: str = "유닛",
         crawler_factory: Callable[..., ProductWeightCrawler] = ProductWeightCrawler,
     ) -> None:
         super().__init__()
@@ -61,7 +61,7 @@ class ProductWeightWorker(QThread):
         self.wms_id = str(wms_id or "")
         self.wms_password = str(wms_password or "")
         self.evidence_dir = Path(evidence_dir)
-        self.quantity_label = str(quantity_label or "박스")
+        self.quantity_label = str(quantity_label or "유닛")
         self.crawler_factory = crawler_factory
         self.stop_event = threading.Event()
         self.crawler: ProductWeightCrawler | None = None
@@ -259,6 +259,7 @@ class ProductWeightWorker(QThread):
                         sku_id=sku_id,
                         sku_name=product.sku_name,
                         dispatch_number=product.dispatch_number,
+                        order_number=product.order_number,
                     )
                 )
         return tuple(unique), tuple(failures)

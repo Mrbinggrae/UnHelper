@@ -3,6 +3,7 @@
 from Modules.Excel.MilkrunExcelImporter import (
     ExcelImportCancelled,
     ExcelImportError,
+    ExcelWorkbookOpenError,
     MilkrunExcelImportResult,
     MilkrunExcelImporter,
 )
@@ -16,6 +17,7 @@ from Modules.Excel.TruckExcelImporter import (
 __all__ = [
     "ExcelImportError",
     "ExcelImportCancelled",
+    "ExcelWorkbookOpenError",
     "MilkrunExcelImportResult",
     "MilkrunExcelImporter",
     "TruckExcelImporter",

@@ -27,7 +27,11 @@ from Modules.Common.GitHubIssueReporter import (
     load_github_issue_token,
 )
 from Modules.Common.Credentials import WMSCredentialStore
-from Modules.Excel.MilkrunExcelImporter import ExcelImportError, MilkrunExcelImporter
+from Modules.Excel.MilkrunExcelImporter import (
+    ExcelImportError,
+    ExcelWorkbookOpenError,
+    MilkrunExcelImporter,
+)
 from Modules.GUI.Dialogs import ErrorReportDialog, UpdateHistoryDialog
 from Modules.GUI.MainWindow import MainWindow, MilkrunWorker, SettingsDialog
 from Modules.Shipments.MilkrunDownloader import MilkrunDownloadRequest
@@ -425,6 +429,33 @@ class ErrorReportTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0], FailureDetails)
         self.assertIn("Traceback (most recent call last)", failures[0].detail)
+
+    def test_milkrun_worker_routes_open_excel_to_close_prompt_signal(self) -> None:
+        worker = MilkrunWorker(
+            MilkrunDownloadRequest(download_dir=Path.cwd()),
+            Path("chromedriver.exe"),
+            Path("입고스케줄관리.xlsx"),
+        )
+        prompts = []
+        failures = []
+        worker.excel_close_required.connect(
+            lambda downloaded_file, message: prompts.append((downloaded_file, message))
+        )
+        worker.failed.connect(failures.append)
+
+        with (
+            patch.object(
+                MilkrunExcelImporter,
+                "validate_workbook",
+                side_effect=ExcelWorkbookOpenError("Excel을 닫아 주세요."),
+            ),
+            patch("Modules.GUI.MainWindow.MilkrunDownloader") as downloader_class,
+        ):
+            worker.run()
+
+        self.assertEqual(prompts, [(None, "Excel을 닫아 주세요.")])
+        self.assertEqual(failures, [])
+        downloader_class.assert_not_called()
 
     def test_main_window_routes_milkrun_failure_to_report_dialog(self) -> None:
         window = MainWindow(smoke_test=True)

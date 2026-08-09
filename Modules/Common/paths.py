@@ -45,6 +45,10 @@ def product_memory_path() -> Path:
     return user_data_dir() / "milkrun_product_memory.json"
 
 
+def booking_snapshot_path() -> Path:
+    return user_data_dir() / "raw_table_snapshots.json"
+
+
 def release_manifest_path() -> Path:
     prefix = APP_NAME.replace(" ", "_")
     if getattr(sys, "frozen", False):

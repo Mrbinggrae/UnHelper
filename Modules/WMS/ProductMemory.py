@@ -128,8 +128,11 @@ def calculate_boxes_per_pallet(
     box_count: Any,
     pallet_count: Any,
 ) -> Decimal:
-    """Calculate a shipment's box count per pallet without requiring WMS data."""
-    boxes = _positive_decimal(box_count, "박스 수")
+    """Calculate SKU units per pallet without requiring WMS data.
+
+    Legacy public/model names are retained for persisted JSON compatibility.
+    """
+    boxes = _positive_decimal(box_count, "유닛 수")
     pallets = _positive_decimal(pallet_count, "팔레트 수")
 
     with localcontext() as context:
@@ -142,7 +145,7 @@ def calculate_pallet_measurement(
     box_count: Any,
     pallet_count: Any,
 ) -> tuple[Decimal, Decimal, str]:
-    """Calculate boxes/pallet, kg/pallet, and the unrounded threshold result."""
+    """Calculate units/pallet, kg/pallet, and the unrounded threshold result."""
     weight = _positive_decimal(weight_grams, "상품 무게(g)")
     boxes_per_pallet = calculate_boxes_per_pallet(box_count, pallet_count)
 
@@ -255,7 +258,7 @@ def _record_from_json(raw: Any, index: int) -> ProductMemoryRecord:
             pallet_weight_kg = None
             automatic_category = ""
         else:
-            boxes_per_pallet = _positive_decimal(raw["boxes_per_pallet"], "팔레트당 박스 수")
+            boxes_per_pallet = _positive_decimal(raw["boxes_per_pallet"], "팔렛트당 유닛 수")
             pallet_weight_kg = _positive_decimal(raw["pallet_weight_kg"], "팔레트 무게(kg)")
             automatic_category = _validated_automatic_category(raw["automatic_category"])
 
@@ -620,6 +623,57 @@ class ProductMemory:
             ordered = sorted(self._records.values(), key=_record_sort_key)
             _atomic_write_json(destination, _payload_for(ordered))
         return destination
+
+    def export_payload(self, sku_ids: Iterable[Any] | None = None) -> dict[str, Any]:
+        """Return a validated JSON payload, optionally limited to selected SKUs."""
+        with self._lock:
+            if sku_ids is None:
+                records = tuple(self._records.values())
+            else:
+                selected: set[str] = set()
+                for value in sku_ids:
+                    try:
+                        selected.add(normalize_sku_id(value))
+                    except ValueError:
+                        continue
+                records = tuple(
+                    record
+                    for sku_id, record in self._records.items()
+                    if sku_id in selected
+                )
+            return _payload_for(sorted(records, key=_record_sort_key))
+
+    @staticmethod
+    def validate_payload(payload: Mapping[str, Any]) -> tuple[ProductMemoryRecord, ...]:
+        records, duplicate_count = _validated_payload(payload)
+        if duplicate_count:
+            raise ValueError("가져올 상품 메모리에 중복 SKU ID가 있습니다.")
+        return tuple(records)
+
+    def import_records(
+        self,
+        records: Iterable[ProductMemoryRecord],
+    ) -> ImportSummary:
+        validated = tuple(
+            _record_from_json(_record_to_json(record), index)
+            for index, record in enumerate(records)
+        )
+        with self._lock:
+            new_records = dict(self._records)
+            added = 0
+            skipped = 0
+            for record in validated:
+                if record.sku_id in new_records:
+                    skipped += 1
+                    continue
+                new_records[record.sku_id] = record
+                added += 1
+            if added:
+                self._commit(new_records)
+            return ImportSummary(added=added, skipped=skipped)
+
+    def import_payload(self, payload: Mapping[str, Any]) -> ImportSummary:
+        return self.import_records(self.validate_payload(payload))
 
     def import_from(self, path: str | os.PathLike[str]) -> ImportSummary:
         source = Path(path)

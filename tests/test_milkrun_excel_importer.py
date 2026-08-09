@@ -9,6 +9,7 @@ from unittest import mock
 from Modules.Excel.MilkrunExcelImporter import (
     ExcelImportCancelled,
     ExcelImportError,
+    ExcelWorkbookOpenError,
     MilkrunExcelImporter,
 )
 
@@ -294,6 +295,34 @@ class FakeComClient:
 
 
 class MilkrunExcelImporterTests(unittest.TestCase):
+    def test_reject_open_target_mode_requests_excel_close_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _source, target = self._paths(root)
+            sheet = FakeTargetSheet()
+            target_book = FakeWorkbook(
+                target,
+                FakeWorksheets(target_sheet=sheet),
+            )
+            excel = FakeExcel(FakeWorkbooks(open_books=[target_book]))
+            client = FakeComClient(active_excel=excel)
+            importer = MilkrunExcelImporter(
+                com_client=client,
+                pythoncom_module=FakePythonCom(),
+                reject_open_target=True,
+            )
+
+            with self.assertRaisesRegex(
+                ExcelWorkbookOpenError,
+                "Excel에서 해당 파일을 닫은 뒤",
+            ):
+                importer.validate_workbook(target)
+
+            self.assertEqual(client.dispatch_count, 0)
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
+            self.assertEqual(target_book.close_calls, [])
+
     def _paths(self, root: Path, source_name: str = "download.csv") -> tuple[Path, Path]:
         source = root / source_name
         target = root / "입고스케줄관리.xlsx"

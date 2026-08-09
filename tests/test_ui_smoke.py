@@ -15,6 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QDate, QSettings, QThread
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
+from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
 from Modules.Common.Credentials import WMSCredentialStore
 from Modules.Common.ErrorReport import FailureDetails
 from Modules.GUI.MainWindow import MainWindow, SettingsDialog, _open_product_memory_with_recovery
@@ -63,6 +64,9 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.get_data_button.text(), "데이터 얻기")
             self.assertEqual(window.raw_table.columnCount(), 10)
             self.assertEqual(window.raw_table.horizontalHeaderItem(0).text(), "거래처 이름")
+            self.assertEqual(window.raw_table.horizontalHeaderItem(1).text(), "발주번호")
+            self.assertEqual(window.raw_table.horizontalHeaderItem(3).text(), "유닛 수")
+            self.assertEqual(window.raw_table.horizontalHeaderItem(4).text(), "팔렛트당 유닛")
             self.assertEqual(window.raw_table.horizontalHeaderItem(6).text(), "SKU 명")
             self.assertEqual(window.raw_table.horizontalHeaderItem(9).text(), "분류")
             self.assertFalse(window.raw_table.wordWrap())
@@ -566,6 +570,27 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 dialog.close()
 
+    def test_open_excel_uses_close_prompt_instead_of_error_report(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            with (
+                patch.object(QMessageBox, "warning") as warning,
+                patch.object(window, "_show_error_dialog") as error_dialog,
+            ):
+                window._on_excel_close_required(
+                    Path("download.csv"),
+                    "연결된 입고스케줄 Excel 파일이 열려 있습니다.",
+                )
+
+            error_dialog.assert_not_called()
+            warning.assert_called_once()
+            self.assertEqual(warning.call_args.args[1], "Excel을 닫아 주세요")
+            self.assertIn("파일을 닫은 뒤", warning.call_args.args[2])
+            self.assertIn("download.csv", warning.call_args.args[2])
+            self.assertEqual(window.status_label.text(), "Excel 닫기 필요")
+        finally:
+            window.close()
+
     def test_main_window_persists_auto_or_manual_base_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -603,6 +628,231 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(reopened.manual_base_date.date(), QDate(2026, 8, 8))
             finally:
                 reopened.close()
+
+    def test_recent_date_snapshot_restores_tables_and_memory_without_wms(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            snapshot_path = root / "snapshots.json"
+            memory_path = root / "memory.json"
+            store = BookingSnapshotStore(snapshot_path)
+            store.save_table(
+                date(2026, 8, 9),
+                "milkrun",
+                (
+                    MilkrunProductRow(
+                        "복원 거래처",
+                        "10807763",
+                        "1",
+                        "2",
+                        "123",
+                        "복원 상품 / A",
+                        "M3370492",
+                    ),
+                ),
+            )
+            store.save_table(
+                date(2026, 8, 9),
+                "truck",
+                (
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_1",
+                        "2",
+                        "10",
+                        "456",
+                        "트럭 상품",
+                        "T3372829",
+                    ),
+                ),
+            )
+            memory = ProductMemory(memory_path)
+            record = memory.upsert_measurement("123", "복원 상품 / A", "1000", "2", "1")
+            memory.set_manual_category("123", "고단")
+            memory.upsert_measurement("456", "트럭 상품", "2000", "10", "2")
+
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=memory_path,
+                snapshot_file=snapshot_path,
+            )
+            try:
+                self.assertEqual(window.raw_table.rowCount(), 1)
+                self.assertEqual(window.raw_table.item(0, 0).text(), "복원 거래처")
+                self.assertEqual(window.raw_table.item(0, 7).text(), "1000")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "고단")
+                self.assertEqual(window.truck_table.rowCount(), 1)
+                self.assertEqual(window.truck_table.item(0, 7).text(), "2000")
+                self.assertIsNone(window.milkrun_worker)
+                self.assertIsNone(window.weight_worker)
+                self.assertIn("저장 표 복원됨", window.status_label.text())
+            finally:
+                window.close()
+
+    def test_completed_pipeline_automatically_saves_its_actual_base_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot_path = root / "snapshots.json"
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=root / "memory.json",
+                snapshot_file=snapshot_path,
+            )
+            product = MilkrunProductRow(
+                "자동 저장 거래처",
+                "10807763",
+                "1",
+                "2",
+                "123",
+                "자동 저장 상품",
+                "M3370492",
+                "138700001",
+            )
+            result = mock.Mock(
+                booking_type="milkrun",
+                base_date=date(2026, 8, 7),
+                excel=mock.Mock(
+                    source_file=Path("download.csv"),
+                    target_workbook=Path("입고스케줄관리.xlsx"),
+                    sheet_name="Raw_밀크런",
+                    rows=2,
+                    columns=14,
+                    filtered_rows=0,
+                ),
+                daily_inbound=mock.Mock(
+                    products=(product,),
+                    unmatched_dispatches=(),
+                    empty_detail_dispatches=(),
+                ),
+            )
+            try:
+                with patch.object(window, "_start_weight_lookup") as start_weight:
+                    window._on_milkrun_completed(result)
+
+                saved = BookingSnapshotStore(snapshot_path).get(date(2026, 8, 7))
+                self.assertEqual(saved.milkrun_products, (product,))
+                self.assertEqual(window.raw_table.item(0, 1).text(), "138700001")
+                start_weight.assert_called_once_with(window.current_products)
+            finally:
+                window.close()
+
+    def test_changing_base_date_loads_snapshot_or_clears_previous_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-08")
+            snapshot_path = root / "snapshots.json"
+            store = BookingSnapshotStore(snapshot_path)
+            store.save_table(
+                date(2026, 8, 8),
+                "milkrun",
+                (MilkrunProductRow("A", "100", "1", "2", "123", "첫날", "M1"),),
+            )
+            store.save_table(
+                date(2026, 8, 9),
+                "milkrun",
+                (MilkrunProductRow("B", "200", "1", "3", "456", "둘째날", "M2"),),
+            )
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=root / "memory.json",
+                snapshot_file=snapshot_path,
+            )
+            try:
+                self.assertEqual(window.raw_table.item(0, 6).text(), "첫날")
+
+                window.manual_base_date.setDate(QDate(2026, 8, 9))
+                self.assertEqual(window.raw_table.item(0, 6).text(), "둘째날")
+
+                window.manual_base_date.setDate(QDate(2026, 8, 10))
+                self.assertEqual(window.raw_table.rowCount(), 0)
+                self.assertEqual(window.truck_table.rowCount(), 0)
+            finally:
+                window.close()
+
+    def test_table_bundle_import_restores_date_rows_and_related_sku_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_store = BookingSnapshotStore(root / "source-snapshots.json")
+            selected = date(2026, 8, 9)
+            source_store.save_table(
+                selected,
+                "milkrun",
+                (
+                    MilkrunProductRow(
+                        "공유 거래처",
+                        "10807763",
+                        "1",
+                        "2",
+                        "123",
+                        "공유 상품",
+                        "M3370492",
+                    ),
+                ),
+            )
+            source_memory = ProductMemory(root / "source-memory.json")
+            source_memory.upsert_measurement("123", "공유 상품", "1500", "2", "1")
+            bundle = root / "shared.json"
+            source_store.export_bundle(
+                selected,
+                bundle,
+                source_memory.export_payload({"123"}),
+            )
+
+            settings = QSettings(
+                str(root / "destination-settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            destination_memory = root / "destination-memory.json"
+            destination_snapshots = root / "destination-snapshots.json"
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=destination_memory,
+                snapshot_file=destination_snapshots,
+            )
+            try:
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getOpenFileName",
+                        return_value=(str(bundle), ""),
+                    ),
+                    patch.object(QMessageBox, "information") as information,
+                ):
+                    window.import_table_snapshot()
+
+                self.assertEqual(window.base_date_mode.currentData(), "manual")
+                self.assertEqual(window.manual_base_date.date(), QDate(2026, 8, 9))
+                self.assertEqual(window.raw_table.item(0, 0).text(), "공유 거래처")
+                self.assertEqual(window.raw_table.item(0, 7).text(), "1500")
+                self.assertEqual(ProductMemory(destination_memory).get("123").weight_grams, Decimal("1500"))
+                information.assert_called_once()
+
+                exported = root / "re-exported.json"
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getSaveFileName",
+                        return_value=(str(exported), ""),
+                    ),
+                    patch.object(QMessageBox, "information"),
+                ):
+                    window.export_table_snapshot()
+                self.assertTrue(exported.is_file())
+            finally:
+                window.close()
 
     def test_manual_base_date_reaches_milkrun_and_truck_start_button_requests(self) -> None:
         cases = (
@@ -848,6 +1098,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "123",
                     "사과 상품",
                     "M3370492",
+                    "138100001",
                 ),
                 MilkrunProductRow(
                     "거래처 알파",
@@ -857,6 +1108,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "456",
                     "배 상품",
                     "M3370492",
+                    "138100002",
                 ),
                 MilkrunProductRow(
                     "거래처 베타",
@@ -866,6 +1118,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                     "789",
                     "독립 상품",
                     "M3370493",
+                    "138100003",
                 ),
             )
             window._populate_milkrun_products(milkrun_products)
@@ -875,7 +1128,11 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertFalse(window.raw_table.isRowHidden(1))
             self.assertTrue(window.raw_table.isRowHidden(2))
 
-            window.milkrun_search_input.setText("10808888 789")
+            self.assertEqual(window.raw_table.item(0, 1).text(), "138100001")
+            self.assertEqual(window.raw_table.item(1, 1).text(), "138100002")
+            self.assertEqual(window.raw_table.rowSpan(0, 1), 1)
+
+            window.milkrun_search_input.setText("138100003 789")
             self.assertTrue(window.raw_table.isRowHidden(0))
             self.assertTrue(window.raw_table.isRowHidden(1))
             self.assertFalse(window.raw_table.isRowHidden(2))

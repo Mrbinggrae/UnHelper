@@ -20,6 +20,7 @@ class MilkrunProductRow:
     sku_id: str
     sku_name: str
     dispatch_number: str = ""
+    order_number: str = ""
 
 
 def normalize_booking_number(value: Any, *, prefix: str) -> str:
@@ -147,6 +148,12 @@ def _clean_vendor_name(value: Any) -> str:
     return _VENDOR_CODE_SUFFIX.sub("", _clean_text(value)).strip()
 
 
+def _clean_order_number(value: Any) -> str:
+    text = _clean_text(value)
+    match = re.search(r"\d{5,20}", text)
+    return match.group(0) if match else text
+
+
 def parse_detail_table_cells(
     rows: Iterable[Sequence[Any]],
     *,
@@ -221,20 +228,19 @@ def parse_detail_table_cells(
     if normalized_prefix != "M":
         raise ValueError(f"지원하지 않는 입고 예약 접두사입니다: {booking_prefix!r}")
 
-    current_group: tuple[str, str, str, str] | None = None
+    current_group: tuple[str, str, str] | None = None
     parsed: list[MilkrunProductRow] = []
 
     for raw_cells in rows:
         cells = tuple(_clean_text(value) for value in raw_cells)
-        # A new vendor/milkrun group contributes the first four cells. The
-        # remaining five cells are shipment id, image, SKU id/name, barcode,
-        # and quantity; continuation rows contain only the final five cells.
+        # The detail's group-level box count is intentionally ignored. WMS
+        # ``hidden-weight`` is a one-unit weight, so each SKU row's final
+        # confirmed-order quantity is the value used for pallet calculation.
         if len(cells) >= 9:
             current_group = (
                 _clean_vendor_name(cells[0]),
                 cells[1],
                 cells[2],
-                cells[3],
             )
         if current_group is None or len(cells) < 5:
             continue
@@ -242,9 +248,12 @@ def parse_detail_table_cells(
         if len(cells) >= 8:
             sku_id = cells[6]
             sku_name = cells[7]
+            order_number = _clean_order_number(cells[4])
         else:
             sku_id = cells[-4]
             sku_name = cells[-3]
+            order_number = _clean_order_number(cells[0])
+        unit_count = cells[-1]
         if not sku_id and not sku_name:
             continue
         parsed.append(
@@ -252,13 +261,15 @@ def parse_detail_table_cells(
                 vendor_name=current_group[0],
                 milkrun_number=current_group[1],
                 pallet_count=current_group[2],
-                box_count=current_group[3],
+                # Field name retained for snapshot/JSON backward compatibility.
+                box_count=unit_count,
                 sku_id=sku_id,
                 sku_name=sku_name,
                 dispatch_number=normalize_booking_number(
                     dispatch_number,
                     prefix=booking_prefix,
                 ),
+                order_number=order_number,
             )
         )
 

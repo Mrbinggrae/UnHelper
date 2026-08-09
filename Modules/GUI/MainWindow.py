@@ -38,12 +38,22 @@ from Modules.Common.Credentials import (
     WMSCredentials,
     WMSCredentialStore,
 )
-from Modules.Common.paths import chromedriver_path, default_download_dir, product_memory_path
+from Modules.Common.BookingSnapshotStore import (
+    BookingDateSnapshot,
+    BookingSnapshotStore,
+)
+from Modules.Common.paths import (
+    booking_snapshot_path,
+    chromedriver_path,
+    default_download_dir,
+    product_memory_path,
+)
 from Modules.Common.version import CURRENT_VERSION
 from Modules.Common.ErrorReport import FailureDetails
 from Modules.Excel.MilkrunExcelImporter import (
     ExcelImportCancelled,
     ExcelImportError,
+    ExcelWorkbookOpenError,
     MilkrunExcelImportResult,
     MilkrunExcelImporter,
 )
@@ -94,12 +104,14 @@ class MilkrunPipelineResult:
     excel: MilkrunExcelImportResult | TruckExcelImportResult
     daily_inbound: DailyInboundResult
     booking_type: str = "milkrun"
+    base_date: date | None = None
 
 
 class MilkrunWorker(QThread):
     log_updated = Signal(str)
     completed = Signal(object)
     excel_failed = Signal(object, object)
+    excel_close_required = Signal(object, str)
     detail_failed = Signal(object, object)
     detail_cancelled = Signal(object, str)
     failed = Signal(object)
@@ -128,9 +140,15 @@ class MilkrunWorker(QThread):
             is_truck = self.booking_type == "truck"
             booking_label = "트럭" if is_truck else "Milkrun"
             importer = (
-                TruckExcelImporter(log=self.log_updated.emit)
+                TruckExcelImporter(
+                    log=self.log_updated.emit,
+                    reject_open_target=True,
+                )
                 if is_truck
-                else MilkrunExcelImporter(log=self.log_updated.emit)
+                else MilkrunExcelImporter(
+                    log=self.log_updated.emit,
+                    reject_open_target=True,
+                )
             )
             self.log_updated.emit("연결된 Excel 파일을 확인합니다.")
             importer.validate_workbook(self.target_workbook)
@@ -198,13 +216,21 @@ class MilkrunWorker(QThread):
                         import_result,
                     )
             self.completed.emit(
-                MilkrunPipelineResult(import_result, daily_result, self.booking_type)
+                MilkrunPipelineResult(
+                    import_result,
+                    daily_result,
+                    self.booking_type,
+                    download_result.base_date,
+                )
             )
         except (AutomationCancelled, ExcelImportCancelled) as exc:
             if import_result is not None:
                 self.detail_cancelled.emit(import_result, str(exc))
             else:
                 self.cancelled.emit(str(exc))
+        except ExcelWorkbookOpenError as exc:
+            downloaded_file = download_result.file_path if download_result is not None else None
+            self.excel_close_required.emit(downloaded_file, str(exc))
         except ExcelImportError as exc:
             failure = FailureDetails.from_exception(exc)
             if download_result is not None:
@@ -727,6 +753,8 @@ class MainWindow(QMainWindow):
         smoke_test: bool = False,
         *,
         settings: QSettings | None = None,
+        product_memory_file: str | Path | None = None,
+        snapshot_file: str | Path | None = None,
     ):
         super().__init__()
         self.setObjectName("MainWindow")
@@ -735,7 +763,13 @@ class MainWindow(QMainWindow):
         self._base_date_load_error = ""
         self.milkrun_worker: MilkrunWorker | None = None
         self.weight_worker: ProductWeightWorker | None = None
-        self.product_memory_file = product_memory_path()
+        self.product_memory_file = (
+            Path(product_memory_file) if product_memory_file else product_memory_path()
+        )
+        self.booking_snapshot_file = (
+            Path(snapshot_file) if snapshot_file else booking_snapshot_path()
+        )
+        self._snapshot_restore_enabled = not smoke_test or snapshot_file is not None
         self.current_products = ()
         self.current_pipeline_result: MilkrunPipelineResult | None = None
         self._products_by_booking: dict[str, tuple] = {"milkrun": (), "truck": ()}
@@ -769,6 +803,8 @@ class MainWindow(QMainWindow):
         self.resize(1400, 820)
         self.setMinimumSize(1024, 650)
         self._build_ui()
+        if self._snapshot_restore_enabled:
+            self._restore_snapshot_for_selected_date(announce=True, clear_if_missing=False)
         if not smoke_test:
             QTimer.singleShot(1200, self.check_for_update)
 
@@ -859,11 +895,23 @@ class MainWindow(QMainWindow):
         self.log_toggle_button.setObjectName("LogToggleButton")
         self.log_toggle_button.setCheckable(True)
         self.log_toggle_button.clicked.connect(self._toggle_log_view)
+        self.import_table_button = QPushButton("표 가져오기")
+        self.import_table_button.setToolTip(
+            "다른 사용자가 내보낸 기준일 RAW 표와 SKU 무게·분류를 가져옵니다."
+        )
+        self.import_table_button.clicked.connect(self.import_table_snapshot)
+        self.export_table_button = QPushButton("표 내보내기")
+        self.export_table_button.setToolTip(
+            "선택한 기준일의 Milkrun·트럭 표와 관련 SKU 무게·분류를 내보냅니다."
+        )
+        self.export_table_button.clicked.connect(self.export_table_snapshot)
         self.open_folder_button = QPushButton("다운로드 폴더 열기")
         self.open_folder_button.clicked.connect(self.open_download_folder)
         status_row.addWidget(status_dot)
         status_row.addWidget(self.status_label, 1)
         status_row.addWidget(self.log_toggle_button)
+        status_row.addWidget(self.import_table_button)
+        status_row.addWidget(self.export_table_button)
         status_row.addWidget(self.open_folder_button)
         footer_layout.addLayout(status_row)
         self.log_view = QPlainTextEdit()
@@ -960,7 +1008,7 @@ class MainWindow(QMainWindow):
         search_input.setPlaceholderText(
             "거래처 이름, 예약번호, SKU ID, SKU 명 검색"
             if is_truck
-            else "거래처 이름, 밀크런 번호, SKU ID, SKU 명 검색"
+            else "거래처 이름, 발주번호, SKU ID, SKU 명 검색"
         )
         search_input.textChanged.connect(
             lambda text, kind=booking_type: self._filter_booking_table(kind, text)
@@ -987,10 +1035,10 @@ class MainWindow(QMainWindow):
                 if is_truck
                 else [
                 "거래처 이름",
-                "밀크런 번호",
+                "발주번호",
                 "팔렛트 수",
-                "박스 수",
-                "팔렛트당 박스",
+                "유닛 수",
+                "팔렛트당 유닛",
                 "SKU ID",
                 "SKU 명",
                 "상품 무게(g)",
@@ -1113,6 +1161,11 @@ class MainWindow(QMainWindow):
             self.manual_base_date.date().toString(Qt.DateFormat.ISODate),
         )
         self.settings.sync()
+        if self._snapshot_restore_enabled and not self._automation_worker_running():
+            self._restore_snapshot_for_selected_date(
+                announce=True,
+                clear_if_missing=True,
+            )
 
     def _sync_base_date_controls(self) -> None:
         working = self._automation_worker_running()
@@ -1134,6 +1187,232 @@ class MainWindow(QMainWindow):
         if not selected.isValid():
             raise ValueError("메인 화면에서 올바른 수동 기준일을 선택해 주세요.")
         return date(selected.year(), selected.month(), selected.day())
+
+    def _selected_snapshot_date(self) -> date | None:
+        mode = self.base_date_mode.currentData()
+        if mode == "auto":
+            return date.today()
+        if mode != "manual":
+            return None
+        selected = self.manual_base_date.date()
+        if not selected.isValid():
+            return None
+        return date(selected.year(), selected.month(), selected.day())
+
+    def _clear_booking_snapshot_view(self) -> None:
+        for booking_type in ("milkrun", "truck"):
+            table = self._table_for_booking(booking_type)
+            table.clearSpans()
+            table.setRowCount(0)
+            self._products_by_booking[booking_type] = ()
+            self._pipeline_results_by_booking[booking_type] = None
+            self._group_categories_for_booking(booking_type).clear()
+        self.current_products = ()
+        self.current_pipeline_result = None
+        self._weight_records.clear()
+        self._weight_failures.clear()
+        self._weight_row_errors.clear()
+
+    def _restore_booking_snapshot(
+        self,
+        snapshot: BookingDateSnapshot,
+        *,
+        announce: bool,
+    ) -> None:
+        self._clear_booking_snapshot_view()
+        self._populate_booking_products(snapshot.truck_products, "truck")
+        self._populate_booking_products(snapshot.milkrun_products, "milkrun")
+        self._active_booking_type = (
+            "truck" if self.raw_tabs.currentIndex() == 0 else "milkrun"
+        )
+        self.current_products = self._products_by_booking[self._active_booking_type]
+        self.current_pipeline_result = None
+        if any(self._products_by_booking.values()):
+            self._refresh_current_product_memory(announce=False)
+        if announce:
+            self.append_log(
+                f"저장된 {snapshot.base_date:%Y-%m-%d} RAW 표를 복원했습니다: "
+                f"Milkrun {len(snapshot.milkrun_products)}행 · "
+                f"트럭 {len(snapshot.truck_products)}행"
+            )
+            self.status_label.setText(
+                f"{snapshot.base_date:%Y-%m-%d} 저장 표 복원됨"
+            )
+
+    def _restore_snapshot_for_selected_date(
+        self,
+        *,
+        announce: bool,
+        clear_if_missing: bool,
+    ) -> bool:
+        selected_date = self._selected_snapshot_date()
+        if selected_date is None:
+            return False
+        try:
+            snapshot = BookingSnapshotStore(self.booking_snapshot_file).get(selected_date)
+        except Exception as exc:
+            if clear_if_missing:
+                self._clear_booking_snapshot_view()
+            self.append_log(f"[저장 표 읽기 오류] {exc}")
+            self.status_label.setText("저장 표 읽기 실패")
+            return False
+        if snapshot is None:
+            if clear_if_missing:
+                self._clear_booking_snapshot_view()
+                self.append_log(
+                    f"{selected_date:%Y-%m-%d}에 저장된 RAW 표가 없습니다."
+                )
+                self.status_label.setText("선택한 기준일의 저장 표 없음")
+            return False
+        self._restore_booking_snapshot(snapshot, announce=announce)
+        return True
+
+    def _save_booking_snapshot(
+        self,
+        base_date: date,
+        booking_type: str,
+        products,
+    ) -> None:
+        try:
+            BookingSnapshotStore(self.booking_snapshot_file).save_table(
+                base_date,
+                booking_type,
+                tuple(products),
+            )
+            self.append_log(
+                f"{base_date:%Y-%m-%d} {self._booking_label(booking_type)} 표를 "
+                "로컬에 저장했습니다. 최근 2개 기준일만 유지합니다."
+            )
+        except Exception as exc:
+            self.append_log(f"[RAW 표 자동 저장 오류] {exc}")
+            QMessageBox.warning(
+                self,
+                "RAW 표 저장 실패",
+                "표 표시는 완료했지만 재실행 복원용 파일을 저장하지 못했습니다.\n\n"
+                f"{exc}",
+            )
+
+    def _set_manual_snapshot_date(self, base_date: date) -> None:
+        self.base_date_mode.blockSignals(True)
+        self.manual_base_date.blockSignals(True)
+        try:
+            self.base_date_mode.setCurrentIndex(
+                self.base_date_mode.findData("manual")
+            )
+            self.manual_base_date.setDate(
+                QDate(base_date.year, base_date.month, base_date.day)
+            )
+        finally:
+            self.manual_base_date.blockSignals(False)
+            self.base_date_mode.blockSignals(False)
+        self._base_date_load_error = ""
+        self.settings.setValue("base_date_mode", "manual")
+        self.settings.setValue("manual_base_date", base_date.isoformat())
+        self.settings.sync()
+        self._sync_base_date_controls()
+
+    def export_table_snapshot(self) -> None:
+        selected_date = self._selected_snapshot_date()
+        if selected_date is None:
+            QMessageBox.warning(
+                self,
+                "기준일 확인",
+                "내보낼 기준일을 자동 또는 수동으로 먼저 선택해 주세요.",
+            )
+            return
+        store = BookingSnapshotStore(self.booking_snapshot_file)
+        try:
+            snapshot = store.get(selected_date)
+            if snapshot is None:
+                QMessageBox.information(
+                    self,
+                    "내보낼 표 없음",
+                    f"{selected_date:%Y-%m-%d}에 저장된 RAW 표가 없습니다.",
+                )
+                return
+            sku_ids = {
+                product.sku_id
+                for booking_type in ("milkrun", "truck")
+                for product in snapshot.products_for(booking_type)
+            }
+            memory = ProductMemory(self.product_memory_file)
+            product_payload = memory.export_payload(sku_ids)
+        except Exception as exc:
+            self._show_error_dialog(
+                "RAW 표 내보내기 실패",
+                FailureDetails.from_exception(exc),
+                category="RAW 표 저장·공유",
+            )
+            return
+
+        default_path = default_download_dir() / (
+            f"UnHelper_RAW_표_{selected_date:%Y%m%d}.json"
+        )
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "RAW 표 내보내기",
+            str(default_path),
+            "UnHelper RAW 표 (*.json)",
+        )
+        if not path:
+            return
+        destination = Path(path)
+        if destination.suffix.lower() != ".json":
+            destination = destination.with_suffix(".json")
+        try:
+            exported = store.export_bundle(
+                selected_date,
+                destination,
+                product_payload,
+            )
+        except Exception as exc:
+            self._show_error_dialog(
+                "RAW 표 내보내기 실패",
+                FailureDetails.from_exception(exc),
+                category="RAW 표 저장·공유",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "RAW 표 내보내기 완료",
+            f"{selected_date:%Y-%m-%d} 표를 저장했습니다.\n\n{exported}",
+        )
+
+    def import_table_snapshot(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "RAW 표 가져오기",
+            str(default_download_dir()),
+            "UnHelper RAW 표 (*.json)",
+        )
+        if not path:
+            return
+        try:
+            snapshot, product_payload = BookingSnapshotStore.read_bundle(path)
+            records = ProductMemory.validate_payload(product_payload)
+            memory = ProductMemory(self.product_memory_file)
+            store = BookingSnapshotStore(self.booking_snapshot_file)
+            store.save_snapshot(snapshot)
+            summary = memory.import_records(records)
+            self._set_manual_snapshot_date(snapshot.base_date)
+            self._restore_snapshot_for_selected_date(
+                announce=True,
+                clear_if_missing=True,
+            )
+        except Exception as exc:
+            self._show_error_dialog(
+                "RAW 표 가져오기 실패",
+                FailureDetails.from_exception(exc),
+                category="RAW 표 저장·공유",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "RAW 표 가져오기 완료",
+            f"{snapshot.base_date:%Y-%m-%d} 표를 가져왔습니다.\n"
+            f"상품 메모리 추가 {summary.added}개 · 기존 값 유지 {summary.skipped}개\n\n"
+            "기존 SKU 메모리는 덮어쓰지 않았습니다.",
+        )
 
     def _start_booking_download(self, booking_type: str) -> None:
         if self._automation_worker_running():
@@ -1221,6 +1500,7 @@ class MainWindow(QMainWindow):
         self.milkrun_worker.log_updated.connect(self.append_log)
         self.milkrun_worker.completed.connect(self._on_milkrun_completed)
         self.milkrun_worker.excel_failed.connect(self._on_milkrun_excel_failed)
+        self.milkrun_worker.excel_close_required.connect(self._on_excel_close_required)
         self.milkrun_worker.detail_failed.connect(self._on_milkrun_detail_failed)
         self.milkrun_worker.detail_cancelled.connect(self._on_milkrun_detail_cancelled)
         self.milkrun_worker.failed.connect(self._on_milkrun_failed)
@@ -1256,6 +1536,13 @@ class MainWindow(QMainWindow):
         self.current_pipeline_result = result
         self._pipeline_results_by_booking[booking_type] = result
         self._populate_booking_products(daily.products, booking_type)
+        snapshot_date = getattr(result, "base_date", None) or self._selected_snapshot_date()
+        if snapshot_date is not None:
+            self._save_booking_snapshot(
+                snapshot_date,
+                booking_type,
+                daily.products,
+            )
         self.append_log(f"다운로드 완료: {excel.source_file}")
         self.append_log(
             f"Excel 반영 완료: {excel.target_workbook} · {excel.sheet_name}!C1 · "
@@ -1305,6 +1592,14 @@ class MainWindow(QMainWindow):
         # ``dispatch_number`` identifies the outer M schedule card and can
         # contain several independent Milkrun groups.
         return normalize_product_name(product.milkrun_number)
+
+    @staticmethod
+    def _display_booking_number(product, booking_type: str) -> str:
+        if booking_type == "truck":
+            return str(product.dispatch_number or "").strip()
+        return normalize_product_name(
+            getattr(product, "order_number", "") or product.milkrun_number
+        )
 
     def _group_categories_for_booking(self, booking_type: str) -> dict[str, str]:
         return (
@@ -1433,7 +1728,7 @@ class MainWindow(QMainWindow):
                 boxes_per_pallet = "-"
             values = (
                 product.vendor_name,
-                product.dispatch_number if booking_type == "truck" else product.milkrun_number,
+                self._display_booking_number(product, booking_type),
                 product.pallet_count,
                 product.box_count,
                 boxes_per_pallet,
@@ -1500,7 +1795,12 @@ class MainWindow(QMainWindow):
             # Vehicle identity is shared, while pallet/unit/box calculation
             # and category cells remain independent for every SKU.
             table.setSpan(first_row, 0, len(rows), 1)
-            table.setSpan(first_row, 1, len(rows), 1)
+            displayed_numbers = {
+                self._display_booking_number(self.current_products[row], booking_type)
+                for row in rows
+            }
+            if len(displayed_numbers) == 1:
+                table.setSpan(first_row, 1, len(rows), 1)
 
         self._apply_group_row_tint(table, visual_multi_sku_groups)
         search_input = self._search_input_for_booking(booking_type)
@@ -1524,11 +1824,7 @@ class MainWindow(QMainWindow):
 
         visible_rows: set[int] = set()
         for row_index, product in enumerate(products):
-            booking_number = (
-                product.dispatch_number
-                if booking_type == "truck"
-                else product.milkrun_number
-            )
+            booking_number = self._display_booking_number(product, booking_type)
             searchable = normalize_product_name(
                 " ".join(
                     (
@@ -1608,9 +1904,7 @@ class MainWindow(QMainWindow):
             credentials.wms_id,
             credentials.password,
             evidence_dir=download_dir,
-            quantity_label=(
-                "유닛" if self._active_booking_type == "truck" else "박스"
-            ),
+            quantity_label="유닛",
         )
         self.weight_worker.log_updated.connect(self.append_log)
         self.weight_worker.record_ready.connect(self._on_weight_record_ready)
@@ -1701,8 +1995,6 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError) as exc:
                 self._set_table_text(row_index, 4, "-", table=table)
                 error_text = str(exc)
-                if booking_type == "truck":
-                    error_text = error_text.replace("박스", "유닛")
                 self._weight_row_errors[record.sku_id] = error_text
 
             if record.weight_grams is not None:
@@ -1739,7 +2031,7 @@ class MainWindow(QMainWindow):
                     manual=display_override is not None,
                     enabled=not self._automation_worker_running(),
                     error_text=error_text,
-                    quantity_label="유닛" if booking_type == "truck" else "박스",
+                    quantity_label="유닛",
                 )
 
     def _on_weight_sku_failed(self, failure: SkuWeightFailure) -> None:
@@ -1902,7 +2194,7 @@ class MainWindow(QMainWindow):
         )
         if manual_groups:
             group_label = "예약" if self._active_booking_type == "truck" else "밀크런"
-            quantity_label = "유닛" if self._active_booking_type == "truck" else "상품"
+            quantity_label = "유닛"
             message += (
                 f"\n\n다중 SKU {group_label} 수동 분류: {len(manual_groups)}건\n"
                 f"해당 {group_label}은 SKU별 {quantity_label} 무게만 저장했습니다. "
@@ -2130,7 +2422,7 @@ class MainWindow(QMainWindow):
         manual: bool,
         enabled: bool,
         error_text: str = "",
-        quantity_label: str = "박스",
+        quantity_label: str = "유닛",
     ) -> None:
         display = category if category in MANUAL_CATEGORIES else "?"
         button.setText(display)
@@ -2160,13 +2452,12 @@ class MainWindow(QMainWindow):
         booking_type: str,
         enabled: bool,
     ) -> None:
-        quantity_label = "유닛" if booking_type == "truck" else "박스"
         cls._configure_category_button(
             button,
             category or "?",
             manual=category is not None,
             enabled=enabled,
-            quantity_label=quantity_label,
+            quantity_label="유닛",
         )
         group_label = "예약" if booking_type == "truck" else "밀크런 번호"
         button.setToolTip(
@@ -2258,6 +2549,26 @@ class MainWindow(QMainWindow):
                 category=f"{booking_label} Excel 반영",
             )
 
+    def _on_excel_close_required(
+        self,
+        downloaded_file: Path | None,
+        message: str,
+    ) -> None:
+        if downloaded_file is not None:
+            self.append_log(f"다운로드 완료: {downloaded_file}")
+        self.append_log("[Excel 닫기 필요] 연결된 입고스케줄 파일이 열려 있습니다.")
+        self.status_label.setText("Excel 닫기 필요")
+        if self._closing_after_cancel:
+            return
+        detail = message
+        if downloaded_file is not None:
+            detail += f"\n\n다운로드 파일은 보관되어 있습니다.\n{downloaded_file}"
+        QMessageBox.warning(
+            self,
+            "Excel을 닫아 주세요",
+            detail + "\n\n파일을 닫은 뒤 데이터 얻기를 다시 눌러 주세요.",
+        )
+
     def _on_milkrun_detail_failed(
         self,
         import_result,
@@ -2335,6 +2646,8 @@ class MainWindow(QMainWindow):
         self.get_data_button.setEnabled(not working)
         self.truck_get_data_button.setEnabled(not working)
         self.settings_button.setEnabled(not working)
+        self.import_table_button.setEnabled(not working)
+        self.export_table_button.setEnabled(not working)
         self.base_date_mode.setEnabled(not working)
         self.manual_base_date.setEnabled(
             not working and self.base_date_mode.currentData() == "manual"
@@ -2365,7 +2678,7 @@ class MainWindow(QMainWindow):
         dialog.product_memory_changed.connect(self._refresh_current_product_memory)
         dialog.exec()
 
-    def _refresh_current_product_memory(self) -> None:
+    def _refresh_current_product_memory(self, announce: bool = True) -> None:
         if not any(self._products_by_booking.values()):
             return
         try:
@@ -2388,7 +2701,8 @@ class MainWindow(QMainWindow):
                         continue
                     self._weight_records[sku_id] = record
                     self._render_weight_record(record, booking_type)
-            self.append_log("설정에서 변경한 상품 분류 메모리를 RAW 표에 반영했습니다.")
+            if announce:
+                self.append_log("설정에서 변경한 상품 분류 메모리를 RAW 표에 반영했습니다.")
         except Exception as exc:
             self._show_error_dialog(
                 "상품 분류 새로고침 실패",

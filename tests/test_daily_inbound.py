@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 
 from Modules.Shipments.DailyInbound import (
     extract_booking_numbers,
@@ -14,6 +15,7 @@ from Modules.Shipments.DailyInbound import (
     normalize_truck_reservation_number,
     parse_detail_table_cells,
 )
+from Modules.WMS.ProductMemory import calculate_pallet_measurement
 
 
 class DailyInboundTests(unittest.TestCase):
@@ -97,7 +99,13 @@ class DailyInboundTests(unittest.TestCase):
                 "8809964240765",
                 "504",
             ),
-            ("", "72246115", "한경희 폴더블 선풍기 / 차콜", "8809964240772", "216"),
+            (
+                "138716975 (RG)",
+                "72246115",
+                "한경희 폴더블 선풍기 / 차콜",
+                "8809964240772",
+                "216",
+            ),
             (
                 "엘제이디(LJD)\n(A01723626)",
                 "10799314",
@@ -117,31 +125,44 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(len(result), 3)
         self.assertEqual(result[0].vendor_name, "주식회사 한티앤에스")
         self.assertEqual(result[1].milkrun_number, "10813478")
+        self.assertEqual(result[0].order_number, "138716974")
+        self.assertEqual(result[1].order_number, "138716975")
         self.assertEqual(result[1].sku_id, "72246115")
+        self.assertEqual(result[0].box_count, "504")
+        self.assertEqual(result[1].box_count, "216")
         self.assertEqual(result[2].pallet_count, "1")
+        self.assertEqual(result[2].box_count, "80")
         self.assertEqual(result[2].sku_name, "바유이 전동드릴")
         self.assertEqual(result[2].dispatch_number, "M3370492")
 
-    def test_parser_keeps_one_pallet_and_two_boxes_in_their_own_fields(self) -> None:
+    def test_parser_uses_sku_units_instead_of_group_box_count(self) -> None:
         rows = (
             (
                 "거래처 (A00001)",
                 "10813478",
-                "1",
-                "2",
+                "16",
+                "8",
                 "shipment",
                 "",
                 "123",
                 "상품",
                 "barcode",
-                "2",
+                "8753",
             ),
         )
 
         result = parse_detail_table_cells(rows)
 
-        self.assertEqual(result[0].pallet_count, "1")
-        self.assertEqual(result[0].box_count, "2")
+        self.assertEqual(result[0].pallet_count, "16")
+        self.assertEqual(result[0].box_count, "8753")
+        units_per_pallet, pallet_weight_kg, category = calculate_pallet_measurement(
+            "512",
+            result[0].box_count,
+            result[0].pallet_count,
+        )
+        self.assertEqual(units_per_pallet, Decimal("547.0625"))
+        self.assertEqual(pallet_weight_kg, Decimal("280.096"))
+        self.assertEqual(category, "중량")
 
     def test_detail_parser_keeps_truck_reservation_lineage(self) -> None:
         rows = (
