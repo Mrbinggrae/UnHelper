@@ -918,6 +918,26 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(ProductMemory(destination_memory).get("123").weight_grams, Decimal("1500"))
                 information.assert_called_once()
 
+                with (
+                    patch.object(
+                        window,
+                        "_ask_weight_retry_action",
+                        return_value="resume",
+                    ) as ask_retry,
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                ):
+                    window._start_booking_download("milkrun")
+
+                ask_retry.assert_called_once_with(
+                    cached_count=1,
+                    total_count=1,
+                    has_checkpoint=False,
+                )
+                start_weight.assert_called_once_with(
+                    window._products_by_booking["milkrun"],
+                    retry_mode="resume",
+                )
+
                 exported = root / "re-exported.json"
                 with (
                     patch.object(
@@ -1445,7 +1465,63 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ):
                     window._start_booking_download("milkrun")
 
-                ask_retry.assert_called_once_with(cached_count=1, total_count=2)
+                ask_retry.assert_called_once_with(
+                    cached_count=1,
+                    total_count=2,
+                    has_checkpoint=True,
+                )
+                start_weight.assert_called_once_with(products, retry_mode="resume")
+                self.assertEqual(window.current_products, products)
+            finally:
+                window.close()
+
+    def test_imported_or_restored_table_resume_skips_full_shipments_without_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            memory_path = root / "memory.json"
+            ProductMemory(memory_path).upsert_measurement(
+                "123", "저장 상품", "1000", "2", "1"
+            )
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=memory_path,
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow(
+                    "거래처", "T1", "1", "2", "123", "저장 상품", "T3370492"
+                ),
+                MilkrunProductRow(
+                    "거래처", "T1", "1", "2", "456", "미완료 상품", "T3370492"
+                ),
+            )
+            try:
+                window._populate_truck_products(products)
+                window._refresh_current_product_memory(announce=False)
+                self.assertEqual(window._read_weight_retry_checkpoints(), {})
+
+                with (
+                    patch.object(
+                        window,
+                        "_ask_weight_retry_action",
+                        return_value="resume",
+                    ) as ask_retry,
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                ):
+                    window._start_booking_download("truck")
+
+                ask_retry.assert_called_once_with(
+                    cached_count=1,
+                    total_count=2,
+                    has_checkpoint=False,
+                )
                 start_weight.assert_called_once_with(products, retry_mode="resume")
                 self.assertEqual(window.current_products, products)
             finally:

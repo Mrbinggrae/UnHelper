@@ -1556,19 +1556,26 @@ class MainWindow(QMainWindow):
         )
         checkpoints = self._read_weight_retry_checkpoints()
         existing_products = self._products_by_booking.get(booking_type, ())
-        if retry_mode is None and checkpoint_key in checkpoints and existing_products:
+        if retry_mode is None and existing_products:
             sku_ids = self._weight_checkpoint_skus(existing_products)
-            cached_count = self._checkpoint_completed_count(
-                checkpoints[checkpoint_key],
-                existing_products,
-            )
+            checkpoint = checkpoints.get(checkpoint_key)
+            if checkpoint is not None:
+                cached_count = self._checkpoint_completed_count(
+                    checkpoint,
+                    existing_products,
+                )
+            else:
+                cached_count = self._stored_weight_count(existing_products)
             retry_mode = self._ask_weight_retry_action(
                 cached_count=cached_count,
                 total_count=len(sku_ids),
+                has_checkpoint=checkpoint is not None,
             )
             if retry_mode == "cancel":
                 self.status_label.setText(
                     "미완료 WMS 무게 측정은 다음에 이어서 진행할 수 있습니다"
+                    if checkpoint is not None
+                    else "현재 RAW 표를 그대로 유지했습니다"
                 )
                 return
             if retry_mode == "resume":
@@ -2149,6 +2156,15 @@ class MainWindow(QMainWindow):
         completed_skus = set(checkpoint.get("completed_sku_ids", ()))
         return len(target_skus.intersection(completed_skus))
 
+    def _stored_weight_count(self, products) -> int:
+        target_skus = set(self._weight_checkpoint_skus(products))
+        return sum(
+            1
+            for sku_id in target_skus
+            if (record := self._weight_records.get(sku_id)) is not None
+            and record.weight_grams is not None
+        )
+
     def _clear_weight_retry_checkpoint(self, key: str | None = None) -> None:
         checkpoint_key = key or self._active_weight_checkpoint_key
         if not checkpoint_key:
@@ -2165,14 +2181,24 @@ class MainWindow(QMainWindow):
         *,
         cached_count: int,
         total_count: int,
+        has_checkpoint: bool = True,
     ) -> str:
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("WMS 무게 측정 다시 진행")
-        dialog.setText("이 기준일의 WMS 무게 측정이 완료되지 않았습니다.")
+        dialog.setWindowTitle(
+            "WMS 무게 측정 다시 진행"
+            if has_checkpoint
+            else "저장된 RAW 표에서 진행"
+        )
+        dialog.setText(
+            "이 기준일의 WMS 무게 측정이 완료되지 않았습니다."
+            if has_checkpoint
+            else "이 기준일의 저장된 RAW 표가 있습니다."
+        )
         dialog.setInformativeText(
             f"현재 표 SKU {total_count}개 중 저장된 무게 {cached_count}개를 확인했습니다.\n\n"
-            "이어서 진행: 저장된 무게는 다시 측정하지 않고 미완료 SKU만 조회합니다.\n"
+            "이어서 진행: 현재 표를 유지하고 저장된 무게는 다시 측정하지 않으며 "
+            "미완료 SKU만 조회합니다.\n"
             "처음부터 다시: Shipments 조회, 파일 다운로드, Excel 반영, 상세 상품 수집과 "
             "WMS 무게 측정을 모두 처음부터 다시 실행합니다. 재측정에 실패해도 기존 "
             "저장값은 먼저 삭제하지 않습니다."
