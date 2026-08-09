@@ -1064,7 +1064,7 @@ class MainWindow(QMainWindow):
         cards = QHBoxLayout()
         cards.setSpacing(12)
         self.arrival_summary_tables: dict[str, QTableWidget] = {}
-        self.arrival_breakdown_tables: dict[str, QTableWidget] = {}
+        self.arrival_detail_labels: dict[str, dict[str, QLabel]] = {}
         cards.addWidget(
             self._build_arrival_summary_card(
                 "outside_waiting",
@@ -1073,6 +1073,7 @@ class MainWindow(QMainWindow):
                 ("1F", "2F", "전일자"),
             ),
             1,
+            Qt.AlignmentFlag.AlignTop,
         )
         cards.addWidget(
             self._build_arrival_summary_card(
@@ -1082,6 +1083,7 @@ class MainWindow(QMainWindow):
                 ("1F", "2F", "전일자"),
             ),
             1,
+            Qt.AlignmentFlag.AlignTop,
         )
         cards.addWidget(
             self._build_arrival_summary_card(
@@ -1091,10 +1093,9 @@ class MainWindow(QMainWindow):
                 ("1F", "2F", "합계"),
             ),
             1,
+            Qt.AlignmentFlag.AlignTop,
         )
         outer.addLayout(cards)
-        # Kept as an alias for UI integrations that used the original floor-only table.
-        self.arrival_floor_table = self.arrival_breakdown_tables["floor_targets"]
 
         outer.addStretch(1)
         page.setWidget(content)
@@ -1111,15 +1112,13 @@ class MainWindow(QMainWindow):
         card.setObjectName("ArrivalCard")
         card.setProperty("card", True)
         card.setMinimumWidth(285)
-        card.setMinimumHeight(334)
+        card.setMinimumHeight(510)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(8)
-        summary_layout = QVBoxLayout()
-        summary_layout.setSpacing(6)
         label = QLabel(f"{title} · 차량 대수")
         label.setObjectName("ArrivalCardTitle")
-        summary_layout.addWidget(label)
+        layout.addWidget(label)
         table = QTableWidget(len(rows), len(columns))
         table.setObjectName("ArrivalSummaryTable")
         table.setHorizontalHeaderLabels(columns)
@@ -1143,66 +1142,51 @@ class MainWindow(QMainWindow):
         table.setMinimumHeight(122)
         table.setFixedHeight(122)
         self.arrival_summary_tables[key] = table
-        summary_layout.addWidget(table)
-        layout.addLayout(summary_layout)
+        layout.addWidget(table)
 
-        breakdown_layout = QVBoxLayout()
-        breakdown_layout.setSpacing(6)
-        third_label = "합계" if key == "floor_targets" else "전일"
-        breakdown_label = QLabel("팔렛트 상세 · 2F만 분류")
-        breakdown_label.setObjectName("ArrivalBreakdownTitle")
-        breakdown_label.setToolTip(
-            "차량 대수 아래에 RAW 표에서 계산한 팔렛트와 분류 수량을 표시합니다. "
-            "이관 차량은 RAW T/M 상품 데이터가 없어 상세 합계에서 제외됩니다."
+        detail_panel = QFrame()
+        detail_panel.setObjectName("ArrivalDetailPanel")
+        detail_layout = QVBoxLayout(detail_panel)
+        detail_layout.setContentsMargins(4, 4, 4, 2)
+        detail_layout.setSpacing(8)
+        detail_labels: dict[str, QLabel] = {}
+
+        def add_detail_section(
+            section_key: str,
+            heading_text: str,
+            initial_text: str,
+            *,
+            list_height: int = 28,
+        ) -> None:
+            heading = QLabel(heading_text)
+            heading.setObjectName("ArrivalDetailHeading")
+            heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            detail_layout.addWidget(heading)
+
+            value = QLabel(initial_text)
+            value.setObjectName(
+                "ArrivalDetailList" if section_key == "second" else "ArrivalDetailTotal"
+            )
+            value.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            value.setMinimumHeight(list_height)
+            value.setWordWrap(True)
+            detail_layout.addWidget(value)
+            detail_labels[section_key] = value
+
+        add_detail_section("first", "1F 상세 정보", "총 0 Pallet")
+        add_detail_section(
+            "second",
+            "2F 상세 정보",
+            "총 0 Pallet\n경량 - 0 Pallet\n중량 - 0 Pallet\n고단 - 0 Pallet\n"
+            "양곡 - 0 Pallet\n미분류 - 0 Pallet",
+            list_height=126,
         )
-        breakdown_layout.addWidget(breakdown_label)
-        breakdown = QTableWidget(4, 4)
-        breakdown.setObjectName("ArrivalBreakdownTable")
-        detail_cells = (
-            ("1F 총", "0", f"{third_label} 총", "0"),
-            ("2F 총", "0", "경량", "0"),
-            ("중량", "0", "고단", "0"),
-            ("양곡", "0", "미분류", "0"),
-        )
-        breakdown.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        breakdown.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        breakdown.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        breakdown.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        breakdown.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        breakdown.verticalHeader().setVisible(False)
-        breakdown.horizontalHeader().setVisible(False)
-        breakdown.verticalHeader().setMinimumSectionSize(30)
-        breakdown.verticalHeader().setDefaultSectionSize(30)
-        breakdown.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        breakdown.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Fixed
-        )
-        breakdown.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
-        )
-        breakdown.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.Fixed
-        )
-        breakdown.setColumnWidth(1, 52)
-        breakdown.setColumnWidth(3, 52)
-        for row, values in enumerate(detail_cells):
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column in (0, 2):
-                    item.setBackground(QBrush(QColor(COLORS["raised"])))
-                    item.setForeground(QBrush(QColor(COLORS["secondary"])))
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                breakdown.setItem(row, column, item)
-        breakdown.setMinimumHeight(122)
-        breakdown.setFixedHeight(122)
-        self.arrival_breakdown_tables[key] = breakdown
-        breakdown_layout.addWidget(breakdown)
-        layout.addLayout(breakdown_layout)
+        if key != "floor_targets":
+            add_detail_section("previous", "전일자", "총 0 Pallet")
+
+        detail_layout.addStretch(1)
+        self.arrival_detail_labels[key] = detail_labels
+        layout.addWidget(detail_panel)
         return card
 
     def _on_main_tab_changed(self, index: int) -> None:
@@ -1380,34 +1364,26 @@ class MainWindow(QMainWindow):
         vehicles = build_arrival_vehicles(snapshot, raw_bookings)
         floor_breakdowns = build_floor_target_breakdowns(snapshot, raw_bookings)
 
-        def render_compact_breakdown(
-            table: QTableWidget,
-            first_pallets: Decimal,
-            second_pallets: Decimal,
-            third_pallets: Decimal,
-            second_categories: dict[str, Decimal],
-            first_note: str = "",
-            second_note: str = "",
-            third_note: str = "",
-        ) -> None:
-            values = (
-                (0, 1, first_pallets, first_note),
-                (0, 3, third_pallets, third_note),
-                (1, 1, second_pallets, second_note),
-                (1, 3, second_categories.get("경량", Decimal("0")), second_note),
-                (2, 1, second_categories.get("중량", Decimal("0")), second_note),
-                (2, 3, second_categories.get("고단", Decimal("0")), second_note),
-                (3, 1, second_categories.get(GRAIN_CATEGORY, Decimal("0")), second_note),
-                (3, 3, second_categories.get("?", Decimal("0")), second_note),
+        def pallet_total_text(value: Decimal) -> str:
+            return f"총 {self._format_decimal(value)} Pallet"
+
+        def second_floor_text(
+            pallet_count: Decimal,
+            categories: dict[str, Decimal],
+        ) -> str:
+            category_values = (
+                ("경량", categories.get("경량", Decimal("0"))),
+                ("중량", categories.get("중량", Decimal("0"))),
+                ("고단", categories.get("고단", Decimal("0"))),
+                ("양곡", categories.get(GRAIN_CATEGORY, Decimal("0"))),
+                ("미분류", categories.get("?", Decimal("0"))),
             )
-            for row_index, column_index, value, note in values:
-                item = table.item(row_index, column_index)
-                if item is None:
-                    item = QTableWidgetItem()
-                    table.setItem(row_index, column_index, item)
-                item.setText(self._format_decimal(value))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                item.setToolTip(note)
+            lines = [pallet_total_text(pallet_count)]
+            lines.extend(
+                f"{label} - {self._format_decimal(value)} Pallet"
+                for label, value in category_values
+            )
+            return "\n".join(lines)
 
         def status_breakdown_note(breakdown) -> str:
             notes: list[str] = []
@@ -1418,24 +1394,40 @@ class MainWindow(QMainWindow):
             notes.extend(breakdown.notes)
             return " · ".join(notes)
 
+        def render_detail_labels(
+            key: str,
+            first,
+            second,
+            previous=None,
+            *,
+            first_note: str = "",
+            second_note: str = "",
+            previous_note: str = "",
+        ) -> None:
+            labels = self.arrival_detail_labels[key]
+            labels["first"].setText(pallet_total_text(first.pallet_count))
+            labels["first"].setToolTip(first_note)
+            labels["second"].setText(
+                second_floor_text(second.pallet_count, second.categories)
+            )
+            labels["second"].setToolTip(second_note)
+            if previous is not None and "previous" in labels:
+                labels["previous"].setText(pallet_total_text(previous.pallet_count))
+                labels["previous"].setToolTip(previous_note)
+
         for key, status in (("outside_waiting", "외부대기"), ("departure", "출차")):
-            table = self.arrival_breakdown_tables[key]
             breakdowns = build_status_pallet_breakdowns(vehicles, status=status)
             first, second, previous = breakdowns
-            render_compact_breakdown(
-                table,
-                first.pallet_count,
-                second.pallet_count,
-                previous.pallet_count,
-                second.categories,
-                status_breakdown_note(first),
-                status_breakdown_note(second),
-                status_breakdown_note(previous),
+            render_detail_labels(
+                key,
+                first,
+                second,
+                previous,
+                first_note=status_breakdown_note(first),
+                second_note=status_breakdown_note(second),
+                previous_note=status_breakdown_note(previous),
             )
 
-        floor_table = self.arrival_breakdown_tables["floor_targets"]
-        total_pallets = Decimal("0")
-        total_notes: list[str] = []
         floor_notes: list[str] = []
         for row_index, breakdown in enumerate(floor_breakdowns):
             notes: list[str] = []
@@ -1449,19 +1441,14 @@ class MainWindow(QMainWindow):
                 if len(missing_keys) > 10:
                     preview += f" 외 {len(missing_keys) - 10}건"
                 notes.append("층 미매핑 " + preview)
-            total_pallets += breakdown.pallet_count
             floor_notes.append(" · ".join(notes))
-            total_notes.extend(notes)
         first_floor, second_floor = floor_breakdowns
-        render_compact_breakdown(
-            floor_table,
-            first_floor.pallet_count,
-            second_floor.pallet_count,
-            total_pallets,
-            second_floor.categories,
-            floor_notes[0],
-            floor_notes[1],
-            " · ".join(dict.fromkeys(total_notes)),
+        render_detail_labels(
+            "floor_targets",
+            first_floor,
+            second_floor,
+            first_note=floor_notes[0],
+            second_note=floor_notes[1],
         )
 
 

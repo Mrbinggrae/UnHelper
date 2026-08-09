@@ -223,22 +223,29 @@ QTableWidget#ArrivalSummaryTable::item {
     padding: 2px 7px;
     font-weight: 700;
 }
-QLabel#ArrivalBreakdownTitle {
-    color: #8FA0B2;
-    font-size: 8.75pt;
-    font-weight: 650;
-    padding-top: 2px;
+QFrame#ArrivalDetailPanel {
+    background: transparent;
+    border: 0;
 }
-QTableWidget#ArrivalBreakdownTable {
+QLabel#ArrivalDetailHeading {
+    color: #F3F7FA;
+    font-size: 11.5pt;
+    font-weight: 750;
+    padding-top: 5px;
+}
+QLabel#ArrivalDetailTotal,
+QLabel#ArrivalDetailList {
+    color: #DCE5EE;
     background: #0A1119;
     border: 1px solid #202C3A;
     border-radius: 7px;
-    gridline-color: #202C3A;
-    font-size: 10pt;
+    font-size: 10.25pt;
+    font-weight: 700;
+    padding: 5px 8px;
 }
-QTableWidget#ArrivalBreakdownTable::item {
-    padding: 2px 5px;
-    font-weight: 650;
+QLabel#ArrivalDetailList {
+    padding-top: 7px;
+    padding-bottom: 7px;
 }
 QTableWidget#ArrivalFloorTable {
     background: #0D141D;

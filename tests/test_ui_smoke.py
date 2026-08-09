@@ -13,7 +13,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QPoint, QSettings, QThread, Qt
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QScrollArea
 
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
 from Modules.Common.Credentials import WMSCredentialStore
@@ -120,17 +120,22 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.main_tabs.tabText(0), "입차순번")
             self.assertEqual(window.arrival_refresh_button.text(), "새로고침")
             self.assertIsNotNone(window.findChild(QScrollArea, "ArrivalScroll"))
-            self.assertEqual(
-                window.arrival_breakdown_tables["outside_waiting"].columnCount(),
-                4,
-            )
             summary_table = window.arrival_summary_tables["outside_waiting"]
-            breakdown_table = window.arrival_breakdown_tables["outside_waiting"]
-            for table in (summary_table, breakdown_table):
-                self.assertGreaterEqual(table.minimumHeight(), 122)
-                self.assertGreaterEqual(table.verticalHeader().minimumSectionSize(), 30)
+            self.assertGreaterEqual(summary_table.minimumHeight(), 122)
+            self.assertGreaterEqual(summary_table.verticalHeader().minimumSectionSize(), 30)
             self.assertGreaterEqual(summary_table.horizontalHeader().height(), 30)
-            self.assertTrue(breakdown_table.horizontalHeader().isHidden())
+            self.assertEqual(
+                set(window.arrival_detail_labels["outside_waiting"]),
+                {"first", "second", "previous"},
+            )
+            self.assertEqual(
+                set(window.arrival_detail_labels["floor_targets"]),
+                {"first", "second"},
+            )
+            self.assertGreaterEqual(
+                window.arrival_detail_labels["outside_waiting"]["second"].minimumHeight(),
+                126,
+            )
             self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
                 "합계",
@@ -158,7 +163,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 240,
             )
             self.assertGreaterEqual(
-                window.arrival_breakdown_tables["outside_waiting"].width(),
+                window.arrival_detail_labels["outside_waiting"]["second"].width(),
                 240,
             )
             outside = window.arrival_summary_tables["outside_waiting"]
@@ -255,24 +260,17 @@ class MainWindowSmokeTests(unittest.TestCase):
                 "10",
             )
             self.assertEqual(
-                window.arrival_breakdown_tables["departure"].item(0, 1).text(),
-                "3",
+                window.arrival_detail_labels["departure"]["first"].text(),
+                "총 3 Pallet",
             )
             self.assertEqual(
-                window.arrival_breakdown_tables["departure"].item(0, 0).text(),
-                "1F 총",
+                window.arrival_detail_labels["outside_waiting"]["previous"].text(),
+                "총 8 Pallet",
             )
-            self.assertEqual(
-                window.arrival_breakdown_tables["outside_waiting"].item(0, 3).text(),
-                "8",
-            )
-            self.assertEqual(window.arrival_floor_table.item(1, 1).text(), "3")
-            self.assertEqual(window.arrival_floor_table.item(1, 3).text(), "3")
-            self.assertEqual(window.arrival_floor_table.item(0, 3).text(), "3")
-            self.assertEqual(
-                window.arrival_breakdown_tables["outside_waiting"].item(0, 2).text(),
-                "전일 총",
-            )
+            floor_second = window.arrival_detail_labels["floor_targets"]["second"].text()
+            self.assertIn("총 3 Pallet", floor_second)
+            self.assertIn("경량 - 3 Pallet", floor_second)
+            self.assertNotIn("전일", floor_second)
         finally:
             window.close()
 
