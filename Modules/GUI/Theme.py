@@ -233,19 +233,16 @@ QLabel#ArrivalDetailHeading {
     font-weight: 750;
     padding-top: 5px;
 }
-QLabel#ArrivalDetailTotal,
-QLabel#ArrivalDetailList {
-    color: #DCE5EE;
+QTableWidget#ArrivalDetailTable {
     background: #0A1119;
     border: 1px solid #202C3A;
     border-radius: 7px;
-    font-size: 10.25pt;
+    gridline-color: #202C3A;
+    font-size: 10pt;
     font-weight: 700;
-    padding: 5px 8px;
 }
-QLabel#ArrivalDetailList {
-    padding-top: 7px;
-    padding-bottom: 7px;
+QTableWidget#ArrivalDetailTable::item {
+    padding: 3px 8px;
 }
 QTableWidget#ArrivalFloorTable {
     background: #0D141D;

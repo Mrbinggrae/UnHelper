@@ -13,7 +13,7 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QPoint, QSettings, QThread, Qt
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QScrollArea
 
 from Modules.Common.BookingSnapshotStore import BookingSnapshotStore
 from Modules.Common.Credentials import WMSCredentialStore
@@ -125,16 +125,24 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertGreaterEqual(summary_table.verticalHeader().minimumSectionSize(), 30)
             self.assertGreaterEqual(summary_table.horizontalHeader().height(), 30)
             self.assertEqual(
-                set(window.arrival_detail_labels["outside_waiting"]),
+                set(window.arrival_detail_tables["outside_waiting"]),
                 {"first", "second", "previous"},
             )
             self.assertEqual(
-                set(window.arrival_detail_labels["floor_targets"]),
+                set(window.arrival_detail_tables["floor_targets"]),
                 {"first", "second"},
             )
             self.assertGreaterEqual(
-                window.arrival_detail_labels["outside_waiting"]["second"].minimumHeight(),
-                126,
+                window.arrival_detail_tables["outside_waiting"]["second"].minimumHeight(),
+                188,
+            )
+            self.assertEqual(
+                window.arrival_detail_tables["outside_waiting"]["second"].rowCount(),
+                6,
+            )
+            self.assertEqual(
+                window.arrival_detail_tables["outside_waiting"]["second"].columnCount(),
+                2,
             )
             self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
@@ -163,7 +171,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 240,
             )
             self.assertGreaterEqual(
-                window.arrival_detail_labels["outside_waiting"]["second"].width(),
+                window.arrival_detail_tables["outside_waiting"]["second"].width(),
                 240,
             )
             outside = window.arrival_summary_tables["outside_waiting"]
@@ -186,6 +194,17 @@ class MainWindowSmokeTests(unittest.TestCase):
                 arrival_scroll.verticalScrollBarPolicy(),
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded,
             )
+            self.assertGreater(arrival_scroll.verticalScrollBar().maximum(), 0)
+            arrival_scroll.verticalScrollBar().setValue(
+                arrival_scroll.verticalScrollBar().maximum()
+            )
+            self.app.processEvents()
+            previous_table = window.arrival_detail_tables["outside_waiting"]["previous"]
+            previous_bottom = previous_table.mapTo(
+                arrival_scroll.viewport(),
+                previous_table.rect().bottomRight(),
+            )
+            self.assertLessEqual(previous_bottom.y(), arrival_scroll.viewport().height())
         finally:
             window.close()
 
@@ -260,17 +279,19 @@ class MainWindowSmokeTests(unittest.TestCase):
                 "10",
             )
             self.assertEqual(
-                window.arrival_detail_labels["departure"]["first"].text(),
-                "총 3 Pallet",
+                window.arrival_detail_tables["departure"]["first"].item(0, 1).text(),
+                "3 Pallet",
             )
             self.assertEqual(
-                window.arrival_detail_labels["outside_waiting"]["previous"].text(),
-                "총 8 Pallet",
+                window.arrival_detail_tables["outside_waiting"]["previous"].item(0, 1).text(),
+                "8 Pallet",
             )
-            floor_second = window.arrival_detail_labels["floor_targets"]["second"].text()
-            self.assertIn("총 3 Pallet", floor_second)
-            self.assertIn("경량 - 3 Pallet", floor_second)
-            self.assertNotIn("전일", floor_second)
+            floor_second = window.arrival_detail_tables["floor_targets"]["second"]
+            self.assertEqual(floor_second.item(0, 0).text(), "총 팔렛트")
+            self.assertEqual(floor_second.item(0, 1).text(), "3 Pallet")
+            self.assertEqual(floor_second.item(1, 0).text(), "경량")
+            self.assertEqual(floor_second.item(1, 1).text(), "3 Pallet")
+            self.assertNotIn("previous", window.arrival_detail_tables["floor_targets"])
         finally:
             window.close()
 

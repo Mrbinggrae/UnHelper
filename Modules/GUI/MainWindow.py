@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -1035,6 +1036,7 @@ class MainWindow(QMainWindow):
         # scrolling instead of squeezing labels and values until they clip.
         content.setMinimumWidth(935)
         outer = QVBoxLayout(content)
+        outer.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         outer.setContentsMargins(28, 16, 28, 18)
         outer.setSpacing(14)
 
@@ -1064,7 +1066,7 @@ class MainWindow(QMainWindow):
         cards = QHBoxLayout()
         cards.setSpacing(12)
         self.arrival_summary_tables: dict[str, QTableWidget] = {}
-        self.arrival_detail_labels: dict[str, dict[str, QLabel]] = {}
+        self.arrival_detail_tables: dict[str, dict[str, QTableWidget]] = {}
         cards.addWidget(
             self._build_arrival_summary_card(
                 "outside_waiting",
@@ -1112,7 +1114,7 @@ class MainWindow(QMainWindow):
         card.setObjectName("ArrivalCard")
         card.setProperty("card", True)
         card.setMinimumWidth(285)
-        card.setMinimumHeight(510)
+        card.setMinimumHeight(560)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(8)
@@ -1149,43 +1151,68 @@ class MainWindow(QMainWindow):
         detail_layout = QVBoxLayout(detail_panel)
         detail_layout.setContentsMargins(4, 4, 4, 2)
         detail_layout.setSpacing(8)
-        detail_labels: dict[str, QLabel] = {}
+        detail_tables: dict[str, QTableWidget] = {}
 
         def add_detail_section(
             section_key: str,
             heading_text: str,
-            initial_text: str,
-            *,
-            list_height: int = 28,
+            row_labels: tuple[str, ...],
         ) -> None:
             heading = QLabel(heading_text)
             heading.setObjectName("ArrivalDetailHeading")
             heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
             detail_layout.addWidget(heading)
 
-            value = QLabel(initial_text)
-            value.setObjectName(
-                "ArrivalDetailList" if section_key == "second" else "ArrivalDetailTotal"
+            detail_table = QTableWidget(len(row_labels), 2)
+            detail_table.setObjectName("ArrivalDetailTable")
+            detail_table.horizontalHeader().setVisible(False)
+            detail_table.verticalHeader().setVisible(False)
+            detail_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            detail_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            detail_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            detail_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            detail_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            detail_table.verticalHeader().setMinimumSectionSize(31)
+            detail_table.verticalHeader().setDefaultSectionSize(31)
+            detail_table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.Stretch
             )
-            value.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-            value.setMinimumHeight(list_height)
-            value.setWordWrap(True)
-            detail_layout.addWidget(value)
-            detail_labels[section_key] = value
+            detail_table.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeMode.Fixed
+            )
+            detail_table.setColumnWidth(1, 104)
+            for row_index, row_label in enumerate(row_labels):
+                label_item = QTableWidgetItem(row_label)
+                label_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+                )
+                label_item.setBackground(QBrush(QColor(COLORS["raised"])))
+                label_item.setForeground(QBrush(QColor(COLORS["secondary"])))
+                label_font = label_item.font()
+                label_font.setBold(True)
+                label_item.setFont(label_font)
+                detail_table.setItem(row_index, 0, label_item)
 
-        add_detail_section("first", "1F 상세 정보", "총 0 Pallet")
+                value_item = QTableWidgetItem("0 Pallet")
+                value_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                detail_table.setItem(row_index, 1, value_item)
+            table_height = (len(row_labels) * 31) + 2
+            detail_table.setMinimumHeight(table_height)
+            detail_table.setFixedHeight(table_height)
+            detail_layout.addWidget(detail_table)
+            detail_tables[section_key] = detail_table
+
+        add_detail_section("first", "1F 상세 정보", ("총 팔렛트",))
         add_detail_section(
             "second",
             "2F 상세 정보",
-            "총 0 Pallet\n경량 - 0 Pallet\n중량 - 0 Pallet\n고단 - 0 Pallet\n"
-            "양곡 - 0 Pallet\n미분류 - 0 Pallet",
-            list_height=126,
+            ("총 팔렛트", "경량", "중량", "고단", "양곡", "미분류"),
         )
         if key != "floor_targets":
-            add_detail_section("previous", "전일자", "총 0 Pallet")
+            add_detail_section("previous", "전일자", ("총 팔렛트",))
 
         detail_layout.addStretch(1)
-        self.arrival_detail_labels[key] = detail_labels
+        self.arrival_detail_tables[key] = detail_tables
         layout.addWidget(detail_panel)
         return card
 
@@ -1364,26 +1391,8 @@ class MainWindow(QMainWindow):
         vehicles = build_arrival_vehicles(snapshot, raw_bookings)
         floor_breakdowns = build_floor_target_breakdowns(snapshot, raw_bookings)
 
-        def pallet_total_text(value: Decimal) -> str:
-            return f"총 {self._format_decimal(value)} Pallet"
-
-        def second_floor_text(
-            pallet_count: Decimal,
-            categories: dict[str, Decimal],
-        ) -> str:
-            category_values = (
-                ("경량", categories.get("경량", Decimal("0"))),
-                ("중량", categories.get("중량", Decimal("0"))),
-                ("고단", categories.get("고단", Decimal("0"))),
-                ("양곡", categories.get(GRAIN_CATEGORY, Decimal("0"))),
-                ("미분류", categories.get("?", Decimal("0"))),
-            )
-            lines = [pallet_total_text(pallet_count)]
-            lines.extend(
-                f"{label} - {self._format_decimal(value)} Pallet"
-                for label, value in category_values
-            )
-            return "\n".join(lines)
+        def pallet_value_text(value: Decimal) -> str:
+            return f"{self._format_decimal(value)} Pallet"
 
         def status_breakdown_note(breakdown) -> str:
             notes: list[str] = []
@@ -1394,7 +1403,7 @@ class MainWindow(QMainWindow):
             notes.extend(breakdown.notes)
             return " · ".join(notes)
 
-        def render_detail_labels(
+        def render_detail_tables(
             key: str,
             first,
             second,
@@ -1404,21 +1413,35 @@ class MainWindow(QMainWindow):
             second_note: str = "",
             previous_note: str = "",
         ) -> None:
-            labels = self.arrival_detail_labels[key]
-            labels["first"].setText(pallet_total_text(first.pallet_count))
-            labels["first"].setToolTip(first_note)
-            labels["second"].setText(
-                second_floor_text(second.pallet_count, second.categories)
-            )
-            labels["second"].setToolTip(second_note)
-            if previous is not None and "previous" in labels:
-                labels["previous"].setText(pallet_total_text(previous.pallet_count))
-                labels["previous"].setToolTip(previous_note)
+            tables = self.arrival_detail_tables[key]
+            section_values = {
+                "first": ((first.pallet_count,), first_note),
+                "second": (
+                    (
+                        second.pallet_count,
+                        second.categories.get("경량", Decimal("0")),
+                        second.categories.get("중량", Decimal("0")),
+                        second.categories.get("고단", Decimal("0")),
+                        second.categories.get(GRAIN_CATEGORY, Decimal("0")),
+                        second.categories.get("?", Decimal("0")),
+                    ),
+                    second_note,
+                ),
+            }
+            if previous is not None and "previous" in tables:
+                section_values["previous"] = ((previous.pallet_count,), previous_note)
+
+            for section_key, (values, note) in section_values.items():
+                table = tables[section_key]
+                for row_index, value in enumerate(values):
+                    table.item(row_index, 1).setText(pallet_value_text(value))
+                    table.item(row_index, 0).setToolTip(note)
+                    table.item(row_index, 1).setToolTip(note)
 
         for key, status in (("outside_waiting", "외부대기"), ("departure", "출차")):
             breakdowns = build_status_pallet_breakdowns(vehicles, status=status)
             first, second, previous = breakdowns
-            render_detail_labels(
+            render_detail_tables(
                 key,
                 first,
                 second,
@@ -1443,7 +1466,7 @@ class MainWindow(QMainWindow):
                 notes.append("층 미매핑 " + preview)
             floor_notes.append(" · ".join(notes))
         first_floor, second_floor = floor_breakdowns
-        render_detail_labels(
+        render_detail_tables(
             "floor_targets",
             first_floor,
             second_floor,
