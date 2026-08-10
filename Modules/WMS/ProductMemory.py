@@ -463,10 +463,10 @@ class ProductMemory:
     ) -> ProductMemoryRecord:
         """Update WMS weight without changing existing classification/calculation state.
 
-        A multi-SKU Truck reservation cannot safely attach a reservation-level
-        unit/pallet calculation to each individual SKU. Existing global SKU
-        classifications therefore remain untouched; a brand-new SKU is stored
-        as a weight-only record.
+        A multi-SKU booking without a per-SKU pallet allocation cannot safely
+        attach a shared pallet calculation to each individual SKU. Existing
+        global SKU classifications therefore remain untouched; a brand-new SKU
+        is stored as a weight-only record.
         """
         return self._upsert_weight(
             sku_id,

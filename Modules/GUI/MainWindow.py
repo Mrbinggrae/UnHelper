@@ -1293,6 +1293,19 @@ class MainWindow(QMainWindow):
     def _raw_booking_aggregates(self) -> dict[str, RawBookingAggregate]:
         mutable: dict[str, dict[str, object]] = {}
         valid_categories = {"경량", "중량", "고단", GRAIN_CATEGORY, "?"}
+        persistent_categories = {
+            sku_id: record.category_override
+            for sku_id, record in self._weight_records.items()
+            if record.category_override in PERSISTENT_MANUAL_CATEGORIES
+        }
+        try:
+            for record in ProductMemory(self.product_memory_file).entries():
+                if record.category_override in PERSISTENT_MANUAL_CATEGORIES:
+                    persistent_categories[record.sku_id] = record.category_override
+        except Exception:
+            # Product-memory recovery is handled by the existing settings/raw
+            # workflow. Arrival rendering must still work from visible buttons.
+            pass
         for booking_type in ("milkrun", "truck"):
             products = self._products_by_booking.get(booking_type, ())
             table = self._table_for_booking(booking_type)
@@ -1316,6 +1329,7 @@ class MainWindow(QMainWindow):
                         "vendors": [],
                         "pallets": Decimal("0"),
                         "categories": {},
+                        "milkrun_groups": {},
                         "missing": 0,
                     },
                 )
@@ -1332,16 +1346,52 @@ class MainWindow(QMainWindow):
                     state["missing"] += 1
                     continue
 
-                state["pallets"] += pallets
+                try:
+                    sku_id = normalize_sku_id(product.sku_id)
+                except ValueError:
+                    sku_id = ""
                 group_key = row_to_group.get(row_index)
                 if group_key is not None:
+                    # A multi-SKU Milkrun has only a shared pallet count. Its
+                    # current-table group classification must not inherit or
+                    # overwrite any SKU-level persistent category.
                     category = group_categories.get(group_key, "?")
                 else:
-                    button = table.cellWidget(row_index, 9)
-                    category = button.text() if isinstance(button, QPushButton) else "?"
+                    category = persistent_categories.get(sku_id)
+                    if category is None:
+                        button = table.cellWidget(row_index, 9)
+                        category = button.text() if isinstance(button, QPushButton) else "?"
                 if category not in valid_categories:
                     category = "?"
+                if booking_type == "milkrun":
+                    milkrun_number = normalize_product_name(product.milkrun_number)
+                    group_identity = milkrun_number or f"row:{row_index}"
+                    milkrun_groups = state["milkrun_groups"]
+                    group_state = milkrun_groups.get(group_identity)
+                    if group_state is None:
+                        group_state = {
+                            "pallets": pallets,
+                            "categories": set(),
+                        }
+                        milkrun_groups[group_identity] = group_state
+                    elif group_state["pallets"] != pallets:
+                        # Rowspan-expanded Milkrun rows must share one pallet
+                        # count. Count the group once and flag the conflict.
+                        state["missing"] += 1
+                    group_state["categories"].add(category)
+                    continue
+
+                state["pallets"] += pallets
                 categories = state["categories"]
+                categories[category] = categories.get(category, Decimal("0")) + pallets
+
+        for state in mutable.values():
+            categories = state["categories"]
+            for group_state in state["milkrun_groups"].values():
+                pallets = group_state["pallets"]
+                group_categories = group_state["categories"]
+                category = next(iter(group_categories)) if len(group_categories) == 1 else "?"
+                state["pallets"] += pallets
                 categories[category] = categories.get(category, Decimal("0")) + pallets
 
         return {
@@ -2372,10 +2422,25 @@ class MainWindow(QMainWindow):
         products,
         booking_type: str,
     ) -> dict[str, tuple[int, ...]]:
-        # Both detail tables now provide per-SKU quantities: Milkrun exposes
-        # pallet/box columns and Truck exposes PALLET container count/total
-        # quantity. No booking group needs the legacy weight-only/manual mode.
-        return {}
+        if booking_type != "milkrun":
+            # Truck container rows provide pallet and unit counts per SKU, so
+            # each Truck SKU can keep its own automatic calculation.
+            return {}
+        rows_by_group: dict[str, list[int]] = {}
+        skus_by_group: dict[str, set[str]] = {}
+        for row_index, product in enumerate(products):
+            group_key = cls._booking_group_key(product, booking_type)
+            if not group_key:
+                continue
+            rows_by_group.setdefault(group_key, []).append(row_index)
+            skus_by_group.setdefault(group_key, set()).add(
+                cls._group_sku_key(product.sku_id)
+            )
+        return {
+            group_key: tuple(rows_by_group[group_key])
+            for group_key, sku_ids in skus_by_group.items()
+            if len(sku_ids) > 1
+        }
 
     @classmethod
     def _visual_multi_sku_groups(cls, products, booking_type: str) -> dict[str, tuple[int, ...]]:
@@ -2477,13 +2542,16 @@ class MainWindow(QMainWindow):
             for row_index in rows
         }
         for row_index, product in enumerate(self.current_products):
-            try:
-                boxes_per_pallet = self._format_decimal(
-                    calculate_boxes_per_pallet(product.box_count, product.pallet_count),
-                    3,
-                )
-            except (TypeError, ValueError):
-                boxes_per_pallet = "-"
+            if row_index in multi_sku_rows:
+                boxes_per_pallet = "?"
+            else:
+                try:
+                    boxes_per_pallet = self._format_decimal(
+                        calculate_boxes_per_pallet(product.box_count, product.pallet_count),
+                        3,
+                    )
+                except (TypeError, ValueError):
+                    boxes_per_pallet = "-"
             values = (
                 product.vendor_name,
                 self._display_booking_number(product, booking_type),
@@ -2985,6 +3053,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._set_table_text(row_index, 7, "-", table=table)
                 self._clear_table_tooltip(row_index, 7, table=table)
+                self._set_table_text(row_index, 4, "?", table=table)
                 self._set_table_text(row_index, 8, "?", table=table)
                 first_row = multi_sku_groups[group_key][0]
                 button = table.cellWidget(first_row, 9)
@@ -3389,19 +3458,22 @@ class MainWindow(QMainWindow):
             except ValueError:
                 continue
             group_key = self._booking_group_key(product, booking_type)
-            try:
-                boxes_per_pallet = calculate_boxes_per_pallet(
-                    product.box_count,
-                    product.pallet_count,
-                )
-                self._set_table_text(
-                    row_index,
-                    4,
-                    self._format_decimal(boxes_per_pallet, 3),
-                    table=table,
-                )
-            except (TypeError, ValueError):
-                self._set_table_text(row_index, 4, "-", table=table)
+            if group_key in multi_sku_groups:
+                self._set_table_text(row_index, 4, "?", table=table)
+            else:
+                try:
+                    boxes_per_pallet = calculate_boxes_per_pallet(
+                        product.box_count,
+                        product.pallet_count,
+                    )
+                    self._set_table_text(
+                        row_index,
+                        4,
+                        self._format_decimal(boxes_per_pallet, 3),
+                        table=table,
+                    )
+                except (TypeError, ValueError):
+                    self._set_table_text(row_index, 4, "-", table=table)
             self._set_table_text(row_index, 7, "-", table=table)
             self._clear_table_tooltip(row_index, 7, table=table)
             self._set_table_text(

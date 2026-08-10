@@ -79,6 +79,7 @@ class ProductWeightWorker(QThread):
     def run(self) -> None:
         try:
             unique_products, invalid_failures = self._unique_products(self.products)
+            weight_only_skus = self._multi_sku_milkrun_skus(self.products)
             failures = list(invalid_failures)
             progress_total = len(unique_products) + len(invalid_failures)
             progress_completed = 0
@@ -110,6 +111,14 @@ class ProductWeightWorker(QThread):
                     misses.append(product)
                     continue
                 cache_hits += 1
+                if record.sku_id in weight_only_skus:
+                    self.log_updated.emit(
+                        f"SKU {record.sku_id}는 다중 SKU Milkrun의 공용 팔렛트 수를 "
+                        "개별 계산에 사용하지 않고 저장된 WMS 유닛 무게만 적용합니다."
+                    )
+                    self.record_ready.emit(record, True)
+                    advance_progress()
+                    continue
                 if record.category_override in AUTOMATIC_CATEGORIES:
                     # Manual light/heavy values belong to the previous display.
                     # Clear them before calculation so an invalid current pallet
@@ -193,20 +202,30 @@ class ProductWeightWorker(QThread):
                 try:
                     lookup = self.crawler.lookup(sku_id)
                     product_name = normalize_product_name(product.sku_name) or lookup.product_name
-                    try:
-                        record = memory.upsert_measurement(
-                            lookup.sku_id,
-                            product_name,
-                            lookup.weight_grams,
-                            product.box_count,
-                            product.pallet_count,
-                        )
-                    except (TypeError, ValueError):
-                        record = memory.upsert_weight(
+                    if sku_id in weight_only_skus:
+                        # Never fall back to the destructive generic weight
+                        # update: preserving an existing SKU classification is
+                        # part of the multi-SKU Milkrun contract.
+                        record = memory.upsert_weight_only(
                             lookup.sku_id,
                             product_name,
                             lookup.weight_grams,
                         )
+                    else:
+                        try:
+                            record = memory.upsert_measurement(
+                                lookup.sku_id,
+                                product_name,
+                                lookup.weight_grams,
+                                product.box_count,
+                                product.pallet_count,
+                            )
+                        except (TypeError, ValueError):
+                            record = memory.upsert_weight(
+                                lookup.sku_id,
+                                product_name,
+                                lookup.weight_grams,
+                            )
                     wms_successes += 1
                     self.record_ready.emit(record, False)
                 except Exception as exc:
@@ -256,6 +275,42 @@ class ProductWeightWorker(QThread):
             return normalize_sku_id(value)
         except ValueError:
             return normalize_product_name(value) or "알 수 없음"
+
+    @classmethod
+    def _multi_sku_milkrun_skus(
+        cls,
+        products: Iterable[MilkrunProductRow],
+    ) -> set[str]:
+        """Return SKUs whose Milkrun group has no per-SKU pallet allocation.
+
+        The Milkrun detail table rowspans one pallet count across every SKU in
+        the same Milkrun number. Reusing that shared count for each SKU would
+        create a false per-SKU pallet weight, so those rows are weight-only.
+        Truck rows are excluded because their container table provides a
+        container/pallet count for each SKU.
+        """
+        groups: dict[str, set[str]] = {}
+        for product in products:
+            dispatch = normalize_product_name(product.dispatch_number).upper()
+            if dispatch.startswith("T"):
+                continue
+            group_key = normalize_product_name(product.milkrun_number)
+            if not group_key:
+                continue
+            try:
+                sku_key = normalize_sku_id(product.sku_id)
+            except ValueError:
+                sku_key = f"invalid:{normalize_product_name(product.sku_id)}"
+            groups.setdefault(group_key, set()).add(sku_key)
+
+        protected: set[str] = set()
+        for sku_keys in groups.values():
+            if len(sku_keys) <= 1:
+                continue
+            protected.update(
+                sku_key for sku_key in sku_keys if not sku_key.startswith("invalid:")
+            )
+        return protected
 
     @classmethod
     def _unique_products(
