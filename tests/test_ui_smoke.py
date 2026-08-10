@@ -145,6 +145,14 @@ class MainWindowSmokeTests(unittest.TestCase):
                 2,
             )
             self.assertEqual(
+                window.arrival_detail_tables["outside_waiting"]["second"].item(3, 0).text(),
+                "고단 포함",
+            )
+            self.assertEqual(
+                window.arrival_detail_tables["outside_waiting"]["second"].item(4, 0).text(),
+                "양곡 포함",
+            )
+            self.assertEqual(
                 window.arrival_summary_tables["floor_targets"].verticalHeaderItem(2).text(),
                 "합계",
             )
@@ -465,7 +473,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_arrival_ignores_sku_categories_for_unclassified_multi_milkrun(self) -> None:
+    def test_arrival_prefers_high_when_shared_group_also_contains_grain(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
@@ -477,16 +485,47 @@ class MainWindowSmokeTests(unittest.TestCase):
                     MilkrunProductRow(
                         "거래처", "10807763", "16", "160", "102", "상품 B", "M3370492"
                     ),
+                    MilkrunProductRow(
+                        "거래처", "10807763", "16", "80", "103", "상품 C", "M3370492"
+                    ),
                 )
                 window._populate_milkrun_products(products)
                 memory = ProductMemory(window.product_memory_file)
                 memory.set_manual_category("101", "고단", "상품 A")
-                memory.set_manual_category("102", "중량", "상품 B")
+                memory.set_manual_category("102", "양곡", "상품 B")
+                memory.set_manual_category("103", "중량", "상품 C")
 
                 aggregate = window._raw_booking_aggregates()["M3370492"]
 
                 self.assertEqual(aggregate.pallet_count, Decimal("16"))
-                self.assertEqual(aggregate.categories, {"?": Decimal("16")})
+                self.assertEqual(aggregate.categories["고단"], Decimal("16"))
+                self.assertNotIn("양곡", aggregate.categories)
+                self.assertNotIn("?", aggregate.categories)
+            finally:
+                window.close()
+
+    def test_arrival_uses_grain_when_shared_group_has_no_high(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow(
+                        "거래처", "10807763", "12", "240", "101", "상품 A", "M3370492"
+                    ),
+                    MilkrunProductRow(
+                        "거래처", "10807763", "12", "120", "102", "상품 B", "M3370492"
+                    ),
+                )
+                window._populate_milkrun_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("101", "양곡", "상품 A")
+                memory.set_manual_category("102", "중량", "상품 B")
+
+                aggregate = window._raw_booking_aggregates()["M3370492"]
+
+                self.assertEqual(aggregate.pallet_count, Decimal("12"))
+                self.assertEqual(aggregate.categories, {"양곡": Decimal("12")})
             finally:
                 window.close()
 

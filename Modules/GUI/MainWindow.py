@@ -1207,7 +1207,7 @@ class MainWindow(QMainWindow):
         add_detail_section(
             "second",
             "2F 상세 정보",
-            ("총 팔렛트", "경량", "중량", "고단", "양곡", "미분류"),
+            ("총 팔렛트", "경량", "중량", "고단 포함", "양곡 포함", "미분류"),
         )
         if key != "floor_targets":
             add_detail_section("previous", "전일자", ("총 팔렛트",))
@@ -1376,8 +1376,21 @@ class MainWindow(QMainWindow):
             for group_state in state["milkrun_groups"].values():
                 pallets = group_state["pallets"]
                 group_categories = group_state["categories"]
-                category = next(iter(group_categories)) if len(group_categories) == 1 else "?"
                 state["pallets"] += pallets
+                special_category = None
+                if HIGH_CATEGORY in group_categories:
+                    special_category = HIGH_CATEGORY
+                elif GRAIN_CATEGORY in group_categories:
+                    special_category = GRAIN_CATEGORY
+                if special_category is not None:
+                    # Shared Milkrun pallets cannot be divided accurately per
+                    # SKU. High-stack and grain are handling flags; high-stack
+                    # takes precedence in the unlikely event both are present.
+                    categories[special_category] = (
+                        categories.get(special_category, Decimal("0")) + pallets
+                    )
+                    continue
+                category = next(iter(group_categories)) if len(group_categories) == 1 else "?"
                 categories[category] = categories.get(category, Decimal("0")) + pallets
 
         return {
