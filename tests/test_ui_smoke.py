@@ -1703,7 +1703,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_full_pipeline_restart_remeasures_all_skus_after_detail_collection(self) -> None:
+    def test_full_pipeline_restart_reuses_saved_weights_after_detail_collection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             window = MainWindow(
@@ -1743,6 +1743,68 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertFalse(window._pending_full_pipeline_restart)
             finally:
                 window.close()
+
+    def test_full_restart_never_forces_saved_wms_weights_for_milkrun_or_truck(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory_path = root / "memory.json"
+            ProductMemory(memory_path).upsert_measurement(
+                "123", "저장 상품", "1000", "2", "1"
+            )
+
+            for booking_type, prefix in (("milkrun", "M"), ("truck", "T")):
+                with self.subTest(booking_type=booking_type):
+                    settings = QSettings(
+                        str(root / f"worker-{booking_type}.ini"),
+                        QSettings.Format.IniFormat,
+                    )
+                    settings.setValue("base_date_mode", "manual")
+                    settings.setValue("manual_base_date", "2026-08-09")
+                    window = MainWindow(
+                        smoke_test=True,
+                        settings=settings,
+                        product_memory_file=memory_path,
+                        snapshot_file=root / f"worker-{booking_type}-snapshots.json",
+                    )
+                    products = (
+                        MilkrunProductRow(
+                            "거래처", f"{prefix}1", "1", "2", "123", "저장 상품", f"{prefix}1"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", f"{prefix}1", "1", "2", "456", "미측정 상품", f"{prefix}1"
+                        ),
+                    )
+                    fake_worker = mock.Mock()
+                    try:
+                        if booking_type == "truck":
+                            window._populate_truck_products(products)
+                        else:
+                            window._populate_milkrun_products(products)
+                        with (
+                            patch(
+                                "Modules.GUI.MainWindow.WMSCredentialStore.load",
+                                return_value=mock.Mock(wms_id="id", password="pw"),
+                            ),
+                            patch(
+                                "Modules.GUI.MainWindow.ProductWeightWorker",
+                                return_value=fake_worker,
+                            ) as worker_type,
+                        ):
+                            window._start_weight_lookup(products, retry_mode="restart")
+
+                        worker_type.assert_called_once()
+                        self.assertNotIn(
+                            "force_refresh_sku_ids",
+                            worker_type.call_args.kwargs,
+                        )
+                        checkpoint = window._read_weight_retry_checkpoints()[
+                            window._weight_checkpoint_key()
+                        ]
+                        self.assertEqual(checkpoint["completed_sku_ids"], ["123"])
+                        fake_worker.start.assert_called_once_with()
+                    finally:
+                        window.weight_worker = None
+                        window.close()
 
     def test_changing_base_date_loads_snapshot_or_clears_previous_date(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2704,6 +2766,13 @@ class MainWindowSmokeTests(unittest.TestCase):
                     products,
                     memory=ProductMemory(memory_path),
                 )
+                # Simulate a stale checkpoint that lost the durable cached SKU
+                # and incorrectly marked the missing SKU complete.  The prompt
+                # must still report ProductMemory's real count (1).
+                checkpoint_key = window._weight_checkpoint_key()
+                stale = window._read_weight_retry_checkpoints()
+                stale[checkpoint_key]["completed_sku_ids"] = ["456"]
+                window._write_weight_retry_checkpoints(stale)
                 with (
                     patch.object(
                         window,
@@ -2814,6 +2883,52 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_problem_retry_prompt_uses_durable_weights_not_stale_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory_path = root / "memory.json"
+            memory = ProductMemory(memory_path)
+            memory.upsert_measurement("123", "저장 상품", "1000", "2", "1")
+            window = MainWindow(
+                smoke_test=True,
+                product_memory_file=memory_path,
+                snapshot_file=root / "snapshots.json",
+            )
+            products = (
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "123", "저장 상품", "M3370492"
+                ),
+                MilkrunProductRow(
+                    "거래처", "M1", "1", "2", "456", "미측정 상품", "M3370492"
+                ),
+            )
+            try:
+                window._populate_milkrun_products(products)
+                key, _pending = window._remember_weight_retry_checkpoint(
+                    products,
+                    memory=memory,
+                )
+                stale = window._read_weight_retry_checkpoints()
+                stale[key]["completed_sku_ids"] = ["456"]
+                window._write_weight_retry_checkpoints(stale)
+
+                with (
+                    patch.object(
+                        window,
+                        "_ask_weight_retry_action",
+                        return_value="cancel",
+                    ) as ask_retry,
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                    patch.object(window, "_start_booking_download") as start_booking,
+                ):
+                    window._offer_weight_retry_after_problem()
+
+                ask_retry.assert_called_once_with(cached_count=1, total_count=2)
+                start_weight.assert_not_called()
+                start_booking.assert_not_called()
+            finally:
+                window.close()
+
     def test_successful_weight_completion_clears_persistent_retry_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2850,7 +2965,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_restart_checkpoint_resume_keeps_only_current_run_successes_completed(self) -> None:
+    def test_restart_checkpoint_reuses_stored_weights_for_milkrun_and_truck(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             settings = QSettings(
@@ -2862,40 +2977,63 @@ class MainWindowSmokeTests(unittest.TestCase):
             memory_path = root / "memory.json"
             memory = ProductMemory(memory_path)
             memory.upsert_measurement("123", "완료 상품", "1000", "2", "1")
-            memory.upsert_measurement("456", "실패 전 기존 상품", "2000", "2", "1")
-            window = MainWindow(
-                smoke_test=True,
-                settings=settings,
-                product_memory_file=memory_path,
-                snapshot_file=root / "snapshots.json",
-            )
-            products = (
-                MilkrunProductRow("거래처", "M1", "1", "2", "123", "완료 상품", "M1"),
-                MilkrunProductRow("거래처", "M1", "1", "2", "456", "실패 상품", "M1"),
-            )
-            try:
-                window._populate_milkrun_products(products)
-                _key, initial_pending = window._remember_weight_retry_checkpoint(
-                    products,
-                    memory=memory,
-                    retry_mode="restart",
-                )
-                self.assertEqual(initial_pending, ("123", "456"))
-                window._mark_weight_checkpoint_completed("123")
+            memory.upsert_measurement("456", "기존 상품", "2000", "2", "1")
 
-                _key, resumed_pending = window._remember_weight_retry_checkpoint(
-                    products,
-                    memory=memory,
-                    retry_mode="resume",
-                )
+            for booking_type, prefix in (("milkrun", "M"), ("truck", "T")):
+                with self.subTest(booking_type=booking_type):
+                    local_settings = QSettings(
+                        str(root / f"{booking_type}.ini"),
+                        QSettings.Format.IniFormat,
+                    )
+                    local_settings.setValue("base_date_mode", "manual")
+                    local_settings.setValue("manual_base_date", "2026-08-09")
+                    window = MainWindow(
+                        smoke_test=True,
+                        settings=local_settings,
+                        product_memory_file=memory_path,
+                        snapshot_file=root / f"{booking_type}-snapshots.json",
+                    )
+                    products = (
+                        MilkrunProductRow(
+                            "거래처", f"{prefix}1", "1", "2", "123", "완료 상품", f"{prefix}1"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", f"{prefix}1", "1", "2", "456", "기존 상품", f"{prefix}1"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", f"{prefix}1", "1", "2", "789", "미측정 상품", f"{prefix}1"
+                        ),
+                    )
+                    try:
+                        if booking_type == "truck":
+                            window._populate_truck_products(products)
+                        else:
+                            window._populate_milkrun_products(products)
+                        key, pending = window._remember_weight_retry_checkpoint(
+                            products,
+                            memory=memory,
+                            retry_mode="restart",
+                        )
 
-                self.assertEqual(resumed_pending, ("456",))
-                checkpoint = window._read_weight_retry_checkpoints()[
-                    window._weight_checkpoint_key()
-                ]
-                self.assertEqual(checkpoint["completed_sku_ids"], ["123"])
-            finally:
-                window.close()
+                        self.assertEqual(pending, ("789",))
+                        checkpoint = window._read_weight_retry_checkpoints()[key]
+                        self.assertEqual(
+                            checkpoint["completed_sku_ids"],
+                            ["123", "456"],
+                        )
+
+                        # Even a stale checkpoint cannot make a durable WMS
+                        # weight pending again.
+                        checkpoint["completed_sku_ids"] = ["123", "789"]
+                        window._write_weight_retry_checkpoints({key: checkpoint})
+                        _key, resumed_pending = window._remember_weight_retry_checkpoint(
+                            products,
+                            memory=memory,
+                            retry_mode="resume",
+                        )
+                        self.assertEqual(resumed_pending, ("789",))
+                    finally:
+                        window.close()
 
     def test_partial_weight_failure_offers_retry_choice_after_error_details(self) -> None:
         window = MainWindow(smoke_test=True)

@@ -2363,13 +2363,10 @@ class MainWindow(QMainWindow):
         if retry_mode is None and existing_products and not has_unavailable_detail:
             sku_ids = self._weight_checkpoint_skus(existing_products)
             checkpoint = checkpoints.get(checkpoint_key)
-            if checkpoint is not None:
-                cached_count = self._checkpoint_completed_count(
-                    checkpoint,
-                    existing_products,
-                )
-            else:
-                cached_count = self._stored_weight_count(existing_products)
+            # The durable ProductMemory file is the source of truth.  A retry
+            # checkpoint can lag behind a successful write or retain an entry
+            # whose weight was later deleted, so it must not drive this count.
+            cached_count = self._stored_weight_count(existing_products)
             retry_mode = self._ask_weight_retry_action(
                 cached_count=cached_count,
                 total_count=len(sku_ids),
@@ -2965,20 +2962,27 @@ class MainWindow(QMainWindow):
         checkpoints = self._read_weight_retry_checkpoints()
         target_skus = self._weight_checkpoint_skus(products)
         previous = checkpoints.get(key)
+        stored_weight_skus = {
+            sku_id
+            for sku_id in target_skus
+            if memory is not None
+            and (record := memory.get(sku_id)) is not None
+            and record.weight_grams is not None
+        }
         if retry_mode == "restart":
-            completed_skus: set[str] = set()
-        elif previous is not None:
+            # "처음부터 다시" resets Shipments/download/detail collection,
+            # not the durable WMS weight cache.
+            completed_skus = set(stored_weight_skus)
+        elif previous is not None and memory is None:
+            # Tests and the active worker can update a checkpoint before a
+            # ProductMemory handle is available.  In the normal UI path below,
+            # durable weights are authoritative instead of this cached list.
             completed_skus = set(previous.get("completed_sku_ids", ()))
             completed_skus.intersection_update(target_skus)
-        elif memory is not None:
-            completed_skus = {
-                sku_id
-                for sku_id in target_skus
-                if (record := memory.get(sku_id)) is not None
-                and record.weight_grams is not None
-            }
         else:
-            completed_skus = set()
+            # A stale checkpoint must neither remeasure a saved weight nor
+            # claim that a deleted/missing weight is complete.
+            completed_skus = set(stored_weight_skus)
         checkpoints[key] = {
             "sku_ids": list(target_skus),
             "completed_sku_ids": sorted(completed_skus),
@@ -3016,12 +3020,20 @@ class MainWindow(QMainWindow):
         completed_skus = set(checkpoint.get("completed_sku_ids", ()))
         return len(target_skus.intersection(completed_skus))
 
-    def _stored_weight_count(self, products) -> int:
+    def _stored_weight_count(self, products, *, memory=None) -> int:
         target_skus = set(self._weight_checkpoint_skus(products))
+        if memory is None:
+            try:
+                memory = ProductMemory(self.product_memory_file)
+            except Exception:
+                # The normal start path will offer ProductMemory recovery before
+                # launching WMS.  Until then, do not claim a stale UI cache value
+                # as a durable saved weight.
+                return 0
         return sum(
             1
             for sku_id in target_skus
-            if (record := self._weight_records.get(sku_id)) is not None
+            if (record := memory.get(sku_id)) is not None
             and record.weight_grams is not None
         )
 
@@ -3059,9 +3071,9 @@ class MainWindow(QMainWindow):
             f"현재 표 SKU {total_count}개 중 저장된 무게 {cached_count}개를 확인했습니다.\n\n"
             "이어서 진행: 현재 표를 유지하고 저장된 무게는 다시 측정하지 않으며 "
             "미완료 SKU만 조회합니다.\n"
-            "처음부터 다시: Shipments 조회, 파일 다운로드, Excel 반영, 상세 상품 수집과 "
-            "WMS 무게 측정을 모두 처음부터 다시 실행합니다. 재측정에 실패해도 기존 "
-            "저장값은 먼저 삭제하지 않습니다."
+            "처음부터 다시: Shipments 조회, 파일 다운로드, Excel 반영과 상세 상품 "
+            "수집을 처음부터 다시 실행합니다. WMS 무게는 저장된 값을 재사용하고 "
+            "아직 무게가 없는 SKU만 조회합니다."
         )
         resume_button = dialog.addButton("이어서 진행", QMessageBox.ButtonRole.AcceptRole)
         restart_button = dialog.addButton(
@@ -3160,7 +3172,6 @@ class MainWindow(QMainWindow):
             credentials.password,
             evidence_dir=download_dir,
             quantity_label="유닛",
-            force_refresh_sku_ids=pending_skus,
         )
         self.weight_worker.log_updated.connect(self.append_log)
         self.weight_worker.progress_updated.connect(self._on_weight_progress)
@@ -3172,7 +3183,12 @@ class MainWindow(QMainWindow):
         self.weight_worker.finished.connect(self._on_weight_finished)
         self.status_label.setText("WMS 상품 무게 확인 중")
         if retry_mode == "restart":
-            self.append_log("현재 표의 모든 SKU 무게를 WMS에서 처음부터 다시 측정합니다.")
+            total_skus = len(self._weight_checkpoint_skus(weight_products))
+            self.append_log(
+                "Shipments 데이터는 처음부터 다시 수집했습니다. "
+                f"저장된 WMS 무게 {total_skus - len(pending_skus)}개는 재사용하고 "
+                f"무게가 없는 SKU {len(pending_skus)}개만 확인합니다."
+            )
         else:
             self.append_log("저장된 무게를 유지하고 미완료 SKU부터 이어서 확인합니다.")
         self._set_automation_working(True)
@@ -3212,13 +3228,9 @@ class MainWindow(QMainWindow):
         if memory is None:
             return
         sku_ids = self._weight_checkpoint_skus(self.current_products)
-        checkpoint = self._read_weight_retry_checkpoints().get(
-            self._weight_checkpoint_key(),
-            {},
-        )
-        cached_count = self._checkpoint_completed_count(
-            checkpoint,
+        cached_count = self._stored_weight_count(
             self.current_products,
+            memory=memory,
         )
         action = self._ask_weight_retry_action(
             cached_count=cached_count,
