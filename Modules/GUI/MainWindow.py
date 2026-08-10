@@ -1309,13 +1309,6 @@ class MainWindow(QMainWindow):
         for booking_type in ("milkrun", "truck"):
             products = self._products_by_booking.get(booking_type, ())
             table = self._table_for_booking(booking_type)
-            multi_groups = self._booking_multi_sku_groups(products, booking_type)
-            group_categories = self._group_categories_for_booking(booking_type)
-            row_to_group = {
-                row_index: group_key
-                for group_key, rows in multi_groups.items()
-                for row_index in rows
-            }
             for row_index, product in enumerate(products):
                 booking_key = self._canonical_raw_booking(
                     product.dispatch_number,
@@ -1350,17 +1343,10 @@ class MainWindow(QMainWindow):
                     sku_id = normalize_sku_id(product.sku_id)
                 except ValueError:
                     sku_id = ""
-                group_key = row_to_group.get(row_index)
-                if group_key is not None:
-                    # A multi-SKU Milkrun has only a shared pallet count. Its
-                    # current-table group classification must not inherit or
-                    # overwrite any SKU-level persistent category.
-                    category = group_categories.get(group_key, "?")
-                else:
-                    category = persistent_categories.get(sku_id)
-                    if category is None:
-                        button = table.cellWidget(row_index, 9)
-                        category = button.text() if isinstance(button, QPushButton) else "?"
+                category = persistent_categories.get(sku_id)
+                if category is None:
+                    button = table.cellWidget(row_index, 9)
+                    category = button.text() if isinstance(button, QPushButton) else "?"
                 if category not in valid_categories:
                     category = "?"
                 if booking_type == "milkrun":
@@ -2569,19 +2555,18 @@ class MainWindow(QMainWindow):
                 if column_index in (0, 6):
                     item.setToolTip(str(value))
                 table.setItem(row_index, column_index, item)
-            if row_index not in multi_sku_rows:
-                category_button = QPushButton("?")
-                category_button.setObjectName("CategoryButton")
-                category_button.setProperty("classification", "?")
-                category_button.setEnabled(False)
-                category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
-                category_button.clicked.connect(
-                    lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
-                        sku_id,
-                        kind,
-                    )
+            category_button = QPushButton("?")
+            category_button.setObjectName("CategoryButton")
+            category_button.setProperty("classification", "?")
+            category_button.setEnabled(False)
+            category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
+            category_button.clicked.connect(
+                lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
+                    sku_id,
+                    kind,
                 )
-                table.setCellWidget(row_index, 9, category_button)
+            )
+            table.setCellWidget(row_index, 9, category_button)
 
         for group_key, rows in multi_sku_groups.items():
             first_row = rows[0]
@@ -2591,24 +2576,6 @@ class MainWindow(QMainWindow):
                     f"{group_label} {group_key}의 SKU 행이 연속되지 않아 표를 병합할 수 없습니다."
                 )
             table.setSpan(first_row, 2, len(rows), 1)
-            table.setSpan(first_row, 0, len(rows), 1)
-            table.setSpan(first_row, 1, len(rows), 1)
-            table.setSpan(first_row, 9, len(rows), 1)
-            category_button = QPushButton("?")
-            category_button.setObjectName("CategoryButton")
-            category_button.clicked.connect(
-                lambda _checked=False, kind=booking_type, key=group_key: self._cycle_booking_group_category(
-                    kind,
-                    key,
-                )
-            )
-            self._configure_booking_group_button(
-                category_button,
-                self._group_categories_for_booking(booking_type).get(group_key),
-                booking_type=booking_type,
-                enabled=False,
-            )
-            table.setCellWidget(first_row, 9, category_button)
 
         for group_key, rows in visual_multi_sku_groups.items():
             first_row = rows[0]
@@ -3031,7 +2998,6 @@ class MainWindow(QMainWindow):
         table = self._table_for_booking(booking_type)
         multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
         multi_sku_group_skus = self._booking_multi_sku_ids(products, booking_type)
-        group_categories = self._group_categories_for_booking(booking_type)
         self._weight_row_errors.pop(record.sku_id, None)
         for row_index, product in enumerate(products):
             try:
@@ -3055,14 +3021,15 @@ class MainWindow(QMainWindow):
                 self._clear_table_tooltip(row_index, 7, table=table)
                 self._set_table_text(row_index, 4, "?", table=table)
                 self._set_table_text(row_index, 8, "?", table=table)
-                first_row = multi_sku_groups[group_key][0]
-                button = table.cellWidget(first_row, 9)
+                display_override = record.category_override
+                button = table.cellWidget(row_index, 9)
                 if isinstance(button, QPushButton):
-                    self._configure_booking_group_button(
+                    self._configure_category_button(
                         button,
-                        group_categories.get(group_key),
-                        booking_type=booking_type,
+                        display_override or "?",
+                        manual=display_override is not None,
                         enabled=not self._automation_worker_running(),
+                        quantity_label="유닛",
                     )
                 continue
 
@@ -3281,7 +3248,7 @@ class MainWindow(QMainWindow):
         )
         if manual_groups:
             self.status_label.setText(
-                f"완료 · 상품 {product_count}개 · 수동 분류 필요 {len(manual_groups)}건"
+                f"완료 · 상품 {product_count}개 · 개별 분류 확인 {len(manual_groups)}건"
             )
         else:
             self.status_label.setText(f"완료 · 상품 {product_count}개 · 무게 분류 완료")
@@ -3302,13 +3269,11 @@ class MainWindow(QMainWindow):
             f"WMS 신규 조회: {wms_successes}개"
         )
         if manual_groups:
-            group_label = "예약" if self._active_booking_type == "truck" else "밀크런"
-            quantity_label = "유닛"
             message += (
-                f"\n\n다중 SKU {group_label} 수동 분류: {len(manual_groups)}건\n"
-                f"해당 {group_label}은 SKU별 {quantity_label} 무게만 저장했습니다. "
-                f"표의 병합된 분류 버튼을 눌러 {group_label} 전체를 수동 분류해 주세요. "
-                "수동 값은 상품 메모리에 저장되지 않습니다."
+                f"\n\n다중 SKU Milkrun 개별 분류: {len(manual_groups)}건\n"
+                "SKU별 유닛 무게만 저장했으며 팔렛트당 유닛과 1팔렛트 무게는 "
+                "알 수 없어 ?로 표시합니다. 각 SKU 행의 분류 버튼을 눌러 "
+                "경량·중량·고단·양곡을 선택하면 상품 메모리에 저장됩니다."
             )
         if unmatched:
             message += f"\n\n기준일 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
@@ -3337,15 +3302,6 @@ class MainWindow(QMainWindow):
             memory = ProductMemory(self.product_memory_file)
             record = memory.get(sku_id)
             override = record.category_override if record is not None else None
-            if (
-                override in AUTOMATIC_CATEGORIES
-                and sku_id in self._booking_multi_sku_ids(
-                    self._products_by_booking.get(booking_type, ()),
-                    booking_type,
-                )
-                and sku_id not in self._session_manual_category_skus
-            ):
-                override = None
             product_name = ""
             for product in self._products_by_booking.get(booking_type, ()):
                 try:
@@ -3450,7 +3406,6 @@ class MainWindow(QMainWindow):
         products = self._products_by_booking.get(booking_type, ())
         table = self._table_for_booking(booking_type)
         multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
-        group_categories = self._group_categories_for_booking(booking_type)
         for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
@@ -3483,15 +3438,9 @@ class MainWindow(QMainWindow):
                 table=table,
             )
             if group_key in multi_sku_groups:
-                first_row = multi_sku_groups[group_key][0]
-                button = table.cellWidget(first_row, 9)
+                button = table.cellWidget(row_index, 9)
                 if isinstance(button, QPushButton):
-                    self._configure_booking_group_button(
-                        button,
-                        group_categories.get(group_key),
-                        booking_type=booking_type,
-                        enabled=not self._automation_worker_running(),
-                    )
+                    self._configure_category_button(button, "?", manual=False, enabled=True)
                 continue
             button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
@@ -3505,17 +3454,12 @@ class MainWindow(QMainWindow):
         booking_type = booking_type or self._active_booking_type
         products = self._products_by_booking.get(booking_type, ())
         table = self._table_for_booking(booking_type)
-        multi_sku_groups = self._booking_multi_sku_groups(products, booking_type)
-        group_categories = self._group_categories_for_booking(booking_type)
         for row_index, product in enumerate(products):
             try:
                 if normalize_sku_id(product.sku_id) != sku_id:
                     continue
             except ValueError:
                 continue
-            group_key = self._booking_group_key(product, booking_type)
-            if group_key in multi_sku_groups:
-                return group_categories.get(group_key, "?")
             button = table.cellWidget(row_index, 9)
             if isinstance(button, QPushButton):
                 return button.text()

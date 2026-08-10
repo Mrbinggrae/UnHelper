@@ -449,19 +449,13 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ),
             )
             window._populate_milkrun_products(products)
-            window._milkrun_group_categories["10807763"] = "고단"
-            window._configure_booking_group_button(
-                window.raw_table.cellWidget(0, 9),
-                "고단",
-                booking_type="milkrun",
-                enabled=True,
-            )
-            window._configure_category_button(
-                window.raw_table.cellWidget(3, 9),
-                "중량",
-                manual=True,
-                enabled=True,
-            )
+            for row_index, category in enumerate(("고단", "고단", "고단", "중량")):
+                window._configure_category_button(
+                    window.raw_table.cellWidget(row_index, 9),
+                    category,
+                    manual=True,
+                    enabled=True,
+                )
 
             aggregate = window._raw_booking_aggregates()["M3370492"]
 
@@ -614,7 +608,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_multi_sku_milkrun_uses_weight_only_group_classification(self) -> None:
+    def test_multi_sku_milkrun_uses_weight_only_individual_classification(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
@@ -647,7 +641,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(window.raw_table.rowSpan(0, 0), 2)
                 self.assertEqual(window.raw_table.rowSpan(0, 1), 2)
                 self.assertEqual(window.raw_table.rowSpan(0, 2), 2)
-                self.assertEqual(window.raw_table.rowSpan(0, 9), 2)
+                self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
                 self.assertEqual(window.raw_table.item(0, 4).text(), "?")
                 self.assertEqual(window.raw_table.item(1, 4).text(), "?")
                 self.assertEqual(window.raw_table.item(0, 7).text(), "1000")
@@ -656,8 +650,8 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(window.raw_table.item(1, 8).text(), "?")
                 first_button = window.raw_table.cellWidget(0, 9)
                 second_button = window.raw_table.cellWidget(1, 9)
-                self.assertEqual(first_button.text(), "?")
-                self.assertIsNone(second_button)
+                self.assertEqual(first_button.text(), "고단")
+                self.assertEqual(second_button.text(), "중량")
                 self.assertIsNotNone(window.raw_table.cellWidget(2, 9))
                 self.assertEqual(
                     window.raw_table.item(0, 3).background().color(),
@@ -670,10 +664,10 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 first_button.click()
 
-                self.assertEqual(first_button.text(), "경량")
+                self.assertEqual(first_button.text(), "양곡")
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("123").category_override,
-                    "고단",
+                    "양곡",
                 )
                 self.assertEqual(
                     ProductMemory(window.product_memory_file).get("456").category_override,
@@ -681,7 +675,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 )
 
                 window._refresh_current_product_memory()
-                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "경량")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "양곡")
 
                 window._populate_milkrun_products((products[0],))
                 self.assertEqual(window._milkrun_group_categories, {})
@@ -730,6 +724,46 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_multi_sku_milkrun_saves_light_heavy_per_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                products = (
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "123", "상품 A"),
+                    MilkrunProductRow("거래처", "10813478", "2", "20", "456", "상품 B"),
+                )
+                window._populate_milkrun_products(products)
+                memory = ProductMemory(window.product_memory_file)
+                first = memory.upsert_weight_only("123", "상품 A", "1000")
+                second = memory.upsert_weight_only("456", "상품 B", "2000")
+                window._render_weight_record(first, "milkrun")
+                window._render_weight_record(second, "milkrun")
+                first_button = window.raw_table.cellWidget(0, 9)
+                second_button = window.raw_table.cellWidget(1, 9)
+
+                first_button.click()
+                self.assertEqual(first_button.text(), "경량")
+                self.assertEqual(second_button.text(), "?")
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "경량",
+                )
+
+                first_button.click()
+                self.assertEqual(first_button.text(), "중량")
+                self.assertEqual(
+                    ProductMemory(window.product_memory_file).get("123").category_override,
+                    "중량",
+                )
+                self.assertIsNone(
+                    ProductMemory(window.product_memory_file).get("456").category_override
+                )
+                self.assertEqual(window.raw_table.item(0, 4).text(), "?")
+                self.assertEqual(window.raw_table.item(0, 8).text(), "?")
+            finally:
+                window.close()
+
     def test_sku_shared_by_truck_groups_uses_saved_category_and_row_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
@@ -767,7 +801,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_sku_shared_by_milkrun_groups_keeps_multi_group_weight_only(self) -> None:
+    def test_sku_shared_by_milkrun_groups_keeps_individual_multi_category(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
@@ -785,7 +819,7 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window._render_weight_record(shared, "milkrun")
 
                 self.assertEqual(window.raw_table.item(0, 8).text(), "?")
-                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
+                self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "중량")
                 self.assertEqual(window.raw_table.item(2, 8).text(), "2")
                 self.assertEqual(window.raw_table.cellWidget(2, 9).text(), "경량")
                 self.assertEqual(
@@ -859,7 +893,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_multi_sku_milkrun_completion_requests_group_classification(self) -> None:
+    def test_multi_sku_milkrun_completion_requests_individual_classification(self) -> None:
         window = MainWindow(smoke_test=True)
         try:
             products = (
@@ -879,7 +913,8 @@ class MainWindowSmokeTests(unittest.TestCase):
 
             message = warning.call_args.args[2]
             self.assertIn("WMS SKU별 상품 무게 확인을 완료했습니다.", message)
-            self.assertIn("다중 SKU 밀크런 수동 분류: 1건", message)
+            self.assertIn("다중 SKU Milkrun 개별 분류: 1건", message)
+            self.assertIn("각 SKU 행의 분류 버튼", message)
         finally:
             window.close()
 
@@ -1637,9 +1672,9 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.raw_table.rowSpan(0, 0), 2)
             self.assertEqual(window.raw_table.rowSpan(0, 1), 2)
             self.assertEqual(window.raw_table.rowSpan(0, 2), 2)
-            self.assertEqual(window.raw_table.rowSpan(0, 9), 2)
+            self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
             self.assertEqual(window.raw_table.cellWidget(0, 9).text(), "?")
-            self.assertIsNone(window.raw_table.cellWidget(1, 9))
+            self.assertEqual(window.raw_table.cellWidget(1, 9).text(), "?")
         finally:
             window.close()
 
