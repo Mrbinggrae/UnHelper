@@ -1475,6 +1475,12 @@ class MainWindow(QMainWindow):
             second_note=floor_notes[1],
         )
 
+    def _refresh_arrival_from_current_raw(self) -> None:
+        """Recalculate pallet details without re-reading the linked workbook."""
+
+        if self._arrival_snapshot is not None:
+            self._render_arrival_sequence(self._arrival_snapshot)
+
 
     def _on_arrival_sequence_failed(self, failure: FailureDetails | object) -> None:
         details = FailureDetails.coerce(failure)
@@ -3111,6 +3117,7 @@ class MainWindow(QMainWindow):
         self._set_automation_working(self._automation_worker_running())
         if not self._automation_worker_running() and self.current_products:
             self._set_category_buttons_enabled(True)
+        self._refresh_arrival_from_current_raw()
         if self._closing_after_cancel:
             if not self._automation_worker_running():
                 QTimer.singleShot(0, self.close)
@@ -3320,6 +3327,7 @@ class MainWindow(QMainWindow):
                 self._render_weight_record(updated, kind)
             source = "자동" if updated.category_override is None else "수동"
             self.append_log(f"SKU {sku_id} 분류 변경: {updated.effective_category or '?'} ({source})")
+        self._refresh_arrival_from_current_raw()
 
     def _cycle_booking_group_category(self, booking_type: str, group_key: str) -> None:
         if self._automation_worker_running():
@@ -3359,6 +3367,7 @@ class MainWindow(QMainWindow):
             f"{group_label} {group_key} 표 분류 변경: {next_category or '?'} "
             "(현재 표에만 적용·상품 메모리에 저장하지 않음)"
         )
+        self._refresh_arrival_from_current_raw()
 
     def _cycle_truck_group_category(self, reservation_number: str) -> None:
         self._cycle_booking_group_category("truck", reservation_number)
@@ -3745,6 +3754,7 @@ class MainWindow(QMainWindow):
                     self._render_weight_record(record, booking_type)
             if announce:
                 self.append_log("설정에서 변경한 상품 분류 메모리를 RAW 표에 반영했습니다.")
+            self._refresh_arrival_from_current_raw()
         except Exception as exc:
             self._show_error_dialog(
                 "상품 분류 새로고침 실패",

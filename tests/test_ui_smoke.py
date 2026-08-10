@@ -295,6 +295,81 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_arrival_second_floor_updates_high_and_grain_after_manual_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                product = MilkrunProductRow(
+                    "거래처",
+                    "10807763",
+                    "3",
+                    "30",
+                    "123",
+                    "상품",
+                    "M3370492",
+                )
+                window._populate_milkrun_products((product,))
+                record = ProductMemory(window.product_memory_file).upsert_measurement(
+                    "123",
+                    "상품",
+                    "1000",
+                    "30",
+                    "3",
+                )
+                window._render_weight_record(record, "milkrun")
+                snapshot = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 10, 1, 2, 3),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(
+                        ArrivalSequenceEntry(
+                            18,
+                            "MBN3370492",
+                            "M3370492",
+                            "milkrun",
+                            "2F",
+                            "",
+                            "",
+                        ),
+                    ),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "M3370492",
+                            "milkrun",
+                            "2F",
+                            "Raw_밀크런",
+                            2,
+                        ),
+                    ),
+                )
+                window._arrival_snapshot = snapshot
+                window._render_arrival_sequence(snapshot)
+                second = window.arrival_detail_tables["floor_targets"]["second"]
+                button = window.raw_table.cellWidget(0, 9)
+
+                self.assertEqual(second.item(1, 1).text(), "3 Pallet")
+
+                button.click()  # 수동 경량
+                button.click()  # 수동 중량
+                button.click()  # 수동 고단
+
+                self.assertEqual(second.item(1, 1).text(), "0 Pallet")
+                self.assertEqual(second.item(2, 1).text(), "0 Pallet")
+                self.assertEqual(second.item(3, 1).text(), "3 Pallet")
+
+                button.click()  # 수동 양곡
+
+                self.assertEqual(second.item(3, 1).text(), "0 Pallet")
+                self.assertEqual(second.item(4, 1).text(), "3 Pallet")
+            finally:
+                window.close()
+
     def test_operation_progress_shows_completed_and_remaining_percent(self) -> None:
         window = MainWindow(smoke_test=True)
         try:

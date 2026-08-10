@@ -7,7 +7,7 @@ from pathlib import Path
 
 GITHUB_OWNER = "Mrbinggrae"
 GITHUB_REPO = "UnHelper"
-_FALLBACK_VERSION = "1.0.7"
+_FALLBACK_VERSION = "1.0.8"
 
 
 def _history_candidates() -> list[Path]:
