@@ -89,7 +89,11 @@ from Modules.Shipments.DailyInboundScraper import (
     DailyInboundScraper,
     TRUCK_DAILY_INBOUND_PROFILE,
 )
-from Modules.Shipments.DailyInbound import normalize_booking_number
+from Modules.Shipments.DailyInbound import (
+    MilkrunProductRow,
+    deduplicated_truck_pallet_count,
+    normalize_booking_number,
+)
 from Modules.WMS.ProductMemory import (
     AUTOMATIC_CATEGORIES,
     GRAIN_CATEGORY,
@@ -328,7 +332,6 @@ class MilkrunWorker(QThread):
         metrics = import_result.metrics_by_reservation
         products = []
         detail_units: dict[str, Decimal] = {}
-        detail_pallets: dict[str, Decimal] = {}
         for product in daily_result.products:
             metric = metrics.get(product.dispatch_number)
             if metric is None:
@@ -367,17 +370,56 @@ class MilkrunWorker(QThread):
             detail_units[product.dispatch_number] = (
                 detail_units.get(product.dispatch_number, Decimal("0")) + unit_count
             )
-            detail_pallets[product.dispatch_number] = (
-                detail_pallets.get(product.dispatch_number, Decimal("0")) + pallet_count
-            )
 
         grouped_products: dict[str, list] = {}
-        group_order: list[str] = []
+        # Preserve the source file's A-column reservation order.  Daily cards
+        # can be returned in a different DOM order, and unavailable-detail
+        # placeholders must not all drift to the end of the RAW table.
+        group_order: list[str] = list(dict.fromkeys(import_result.dispatch_numbers))
         for product in products:
             if product.dispatch_number not in grouped_products:
                 grouped_products[product.dispatch_number] = []
-                group_order.append(product.dispatch_number)
+                if product.dispatch_number not in group_order:
+                    group_order.append(product.dispatch_number)
             grouped_products[product.dispatch_number].append(product)
+
+        unmatched = set(daily_result.unmatched_dispatches)
+        empty_details = set(daily_result.empty_detail_dispatches)
+        for reservation_number in import_result.dispatch_numbers:
+            if reservation_number in grouped_products:
+                continue
+            metric = metrics.get(reservation_number)
+            if metric is None:
+                raise DailyInboundError(
+                    f"예약번호 {reservation_number}의 다운로드 수량 정보를 찾지 못했습니다."
+                )
+            if reservation_number in unmatched:
+                reason = "일별 입고 카드 미조회"
+            elif reservation_number in empty_details:
+                reason = "예약 상세 상품 없음"
+            else:
+                reason = "상세 SKU 미수집"
+            placeholder = MilkrunProductRow(
+                vendor_name=metric.vendor_name,
+                milkrun_number="",
+                pallet_count=str(metric.pallet_count),
+                box_count=str(metric.unit_count),
+                sku_id="",
+                sku_name=f"{reason} · 다운로드 원본 합계로 표시",
+                dispatch_number=reservation_number,
+                detail_unavailable=True,
+            )
+            grouped_products[reservation_number] = [placeholder]
+            self.log_updated.emit(
+                f"예약번호 {reservation_number}: {reason}. 다운로드 원본의 "
+                f"{metric.pallet_count} Pallet / {metric.unit_count} Unit을 표에 "
+                "미분류로 유지합니다."
+            )
+
+        detail_pallets = {
+            reservation_number: deduplicated_truck_pallet_count(group_products)
+            for reservation_number, group_products in grouped_products.items()
+        }
 
         for reservation_number in detail_units:
             metric = metrics[reservation_number]
@@ -394,7 +436,7 @@ class MilkrunWorker(QThread):
         ordered_products = tuple(
             product
             for reservation_number in group_order
-            for product in grouped_products[reservation_number]
+            for product in grouped_products.get(reservation_number, ())
         )
         return replace(daily_result, products=ordered_products)
 
@@ -814,6 +856,11 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     WEIGHT_RETRY_CHECKPOINTS_KEY = "weight_retry_checkpoints_v1"
     MAX_WEIGHT_RETRY_CHECKPOINTS = 8
+    DETAIL_UNAVAILABLE_TOOLTIP = (
+        "일별 입고 상세를 확인하지 못해 다운로드 원본의 예약 합계만 표시합니다. "
+        "SKU 무게와 분류는 확인할 수 없습니다. 데이터 얻기를 다시 누르면 "
+        "Shipments 상세 조회부터 다시 시도합니다."
+    )
 
     def __init__(
         self,
@@ -1362,6 +1409,9 @@ class MainWindow(QMainWindow):
                         "pallets": Decimal("0"),
                         "categories": {},
                         "milkrun_groups": {},
+                        "truck_containers": {},
+                        "has_high": False,
+                        "has_grain": False,
                         "missing": 0,
                     },
                 )
@@ -1369,14 +1419,6 @@ class MainWindow(QMainWindow):
                 vendors = state["vendors"]
                 if vendor and vendor not in vendors:
                     vendors.append(vendor)
-
-                try:
-                    pallets = Decimal(str(product.pallet_count).replace(",", ""))
-                    if not pallets.is_finite() or pallets < 0:
-                        raise ValueError("invalid pallet count")
-                except (InvalidOperation, TypeError, ValueError):
-                    state["missing"] += 1
-                    continue
 
                 try:
                     sku_id = normalize_sku_id(product.sku_id)
@@ -1388,6 +1430,55 @@ class MainWindow(QMainWindow):
                     category = button.text() if isinstance(button, QPushButton) else "?"
                 if category not in valid_categories:
                     category = "?"
+                if category == HIGH_CATEGORY:
+                    state["has_high"] = True
+                elif category == GRAIN_CATEGORY:
+                    state["has_grain"] = True
+
+                if booking_type == "truck" and product.container_pallets:
+                    valid_container = False
+                    truck_containers = state["truck_containers"]
+                    for raw_identity, raw_count in product.container_pallets:
+                        identity = normalize_product_name(raw_identity).casefold()
+                        if not identity:
+                            continue
+                        try:
+                            container_pallets = Decimal(
+                                str(raw_count).replace(",", "")
+                            )
+                            if not container_pallets.is_finite() or container_pallets <= 0:
+                                raise ValueError("invalid container pallet count")
+                        except (InvalidOperation, TypeError, ValueError):
+                            continue
+                        valid_container = True
+                        container_state = truck_containers.get(identity)
+                        if container_state is None:
+                            truck_containers[identity] = {
+                                "pallets": container_pallets,
+                                "categories": {category},
+                            }
+                            continue
+                        if container_state["pallets"] != container_pallets:
+                            # One physical container cannot have two pallet
+                            # counts. Keep the larger safe total, count it once,
+                            # and expose the source conflict as a check target.
+                            container_state["pallets"] = max(
+                                container_state["pallets"],
+                                container_pallets,
+                            )
+                            state["missing"] += 1
+                        container_state["categories"].add(category)
+                    if not valid_container:
+                        state["missing"] += 1
+                    continue
+
+                try:
+                    pallets = Decimal(str(product.pallet_count).replace(",", ""))
+                    if not pallets.is_finite() or pallets < 0:
+                        raise ValueError("invalid pallet count")
+                except (InvalidOperation, TypeError, ValueError):
+                    state["missing"] += 1
+                    continue
                 if booking_type == "milkrun":
                     milkrun_number = normalize_product_name(product.milkrun_number)
                     group_identity = milkrun_number or f"row:{row_index}"
@@ -1412,6 +1503,20 @@ class MainWindow(QMainWindow):
 
         for state in mutable.values():
             categories = state["categories"]
+            for container_state in state["truck_containers"].values():
+                pallets = container_state["pallets"]
+                container_categories = container_state["categories"]
+                state["pallets"] += pallets
+                # A shared Truck PALLET can contain multiple SKU rows. Count
+                # that physical pallet once; if its ordinary SKU categories
+                # disagree, do not invent a split. Vehicle-wide high/grain is
+                # applied below after the exact total has been established.
+                category = (
+                    next(iter(container_categories))
+                    if len(container_categories) == 1
+                    else "?"
+                )
+                categories[category] = categories.get(category, Decimal("0")) + pallets
             for group_state in state["milkrun_groups"].values():
                 pallets = group_state["pallets"]
                 group_categories = group_state["categories"]
@@ -1431,6 +1536,15 @@ class MainWindow(QMainWindow):
                     continue
                 category = next(iter(group_categories)) if len(group_categories) == 1 else "?"
                 categories[category] = categories.get(category, Decimal("0")) + pallets
+
+            # A booking key represents one physical vehicle.  Handling rules
+            # are vehicle-wide: if any SKU is high-stack, every pallet on that
+            # vehicle is high-stack; otherwise any grain SKU makes the whole
+            # vehicle grain.  High-stack wins in the unlikely mixed case.
+            if state["has_high"]:
+                state["categories"] = {HIGH_CATEGORY: state["pallets"]}
+            elif state["has_grain"]:
+                state["categories"] = {GRAIN_CATEGORY: state["pallets"]}
 
         return {
             booking_key: RawBookingAggregate(
@@ -1483,12 +1597,33 @@ class MainWindow(QMainWindow):
         def pallet_value_text(value: Decimal) -> str:
             return f"{self._format_decimal(value)} Pallet"
 
+        def booking_preview(
+            values,
+            *,
+            label: str,
+            explanation: str,
+            limit: int = 6,
+        ) -> str:
+            bookings = tuple(dict.fromkeys(str(value) for value in values if value))
+            if not bookings:
+                return ""
+            preview = ", ".join(bookings[:limit])
+            if len(bookings) > limit:
+                preview += f" 외 {len(bookings) - limit}대"
+            return f"{label} {len(bookings)}대 · {explanation}\n{preview}"
+
         def status_breakdown_note(breakdown) -> str:
             notes: list[str] = []
             if breakdown.missing_pallet_vehicles:
                 notes.append(f"팔렛트 수 미입력 {breakdown.missing_pallet_vehicles}대")
             if breakdown.unmapped_bookings:
-                notes.append("층 미매핑 " + ", ".join(breakdown.unmapped_bookings))
+                notes.append(
+                    booking_preview(
+                        breakdown.unmapped_bookings,
+                        label="층 미매핑",
+                        explanation="입차순번에서 1F/2F 값을 확인하지 못했습니다.",
+                    )
+                )
             notes.extend(breakdown.notes)
             return " · ".join(notes)
 
@@ -1546,7 +1681,13 @@ class MainWindow(QMainWindow):
             if breakdown.missing_pallet_rows:
                 notes.append(f"팔렛트 수 미입력 {breakdown.missing_pallet_rows}행")
             if breakdown.unmapped_bookings:
-                notes.append("RAW 미매칭 " + ", ".join(breakdown.unmapped_bookings))
+                notes.append(
+                    booking_preview(
+                        breakdown.unmapped_bookings,
+                        label="RAW 미매칭",
+                        explanation="현재 기준일의 앱 RAW 표에 같은 예약번호가 없습니다.",
+                    )
+                )
             if row_index == 0 and breakdown.unassigned_raw_bookings:
                 missing_keys = breakdown.unassigned_raw_bookings
                 preview = ", ".join(missing_keys[:10])
@@ -2215,7 +2356,11 @@ class MainWindow(QMainWindow):
         )
         checkpoints = self._read_weight_retry_checkpoints()
         existing_products = self._products_by_booking.get(booking_type, ())
-        if retry_mode is None and existing_products:
+        has_unavailable_detail = any(
+            bool(getattr(product, "detail_unavailable", False))
+            for product in existing_products
+        )
+        if retry_mode is None and existing_products and not has_unavailable_detail:
             sku_ids = self._weight_checkpoint_skus(existing_products)
             checkpoint = checkpoints.get(checkpoint_key)
             if checkpoint is not None:
@@ -2246,6 +2391,11 @@ class MainWindow(QMainWindow):
                 self._automation_cancel_requested = False
                 self._start_weight_lookup(self.current_products, retry_mode="resume")
                 return
+        elif retry_mode is None and has_unavailable_detail:
+            self.append_log(
+                "저장된 표에 상세 미확인 예약이 있어 WMS 이어하기 대신 "
+                "Shipments 조회부터 다시 실행합니다."
+            )
 
         configured_workbook = str(self.settings.value("milkrun_excel_path", "")).strip()
         if not configured_workbook:
@@ -2391,7 +2541,19 @@ class MainWindow(QMainWindow):
             self.append_log(
                 f"입고일이 기준일 전날인 행 {excel.filtered_rows}개를 제외했습니다."
             )
-        self.append_log(f"일별 입고 상세 표시 완료: {len(daily.products)}개 상품")
+        unavailable_count = sum(
+            bool(getattr(product, "detail_unavailable", False))
+            for product in daily.products
+        )
+        detail_product_count = len(daily.products) - unavailable_count
+        self.append_log(
+            f"일별 입고 상세 표시 완료: {detail_product_count}개 상품"
+            + (
+                f" · 다운로드 원본 합계 표시 {unavailable_count}개 예약"
+                if unavailable_count
+                else ""
+            )
+        )
         if daily.unmatched_dispatches:
             number_label = "예약번호" if booking_type == "truck" else "배차번호"
             self.append_log(
@@ -2402,9 +2564,14 @@ class MainWindow(QMainWindow):
         if empty_details:
             number_label = "예약번호" if booking_type == "truck" else "배차번호"
             self.append_log(
-                f"상품 데이터가 없어 건너뛴 {number_label}: " + ", ".join(empty_details)
+                f"상품 상세가 없어 다운로드 원본 합계로 표시한 {number_label}: "
+                + ", ".join(empty_details)
             )
-        self.status_label.setText("일별 입고 표 완료 · WMS 무게 확인 준비")
+        self.status_label.setText(
+            "일별 입고 표 완료 · 확인 가능한 SKU의 WMS 무게 조회 준비"
+            if unavailable_count
+            else "일별 입고 표 완료 · WMS 무게 확인 준비"
+        )
         weight_retry_mode = (
             "restart" if self._pending_full_pipeline_restart else "resume"
         )
@@ -2437,7 +2604,16 @@ class MainWindow(QMainWindow):
         # ``milkrun_number`` identifies that inner quantity group, while
         # ``dispatch_number`` identifies the outer M schedule card and can
         # contain several independent Milkrun groups.
-        return normalize_product_name(product.milkrun_number)
+        dispatch_number = normalize_product_name(product.dispatch_number)
+        milkrun_number = normalize_product_name(product.milkrun_number)
+        if not dispatch_number:
+            return milkrun_number
+        if not milkrun_number:
+            return dispatch_number
+        # An inner Milkrun number is not globally unique.  The same value can
+        # appear under a different outer M dispatch, and those vehicles must
+        # never share row spans, pallet counts, or multi-SKU policy.
+        return f"{dispatch_number} / {milkrun_number}"
 
     @staticmethod
     def _display_booking_number(product, booking_type: str) -> str:
@@ -2580,7 +2756,10 @@ class MainWindow(QMainWindow):
             for row_index in rows
         }
         for row_index, product in enumerate(self.current_products):
-            if row_index in multi_sku_rows:
+            detail_unavailable = bool(
+                getattr(product, "detail_unavailable", False)
+            )
+            if detail_unavailable or row_index in multi_sku_rows:
                 boxes_per_pallet = "?"
             else:
                 try:
@@ -2598,8 +2777,8 @@ class MainWindow(QMainWindow):
                 boxes_per_pallet,
                 product.sku_id,
                 normalize_product_name(product.sku_name),
-                "-",
-                "?" if row_index in multi_sku_rows else "-",
+                "?" if detail_unavailable else "-",
+                "?" if detail_unavailable or row_index in multi_sku_rows else "-",
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -2611,13 +2790,16 @@ class MainWindow(QMainWindow):
             category_button.setObjectName("CategoryButton")
             category_button.setProperty("classification", "?")
             category_button.setEnabled(False)
-            category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
-            category_button.clicked.connect(
-                lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
-                    sku_id,
-                    kind,
+            if detail_unavailable:
+                category_button.setToolTip(self.DETAIL_UNAVAILABLE_TOOLTIP)
+            else:
+                category_button.setToolTip("WMS 무게 확인 후 분류를 변경할 수 있습니다.")
+                category_button.clicked.connect(
+                    lambda _checked=False, sku_id=product.sku_id, kind=booking_type: self._cycle_category(
+                        sku_id,
+                        kind,
+                    )
                 )
-            )
             table.setCellWidget(row_index, 9, category_button)
 
         for group_key, rows in multi_sku_groups.items():
@@ -2905,7 +3087,16 @@ class MainWindow(QMainWindow):
             self.append_log("중지 요청이 처리 중이므로 WMS 무게 조회를 시작하지 않습니다.")
             return
         products = tuple(products)
-        if not products:
+        unavailable_count = sum(
+            bool(getattr(product, "detail_unavailable", False))
+            for product in products
+        )
+        weight_products = tuple(
+            product
+            for product in products
+            if not bool(getattr(product, "detail_unavailable", False))
+        )
+        if not weight_products:
             self._pending_weight_summary = ProductWeightSummary(
                 total_skus=0,
                 cache_hits=0,
@@ -2915,8 +3106,17 @@ class MainWindow(QMainWindow):
             self._pending_weight_failure = None
             self._pending_weight_cancel = ""
             self._weight_finalize_pending = True
-            self.status_label.setText("기준일 표시 상품 없음 · WMS 조회 생략")
-            self.append_log("기준일에 표시할 상품이 없어 WMS 무게 조회를 건너뜁니다.")
+            if unavailable_count:
+                self.status_label.setText(
+                    f"다운로드 원본 합계 {unavailable_count}건 표시 · WMS/분류 제외"
+                )
+                self.append_log(
+                    "상세 SKU를 확인하지 못한 예약의 다운로드 원본 합계만 표시하고 "
+                    "WMS 무게 조회와 분류를 건너뜁니다."
+                )
+            else:
+                self.status_label.setText("기준일 표시 상품 없음 · WMS 조회 생략")
+                self.append_log("기준일에 표시할 상품이 없어 WMS 무게 조회를 건너뜁니다.")
             self._finalize_weight_if_ready()
             return
         memory = _open_product_memory_with_recovery(self.product_memory_file, self)
@@ -2948,12 +3148,12 @@ class MainWindow(QMainWindow):
         self._pending_weight_failure = None
         self._pending_weight_cancel = ""
         _checkpoint_key, pending_skus = self._remember_weight_retry_checkpoint(
-            products,
+            weight_products,
             memory=memory,
             retry_mode=retry_mode,
         )
         self.weight_worker = ProductWeightWorker(
-            products,
+            weight_products,
             self.product_memory_file,
             chromedriver_path(),
             credentials.wms_id,
@@ -3280,6 +3480,11 @@ class MainWindow(QMainWindow):
         cache_hits = summary.cache_hits if summary is not None else 0
         wms_successes = summary.wms_successes if summary is not None else 0
         product_count = len(self.current_products)
+        unavailable_count = sum(
+            bool(getattr(product, "detail_unavailable", False))
+            for product in self.current_products
+        )
+        detail_product_count = product_count - unavailable_count
         manual_groups = self._booking_multi_sku_groups(
             self.current_products,
             self._active_booking_type,
@@ -3298,7 +3503,12 @@ class MainWindow(QMainWindow):
             if self.current_pipeline_result is not None
             else ()
         )
-        if manual_groups:
+        if unavailable_count:
+            self.status_label.setText(
+                f"완료 · 상세 상품 {detail_product_count}개 · "
+                f"원본 합계 {unavailable_count}건 · WMS/분류 제외"
+            )
+        elif manual_groups:
             self.status_label.setText(
                 f"완료 · 상품 {product_count}개 · 개별 분류 확인 {len(manual_groups)}건"
             )
@@ -3314,12 +3524,21 @@ class MainWindow(QMainWindow):
             if manual_groups
             else "WMS 무게 분류를 완료했습니다."
         )
+        if unavailable_count:
+            completion_text = "확인 가능한 SKU의 WMS 무게 조회를 완료했습니다."
         message = (
-            f"{booking_label} 다운로드, Excel 값 반영, 일별 입고 상세와 {completion_text}\n\n"
-            f"표시 상품: {product_count}개\n"
+            f"{booking_label} 다운로드, Excel 값 반영과 일별 입고 표 표시를 완료했습니다.\n"
+            f"{completion_text}\n\n"
+            f"상세 확인 상품: {detail_product_count}개\n"
             f"저장된 무게 사용: {cache_hits}개\n"
             f"WMS 신규 조회: {wms_successes}개"
         )
+        if unavailable_count:
+            message += (
+                f"\n다운로드 원본 합계 표시: {unavailable_count}개 예약\n"
+                "이 행은 SKU 상세를 확인하지 못해 팔렛트 합계만 미분류로 표시하며, "
+                "WMS 무게 조회와 수동 분류 대상에서 제외합니다."
+            )
         if manual_groups:
             message += (
                 f"\n\n다중 SKU Milkrun 개별 분류: {len(manual_groups)}건\n"
@@ -3328,13 +3547,16 @@ class MainWindow(QMainWindow):
                 "경량·중량·고단·양곡을 선택하면 상품 메모리에 저장됩니다."
             )
         if unmatched:
-            message += f"\n\n기준일 카드에서 찾지 못한 {number_label}: " + ", ".join(unmatched)
+            message += (
+                f"\n\n기준일 카드에서 찾지 못해 원본 합계로 표시한 {number_label}: "
+                + ", ".join(unmatched)
+            )
         if empty_details:
             message += (
-                f"\n\n상품 데이터가 없어 건너뛴 {number_label}: "
+                f"\n\n상품 상세가 없어 원본 합계로 표시한 {number_label}: "
                 + ", ".join(empty_details)
             )
-        if unmatched or empty_details:
+        if unmatched or empty_details or unavailable_count:
             QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
         elif manual_groups:
             QMessageBox.warning(self, f"{booking_label} 작업 완료", message)
@@ -3518,11 +3740,23 @@ class MainWindow(QMainWindow):
         return "?"
 
     def _set_category_buttons_enabled(self, enabled: bool) -> None:
-        for table in (self.raw_table, self.truck_table):
+        for booking_type, table in (
+            ("milkrun", self.raw_table),
+            ("truck", self.truck_table),
+        ):
+            products = self._products_by_booking.get(booking_type, ())
             for row_index in range(table.rowCount()):
                 button = table.cellWidget(row_index, 9)
                 if isinstance(button, QPushButton):
-                    button.setEnabled(enabled)
+                    detail_unavailable = (
+                        row_index < len(products)
+                        and bool(
+                            getattr(products[row_index], "detail_unavailable", False)
+                        )
+                    )
+                    button.setEnabled(enabled and not detail_unavailable)
+                    if detail_unavailable:
+                        button.setToolTip(self.DETAIL_UNAVAILABLE_TOOLTIP)
 
     @staticmethod
     def _configure_category_button(

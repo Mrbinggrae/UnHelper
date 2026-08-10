@@ -20,6 +20,61 @@ class MilkrunProductRow:
     sku_id: str
     sku_name: str
     dispatch_number: str = ""
+    # Truck detail rows may repeat one physical PALLET container for several
+    # SKUs through HTML rowspan.  Keep the container identity/count pairs so a
+    # vehicle total can count that pallet once without discarding its SKU rows.
+    # Milkrun rows and snapshots written before this field was introduced use
+    # the empty default.
+    container_pallets: tuple[tuple[str, str], ...] = ()
+    # A Truck booking can exist in the downloaded source while its daily
+    # inbound card/detail is not yet available (for example, an early
+    # ``발송 확정`` reservation). Keep a source-metric row in the RAW table
+    # without treating it as a WMS-queryable SKU.
+    detail_unavailable: bool = False
+
+
+def deduplicated_truck_pallet_count(
+    products: Iterable[MilkrunProductRow],
+) -> Decimal:
+    """Return a Truck pallet total with shared container identities counted once.
+
+    New Truck detail rows carry ``container_pallets``.  Legacy/imported rows do
+    not, so their existing per-SKU pallet count remains the fallback.  If the
+    same container identity is reported with inconsistent counts, the largest
+    value is used; summing those values would necessarily double-count one
+    physical container.
+    """
+
+    containers: dict[tuple[str, str], Decimal] = {}
+    legacy_total = Decimal("0")
+    for product in products:
+        dispatch = normalize_booking_number(product.dispatch_number, prefix="T") or _clean_text(
+            product.dispatch_number
+        ).casefold()
+        if product.container_pallets:
+            for identity, raw_count in product.container_pallets:
+                normalized_identity = _clean_text(identity).casefold()
+                if not normalized_identity:
+                    continue
+                try:
+                    count = Decimal(str(raw_count).strip().replace(",", ""))
+                except InvalidOperation:
+                    continue
+                if not count.is_finite() or count <= 0:
+                    continue
+                key = (dispatch, normalized_identity)
+                previous = containers.get(key)
+                if previous is None or count > previous:
+                    containers[key] = count
+            continue
+
+        try:
+            count = Decimal(str(product.pallet_count).strip().replace(",", ""))
+        except InvalidOperation:
+            continue
+        if count.is_finite() and count > 0:
+            legacy_total += count
+    return legacy_total + sum(containers.values(), Decimal("0"))
 
 
 def normalize_booking_number(value: Any, *, prefix: str) -> str:
@@ -164,7 +219,7 @@ def parse_detail_table_cells(
     if normalized_prefix == "T":
         aggregated: dict[str, dict[str, Any]] = {}
         order: list[str] = []
-        for raw_cells in rows:
+        for source_index, raw_cells in enumerate(rows):
             cells = tuple(_clean_text(value) for value in raw_cells)
             if len(cells) < 9 or cells[0].upper() != "PALLET":
                 continue
@@ -188,12 +243,24 @@ def parse_detail_table_cells(
                 order.append(sku_id)
                 aggregated[sku_id] = {
                     "sku_name": sku_name,
-                    "container_count": Decimal("0"),
+                    "container_pallets": {},
                     "total_quantity": Decimal("0"),
                     "container_names": [],
                 }
             entry = aggregated[sku_id]
-            entry["container_count"] += container_count
+            container_barcode = cells[2]
+            container_name = cells[1]
+            if container_barcode:
+                container_identity = f"barcode:{container_barcode.casefold()}"
+            elif container_name:
+                container_identity = f"name:{container_name.casefold()}"
+            else:
+                # Without either identity there is no safe cross-SKU dedup key.
+                # Keep the row unique rather than accidentally merging pallets.
+                container_identity = f"row:{source_index}"
+            previous_count = entry["container_pallets"].get(container_identity)
+            if previous_count is None or container_count > previous_count:
+                entry["container_pallets"][container_identity] = container_count
             entry["total_quantity"] += total_quantity
             if cells[1] and cells[1] not in entry["container_names"]:
                 entry["container_names"].append(cells[1])
@@ -202,17 +269,27 @@ def parse_detail_table_cells(
             text = format(value, "f")
             return text.rstrip("0").rstrip(".") if "." in text else text
 
+        def sku_pallet_count(sku_id: str) -> Decimal:
+            return sum(
+                aggregated[sku_id]["container_pallets"].values(),
+                Decimal("0"),
+            )
+
         return tuple(
             MilkrunProductRow(
                 vendor_name="",
                 milkrun_number=", ".join(aggregated[sku_id]["container_names"]),
-                pallet_count=count_text(aggregated[sku_id]["container_count"]),
+                pallet_count=count_text(sku_pallet_count(sku_id)),
                 box_count=count_text(aggregated[sku_id]["total_quantity"]),
                 sku_id=sku_id,
                 sku_name=aggregated[sku_id]["sku_name"],
                 dispatch_number=normalize_booking_number(
                     dispatch_number,
                     prefix="T",
+                ),
+                container_pallets=tuple(
+                    (identity, count_text(count))
+                    for identity, count in aggregated[sku_id]["container_pallets"].items()
                 ),
             )
             for sku_id in order

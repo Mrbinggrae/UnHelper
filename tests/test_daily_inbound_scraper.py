@@ -45,16 +45,11 @@ class _Card:
         self.label = label
         self.stale = stale
 
-    def find_elements(self, by, value):
+    @property
+    def text(self) -> str:
         if self.stale:
             raise StaleElementReferenceException("rerendered")
-        self.assert_selector(by, value)
-        return [_Label(self.label)]
-
-    @staticmethod
-    def assert_selector(by, value) -> None:
-        if (by, value) != (By.CSS_SELECTOR, "b"):
-            raise AssertionError((by, value))
+        return self.label
 
 
 class _Driver:
@@ -208,6 +203,72 @@ class DailyInboundScraperTests(unittest.TestCase):
             scraper._unique_dispatches(("3370492", "T3370492", "M3370492")),
             ("T3370492",),
         )
+
+    def test_truck_card_matches_reservation_from_whole_text_not_bold_markup(self) -> None:
+        card = mock.Mock()
+        card.text = "발송 확정\nT8886709\n코카콜라음료 주식회사"
+        scraper = DailyInboundScraper(
+            _Browser((card,)),
+            profile=TRUCK_DAILY_INBOUND_PROFILE,
+        )
+
+        matches = scraper._matching_slots("T8886709")
+
+        self.assertEqual(matches, [card])
+        card.find_elements.assert_not_called()
+
+    def test_milkrun_raw_card_matches_only_explicit_dispatch_token(self) -> None:
+        # Representative values supplied from the real Milkrun RAW export:
+        # status/order numbers are numerous, but only the prefixed dispatch is
+        # semantically a daily-inbound card key.
+        card = _Card(
+            "강제예약\nM3371507\n팔레트수 16\n박스수 34\n"
+            "발주서 137252351/137252348"
+        )
+        scraper = DailyInboundScraper(_Browser((card,)))
+
+        self.assertEqual(scraper._matching_slots("M3371507"), [card])
+        self.assertEqual(scraper._matching_slots("M137252351"), [])
+        self.assertEqual(scraper._matching_slots("M3371508"), [])
+
+    def test_card_token_parser_rejects_substrings_and_normalizes_spacing(self) -> None:
+        truck = DailyInboundScraper(
+            _Browser(),
+            profile=TRUCK_DAILY_INBOUND_PROFILE,
+        )
+        card = _Card(
+            "AT8886709 SKU-T8886709X T 8,886,709 T8886709 "
+            "M8886709 8886709"
+        )
+
+        self.assertEqual(truck._card_booking_numbers(card), ("T8886709",))
+
+    def test_all_unmatched_truck_returns_result_for_source_total_fallback(self) -> None:
+        progress = []
+        scraper = _StubScraper(
+            _Browser(),
+            profile=TRUCK_DAILY_INBOUND_PROFILE,
+            progress=lambda completed, total: progress.append((completed, total)),
+        )
+
+        result = scraper.run(
+            ("T8886709",),
+            center_name="안산2",
+            schedule_date=date(2026, 8, 9),
+        )
+
+        self.assertEqual(result.products, ())
+        self.assertEqual(result.matched_dispatches, ())
+        self.assertEqual(result.unmatched_dispatches, ("T8886709",))
+        self.assertEqual(progress, [(0, 1), (1, 1)])
+
+    def test_all_unmatched_milkrun_remains_a_failure(self) -> None:
+        with self.assertRaises(DailyInboundError):
+            _StubScraper(_Browser()).run(
+                ("M3371507",),
+                center_name="안산2",
+                schedule_date=date(2026, 8, 9),
+            )
 
     def test_truck_profile_uses_truck_detail_href_and_source_error_message(self) -> None:
         scraper = DailyInboundScraper(
@@ -607,6 +668,113 @@ class DailyInboundScraperTests(unittest.TestCase):
             tuple(product.vendor_name for product in updated.products),
             ("다운로드 거래처", "다운로드 거래처"),
         )
+        self.assertEqual(logs, [])
+
+    def test_truck_worker_keeps_unmatched_source_reservation_as_ordered_placeholder(self) -> None:
+        from Modules.Shipments.DailyInboundScraper import DailyInboundResult
+
+        missing_metric = TruckReservationMetrics(
+            reservation_number="T8886709",
+            unit_count=Decimal("864"),
+            pallet_count=Decimal("16"),
+            source_rows=(2,),
+            vendor_name="코카콜라음료 주식회사",
+        )
+        matched_metric = TruckReservationMetrics(
+            reservation_number="T3372829",
+            unit_count=Decimal("20"),
+            pallet_count=Decimal("2"),
+            source_rows=(3,),
+            vendor_name="다른 거래처",
+        )
+        import_result = TruckExcelImportResult(
+            source_file=Path("truck.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_트럭",
+            rows=3,
+            columns=19,
+            dispatch_numbers=("T8886709", "T3372829"),
+            reservation_metrics=(missing_metric, matched_metric),
+        )
+        daily_result = DailyInboundResult(
+            products=(
+                MilkrunProductRow(
+                    "", "PALLET_1", "2", "20", "123", "상품", "T3372829"
+                ),
+            ),
+            requested_dispatches=("T8886709", "T3372829"),
+            matched_dispatches=("T3372829",),
+            unmatched_dispatches=("T8886709",),
+        )
+        worker = MilkrunWorker(
+            TruckDownloadRequest(Path("downloads")),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+            booking_type="truck",
+        )
+        logs = []
+        worker.log_updated.connect(logs.append)
+
+        updated = worker._apply_truck_reservation_metrics(daily_result, import_result)
+
+        self.assertEqual(
+            tuple(product.dispatch_number for product in updated.products),
+            ("T8886709", "T3372829"),
+        )
+        placeholder = updated.products[0]
+        self.assertTrue(placeholder.detail_unavailable)
+        self.assertEqual(placeholder.vendor_name, "코카콜라음료 주식회사")
+        self.assertEqual(placeholder.pallet_count, "16")
+        self.assertEqual(placeholder.box_count, "864")
+        self.assertEqual(placeholder.sku_id, "")
+        self.assertIn("다운로드 원본 합계", placeholder.sku_name)
+        self.assertIn("T8886709", "\n".join(logs))
+
+    def test_truck_worker_compares_download_metric_with_unique_shared_containers(self) -> None:
+        from Modules.Shipments.DailyInboundScraper import DailyInboundResult
+
+        metric = TruckReservationMetrics(
+            reservation_number="T3372829",
+            unit_count=Decimal("90"),
+            pallet_count=Decimal("3"),
+            source_rows=(2,),
+            vendor_name="다운로드 거래처",
+        )
+        import_result = TruckExcelImportResult(
+            source_file=Path("truck.csv"),
+            target_workbook=Path("입고스케줄관리.xlsx"),
+            sheet_name="Raw_트럭",
+            rows=2,
+            columns=19,
+            dispatch_numbers=("T3372829",),
+            reservation_metrics=(metric,),
+        )
+        shared = (("barcode:cbn-shared", "3"),)
+        daily_result = DailyInboundResult(
+            products=(
+                MilkrunProductRow(
+                    "", "PALLET_SHARED", "3", "30", "SKU1", "상품1", "T3372829", shared
+                ),
+                MilkrunProductRow(
+                    "", "PALLET_SHARED", "3", "60", "SKU2", "상품2", "T3372829", shared
+                ),
+            ),
+            requested_dispatches=("T3372829",),
+            matched_dispatches=("T3372829",),
+            unmatched_dispatches=(),
+        )
+        worker = MilkrunWorker(
+            TruckDownloadRequest(Path("downloads")),
+            Path("chromedriver.exe"),
+            import_result.target_workbook,
+            booking_type="truck",
+        )
+        logs = []
+        worker.log_updated.connect(logs.append)
+
+        updated = worker._apply_truck_reservation_metrics(daily_result, import_result)
+
+        self.assertEqual(len(updated.products), 2)
         self.assertEqual(logs, [])
 
     def test_truck_detail_sheet_close_uses_truck_profile_href(self) -> None:

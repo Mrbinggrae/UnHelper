@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -289,19 +289,22 @@ class ProductWeightWorker(QThread):
         Truck rows are excluded because their container table provides a
         container/pallet count for each SKU.
         """
-        groups: dict[str, set[str]] = {}
+        groups: dict[tuple[str, str], set[str]] = {}
         for product in products:
             dispatch = normalize_product_name(product.dispatch_number).upper()
             if dispatch.startswith("T"):
                 continue
-            group_key = normalize_product_name(product.milkrun_number)
-            if not group_key:
+            milkrun_number = normalize_product_name(product.milkrun_number)
+            if not milkrun_number:
                 continue
             try:
                 sku_key = normalize_sku_id(product.sku_id)
             except ValueError:
                 sku_key = f"invalid:{normalize_product_name(product.sku_id)}"
-            groups.setdefault(group_key, set()).add(sku_key)
+            # The same inner Milkrun number can appear under a different outer
+            # dispatch.  Only rows from the same physical dispatch/group may
+            # influence the weight-only decision.
+            groups.setdefault((dispatch, milkrun_number), set()).add(sku_key)
 
         protected: set[str] = set()
         for sku_keys in groups.values():
@@ -321,6 +324,12 @@ class ProductWeightWorker(QThread):
         unique: list[MilkrunProductRow] = []
         failures: list[SkuWeightFailure] = []
         for product in products:
+            if product.detail_unavailable:
+                # A Truck reservation can be kept in the RAW table from the
+                # downloaded reservation totals even when its detail page did
+                # not yield a SKU.  That placeholder has no SKU to measure and
+                # is intentionally not a WMS failure or progress item.
+                continue
             try:
                 sku_id = normalize_sku_id(product.sku_id)
             except ValueError as exc:
@@ -339,15 +348,8 @@ class ProductWeightWorker(QThread):
             if sku_id == product.sku_id:
                 unique.append(product)
             else:
-                unique.append(
-                    MilkrunProductRow(
-                        vendor_name=product.vendor_name,
-                        milkrun_number=product.milkrun_number,
-                        pallet_count=product.pallet_count,
-                        box_count=product.box_count,
-                        sku_id=sku_id,
-                        sku_name=product.sku_name,
-                        dispatch_number=product.dispatch_number,
-                    )
-                )
+                # Keep any source-specific metadata (for example Truck
+                # container identities) when normalizing an Excel-formatted
+                # SKU such as ``123.0``.
+                unique.append(replace(product, sku_id=sku_id))
         return tuple(unique), tuple(failures)

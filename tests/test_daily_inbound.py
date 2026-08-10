@@ -4,6 +4,7 @@ import unittest
 from decimal import Decimal
 
 from Modules.Shipments.DailyInbound import (
+    deduplicated_truck_pallet_count,
     extract_booking_numbers,
     extract_dispatch_numbers,
     extract_truck_reservation_numbers,
@@ -239,6 +240,64 @@ class DailyInboundTests(unittest.TestCase):
         self.assertEqual(result[1].pallet_count, "2")
         self.assertEqual(result[1].box_count, "242")
         self.assertTrue(all(row.dispatch_number == "T3372829" for row in result))
+
+    def test_truck_shared_container_is_kept_per_sku_but_counted_once_per_vehicle(self) -> None:
+        rows = (
+            (
+                "PALLET",
+                "PALLET_007",
+                "CBN-SHARED",
+                "3",
+                "101",
+                "상품 A",
+                "BARCODE-A",
+                "10",
+                "30",
+            ),
+            (
+                "PALLET",
+                "PALLET_007",
+                "CBN-SHARED",
+                "3",
+                "102",
+                "상품 B",
+                "BARCODE-B",
+                "20",
+                "60",
+            ),
+        )
+
+        result = parse_detail_table_cells(
+            rows,
+            dispatch_number="T3372829",
+            booking_prefix="T",
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(tuple(product.pallet_count for product in result), ("3", "3"))
+        self.assertEqual(
+            tuple(product.container_pallets for product in result),
+            ((('barcode:cbn-shared', '3'),), (('barcode:cbn-shared', '3'),)),
+        )
+        self.assertEqual(deduplicated_truck_pallet_count(result), Decimal("3"))
+
+    def test_truck_same_sku_duplicate_container_row_does_not_duplicate_pallets(self) -> None:
+        rows = (
+            ("PALLET", "PALLET_001", "CBN-1", "2", "101", "상품", "A", "5", "10"),
+            ("PALLET", "PALLET_001", "CBN-1", "2", "101", "상품", "A", "7", "14"),
+            ("PALLET", "PALLET_002", "CBN-2", "1", "101", "상품", "A", "3", "3"),
+        )
+
+        result = parse_detail_table_cells(
+            rows,
+            dispatch_number="T3372829",
+            booking_prefix="T",
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].pallet_count, "3")
+        self.assertEqual(result[0].box_count, "27")
+        self.assertEqual(deduplicated_truck_pallet_count(result), Decimal("3"))
 
 
 if __name__ == "__main__":

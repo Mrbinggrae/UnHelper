@@ -468,8 +468,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             aggregate = window._raw_booking_aggregates()["M3370492"]
 
             self.assertEqual(aggregate.pallet_count, Decimal("20"))
-            self.assertEqual(aggregate.categories["고단"], Decimal("16"))
-            self.assertEqual(aggregate.categories["중량"], Decimal("4"))
+            self.assertEqual(aggregate.categories, {"고단": Decimal("20")})
         finally:
             window.close()
 
@@ -528,6 +527,348 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(aggregate.categories, {"양곡": Decimal("12")})
             finally:
                 window.close()
+
+    def test_arrival_promotes_special_category_to_entire_multi_sku_vehicle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                window._populate_truck_products(
+                    (
+                        MilkrunProductRow(
+                            "트럭 거래처", "PALLET_A", "2", "20", "201", "고단 상품", "T20001"
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처", "PALLET_B", "8", "80", "202", "중량 상품", "T20001"
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처", "PALLET_C", "3", "30", "203", "양곡 상품", "T20002"
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처", "PALLET_D", "4", "40", "204", "경량 상품", "T20002"
+                        ),
+                    )
+                )
+                window._populate_milkrun_products(
+                    (
+                        MilkrunProductRow(
+                            "밀크런 거래처", "INNER_A", "5", "50", "101", "고단 상품", "M10001"
+                        ),
+                        MilkrunProductRow(
+                            "밀크런 거래처", "INNER_B", "7", "70", "102", "중량 상품", "M10001"
+                        ),
+                    )
+                )
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("201", "고단", "고단 상품")
+                memory.set_manual_category("202", "중량", "중량 상품")
+                memory.set_manual_category("203", "양곡", "양곡 상품")
+                memory.set_manual_category("204", "경량", "경량 상품")
+                memory.set_manual_category("101", "고단", "고단 상품")
+                memory.set_manual_category("102", "중량", "중량 상품")
+
+                aggregates = window._raw_booking_aggregates()
+
+                self.assertEqual(aggregates["T20001"].pallet_count, Decimal("10"))
+                self.assertEqual(aggregates["T20001"].categories, {"고단": Decimal("10")})
+                self.assertEqual(aggregates["T20002"].pallet_count, Decimal("7"))
+                self.assertEqual(aggregates["T20002"].categories, {"양곡": Decimal("7")})
+                self.assertEqual(aggregates["M10001"].pallet_count, Decimal("12"))
+                self.assertEqual(aggregates["M10001"].categories, {"고단": Decimal("12")})
+            finally:
+                window.close()
+
+    def test_arrival_counts_shared_truck_container_once_for_vehicle_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            shared_container = (("barcode:cbn-shared", "3"),)
+            try:
+                window._populate_truck_products(
+                    (
+                        MilkrunProductRow(
+                            "트럭 거래처",
+                            "PALLET_SHARED",
+                            "3",
+                            "30",
+                            "501",
+                            "고단 상품",
+                            "T30001",
+                            shared_container,
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처",
+                            "PALLET_SHARED",
+                            "3",
+                            "60",
+                            "502",
+                            "중량 상품",
+                            "T30001",
+                            shared_container,
+                        ),
+                    )
+                )
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("501", "고단", "고단 상품")
+                memory.set_manual_category("502", "중량", "중량 상품")
+
+                aggregate = window._raw_booking_aggregates()["T30001"]
+
+                self.assertEqual(aggregate.pallet_count, Decimal("3"))
+                self.assertEqual(aggregate.categories, {"고단": Decimal("3")})
+            finally:
+                window.close()
+
+    def test_clicked_special_categories_survive_snapshot_restore_and_reach_all_arrival_sections(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory_path = root / "memory.json"
+            snapshot_path = root / "snapshots.json"
+            base_date = date(2026, 8, 10)
+            truck_products = (
+                MilkrunProductRow(
+                    "트럭 거래처",
+                    "PALLET_A",
+                    "3",
+                    "20",
+                    "201",
+                    "트럭 고단",
+                    "T20001",
+                    (("barcode:t-high", "3"),),
+                ),
+                MilkrunProductRow(
+                    "트럭 거래처",
+                    "PALLET_A",
+                    "3",
+                    "80",
+                    "202",
+                    "트럭 일반",
+                    "T20001",
+                    (("barcode:t-high", "3"),),
+                ),
+                MilkrunProductRow(
+                    "트럭 거래처",
+                    "PALLET_B",
+                    "4",
+                    "30",
+                    "203",
+                    "트럭 양곡",
+                    "T20002",
+                    (("barcode:t-grain", "4"),),
+                ),
+                MilkrunProductRow(
+                    "트럭 거래처",
+                    "PALLET_B",
+                    "4",
+                    "40",
+                    "204",
+                    "트럭 일반",
+                    "T20002",
+                    (("barcode:t-grain", "4"),),
+                ),
+            )
+            milkrun_products = (
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_A", "5", "50", "101", "밀크런 고단", "M10001"
+                ),
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_A", "5", "50", "102", "밀크런 일반 A", "M10001"
+                ),
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_B", "7", "70", "103", "밀크런 일반 B", "M10001"
+                ),
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_C", "6", "60", "104", "밀크런 양곡", "M10002"
+                ),
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_C", "6", "60", "105", "밀크런 일반 C", "M10002"
+                ),
+                MilkrunProductRow(
+                    "밀크런 거래처", "INNER_D", "4", "40", "106", "밀크런 일반 D", "M10002"
+                ),
+            )
+
+            first = MainWindow(
+                smoke_test=True,
+                product_memory_file=memory_path,
+                snapshot_file=snapshot_path,
+            )
+            try:
+                first._populate_truck_products(truck_products)
+                first._populate_milkrun_products(milkrun_products)
+
+                def click_category(booking_type: str, sku_id: str, count: int) -> None:
+                    first._render_unknown_sku(sku_id, booking_type)
+                    products = first._products_by_booking[booking_type]
+                    row_index = next(
+                        index
+                        for index, product in enumerate(products)
+                        if str(product.sku_id) == sku_id
+                    )
+                    button = first._table_for_booking(booking_type).cellWidget(row_index, 9)
+                    self.assertTrue(button.isEnabled())
+                    for _index in range(count):
+                        button.click()
+
+                click_category("truck", "201", 3)
+                click_category("truck", "203", 4)
+                click_category("milkrun", "101", 3)
+                click_category("milkrun", "104", 4)
+
+                memory = ProductMemory(memory_path)
+                self.assertEqual(memory.get("201").category_override, "고단")
+                self.assertEqual(memory.get("203").category_override, "양곡")
+                self.assertEqual(memory.get("101").category_override, "고단")
+                self.assertEqual(memory.get("104").category_override, "양곡")
+
+                store = BookingSnapshotStore(snapshot_path)
+                store.save_table(base_date, "truck", truck_products)
+                store.save_table(base_date, "milkrun", milkrun_products)
+            finally:
+                first.close()
+
+            restored = MainWindow(
+                smoke_test=True,
+                product_memory_file=memory_path,
+                snapshot_file=snapshot_path,
+            )
+            try:
+                saved_snapshot = BookingSnapshotStore(snapshot_path).get(base_date)
+                self.assertIsNotNone(saved_snapshot)
+                restored._restore_booking_snapshot(saved_snapshot, announce=False)
+
+                self.assertEqual(
+                    restored._displayed_category_for_sku("201", "truck"),
+                    "고단",
+                )
+                self.assertEqual(
+                    restored._displayed_category_for_sku("203", "truck"),
+                    "양곡",
+                )
+                self.assertEqual(
+                    restored._displayed_category_for_sku("101", "milkrun"),
+                    "고단",
+                )
+                self.assertEqual(
+                    restored._displayed_category_for_sku("104", "milkrun"),
+                    "양곡",
+                )
+
+                aggregates = restored._raw_booking_aggregates()
+                self.assertEqual(aggregates["T20001"].categories, {"고단": Decimal("3")})
+                self.assertEqual(aggregates["T20002"].categories, {"양곡": Decimal("4")})
+                self.assertEqual(aggregates["M10001"].categories, {"고단": Decimal("12")})
+                self.assertEqual(aggregates["M10002"].categories, {"양곡": Decimal("10")})
+
+                arrival = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 10, 2, 3, 4),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(
+                        ArrivalSequenceEntry(18, "tbn0020001", "T20001", "truck", "", "", ""),
+                        ArrivalSequenceEntry(19, "MBN10001", "M10001", "milkrun", "", "", ""),
+                        ArrivalSequenceEntry(20, "tbn0020002", "T20002", "truck", "2F", "", ""),
+                        ArrivalSequenceEntry(21, "MBN10002", "M10002", "milkrun", "2F", "", ""),
+                    ),
+                    floor_assignments=tuple(
+                        BookingFloorAssignment(
+                            booking_key,
+                            booking_type,
+                            "2F",
+                            "Raw_트럭" if booking_type == "truck" else "Raw_밀크런",
+                            row_index,
+                        )
+                        for row_index, (booking_key, booking_type) in enumerate(
+                            (
+                                ("T20001", "truck"),
+                                ("M10001", "milkrun"),
+                                ("T20002", "truck"),
+                                ("M10002", "milkrun"),
+                            ),
+                            start=2,
+                        )
+                    ),
+                )
+
+                restored._render_arrival_sequence(arrival)
+
+                waiting = restored.arrival_detail_tables["outside_waiting"]["second"]
+                departure = restored.arrival_detail_tables["departure"]["second"]
+                targets = restored.arrival_detail_tables["floor_targets"]["second"]
+                self.assertEqual(waiting.item(0, 1).text(), "15 Pallet")
+                self.assertEqual(waiting.item(3, 1).text(), "15 Pallet")
+                self.assertEqual(waiting.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(0, 1).text(), "14 Pallet")
+                self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(4, 1).text(), "14 Pallet")
+                self.assertEqual(targets.item(0, 1).text(), "29 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "15 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "14 Pallet")
+            finally:
+                restored.close()
+
+    def test_same_inner_milkrun_number_on_different_dispatches_is_not_merged(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            window._populate_milkrun_products(
+                (
+                    MilkrunProductRow(
+                        "같은 거래처", "10813478", "2", "20", "101", "상품 A", "M10001"
+                    ),
+                    MilkrunProductRow(
+                        "같은 거래처", "10813478", "5", "50", "102", "상품 B", "M10002"
+                    ),
+                )
+            )
+
+            self.assertEqual(window.raw_table.rowSpan(0, 0), 1)
+            self.assertEqual(window.raw_table.rowSpan(0, 1), 1)
+            self.assertEqual(window.raw_table.rowSpan(0, 2), 1)
+            self.assertEqual(window.raw_table.item(0, 1).text(), "M10001")
+            self.assertEqual(window.raw_table.item(0, 2).text(), "2")
+            self.assertEqual(window.raw_table.item(1, 1).text(), "M10002")
+            self.assertEqual(window.raw_table.item(1, 2).text(), "5")
+        finally:
+            window.close()
+
+    def test_floor_target_raw_mismatch_tooltip_is_compact_and_explains_exclusion(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            assignments = tuple(
+                BookingFloorAssignment(
+                    f"T{index}", "truck", "2F", "Raw_트럭", index
+                )
+                for index in range(10001, 10009)
+            )
+            snapshot = ArrivalSequenceSnapshot(
+                workbook=Path("sample.xlsm"),
+                sheet_name="입차순번",
+                refreshed_at=datetime(2026, 8, 10, 1, 2, 3),
+                summary=ArrivalSummary(
+                    departure=(("0", "0", "0"),) * 3,
+                    outside_waiting=(("0", "0", "0"),) * 3,
+                    floor_targets=(("0", "0"),) * 3,
+                ),
+                entries=(),
+                floor_assignments=assignments,
+            )
+
+            window._render_arrival_sequence(snapshot)
+
+            tooltip = window.arrival_detail_tables["floor_targets"]["second"].item(0, 1).toolTip()
+            self.assertIn("RAW 미매칭 8대", tooltip)
+            self.assertIn("현재 기준일의 앱 RAW 표에 같은 예약번호가 없습니다.", tooltip)
+            self.assertIn("외 2대", tooltip)
+            self.assertNotIn("T10008", tooltip)
+        finally:
+            window.close()
 
     def test_persisted_manual_categories_reach_all_arrival_sections_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1643,6 +1984,214 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_table_bundle_roundtrip_restores_manual_categories_into_arrival(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            selected = date(2026, 8, 9)
+            source_snapshot_path = root / "source-snapshots.json"
+            source_memory_path = root / "source-memory.json"
+            bundle = root / "shared.json"
+            source_store = BookingSnapshotStore(source_snapshot_path)
+            source_store.save_table(
+                selected,
+                "milkrun",
+                (
+                    MilkrunProductRow(
+                        "밀크런 거래처",
+                        "INNER_A",
+                        "3",
+                        "30",
+                        "101",
+                        "밀크런 고단",
+                        "M10001",
+                    ),
+                    MilkrunProductRow(
+                        "밀크런 거래처",
+                        "INNER_A",
+                        "3",
+                        "20",
+                        "102",
+                        "밀크런 일반",
+                        "M10001",
+                    ),
+                    MilkrunProductRow(
+                        "유지 거래처",
+                        "INNER_B",
+                        "4",
+                        "40",
+                        "301",
+                        "기존 유지 상품",
+                        "M10002",
+                    ),
+                ),
+            )
+            source_store.save_table(
+                selected,
+                "truck",
+                (
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_A",
+                        "2",
+                        "20",
+                        "201",
+                        "트럭 양곡",
+                        "T20001",
+                    ),
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_B",
+                        "4",
+                        "40",
+                        "202",
+                        "트럭 일반",
+                        "T20001",
+                    ),
+                ),
+            )
+            source_memory = ProductMemory(source_memory_path)
+            source_memory.set_manual_category("101", "고단", "밀크런 고단")
+            source_memory.set_manual_category("102", "중량", "밀크런 일반")
+            source_memory.set_manual_category("201", "양곡", "트럭 양곡")
+            source_memory.set_manual_category("202", "경량", "트럭 일반")
+            source_memory.set_manual_category("301", "양곡", "기존 유지 상품")
+            source_settings = QSettings(
+                str(root / "source-settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            source_settings.setValue("base_date_mode", "manual")
+            source_settings.setValue("manual_base_date", selected.isoformat())
+            source_window = MainWindow(
+                smoke_test=True,
+                settings=source_settings,
+                product_memory_file=source_memory_path,
+                snapshot_file=source_snapshot_path,
+            )
+            try:
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getSaveFileName",
+                        return_value=(str(bundle), ""),
+                    ),
+                    patch.object(QMessageBox, "information"),
+                ):
+                    source_window.export_table_snapshot()
+            finally:
+                source_window.close()
+
+            destination_memory_path = root / "destination-memory.json"
+            destination_memory = ProductMemory(destination_memory_path)
+            destination_memory.set_manual_category("101", "양곡", "밀크런 고단")
+            destination_memory.set_manual_category("201", "양곡", "트럭 양곡")
+            destination_memory.set_manual_category("202", "경량", "트럭 일반")
+            destination_memory.set_manual_category("301", "고단", "기존 유지 상품")
+            destination_window = MainWindow(
+                smoke_test=True,
+                product_memory_file=destination_memory_path,
+                snapshot_file=root / "destination-snapshots.json",
+            )
+            try:
+                with (
+                    patch.object(
+                        QFileDialog,
+                        "getOpenFileName",
+                        return_value=(str(bundle), ""),
+                    ),
+                    patch.object(
+                        destination_window,
+                        "_ask_duplicate_memory_action",
+                        side_effect=("overwrite", "keep"),
+                    ) as ask_duplicate,
+                    patch.object(QMessageBox, "information"),
+                ):
+                    destination_window.import_table_snapshot()
+
+                self.assertEqual(ask_duplicate.call_count, 2)
+                prompted_skus = tuple(
+                    call.args[1].sku_id for call in ask_duplicate.call_args_list
+                )
+                self.assertEqual(prompted_skus, ("101", "301"))
+                imported = ProductMemory(destination_memory_path)
+                self.assertEqual(imported.get("101").category_override, "고단")
+                self.assertEqual(imported.get("201").category_override, "양곡")
+                self.assertEqual(imported.get("202").category_override, "경량")
+                self.assertEqual(imported.get("301").category_override, "고단")
+                self.assertEqual(
+                    destination_window.raw_table.cellWidget(0, 9).text(),
+                    "고단",
+                )
+                self.assertEqual(
+                    destination_window.truck_table.cellWidget(0, 9).text(),
+                    "양곡",
+                )
+
+                arrival = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 10, 2, 3, 4),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(
+                        ArrivalSequenceEntry(
+                            18,
+                            "MBN10001",
+                            "M10001",
+                            "milkrun",
+                            "",
+                            "",
+                            "",
+                        ),
+                        ArrivalSequenceEntry(
+                            19,
+                            "tbn0020001",
+                            "T20001",
+                            "truck",
+                            "2F",
+                            "",
+                            "",
+                        ),
+                    ),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "M10001",
+                            "milkrun",
+                            "2F",
+                            "Raw_밀크런",
+                            2,
+                        ),
+                        BookingFloorAssignment(
+                            "T20001",
+                            "truck",
+                            "2F",
+                            "Raw_트럭",
+                            2,
+                        ),
+                    ),
+                )
+                destination_window._render_arrival_sequence(arrival)
+
+                outside = destination_window.arrival_detail_tables[
+                    "outside_waiting"
+                ]["second"]
+                departure = destination_window.arrival_detail_tables["departure"][
+                    "second"
+                ]
+                targets = destination_window.arrival_detail_tables["floor_targets"][
+                    "second"
+                ]
+                self.assertEqual(outside.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(outside.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(4, 1).text(), "6 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "6 Pallet")
+            finally:
+                destination_window.close()
+
     def test_manual_base_date_reaches_milkrun_and_truck_start_button_requests(self) -> None:
         cases = (
             (
@@ -2008,6 +2557,119 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.status_label.text(), "기준일 표시 상품 없음 · WMS 조회 생략")
         finally:
             window.close()
+
+    def test_truck_detail_unavailable_row_stays_visible_locked_and_skips_wms(self) -> None:
+        window = MainWindow(smoke_test=True)
+        placeholder = MilkrunProductRow(
+            "코카콜라음료 주식회사",
+            "",
+            "16",
+            "864",
+            "",
+            "일별 입고 카드 미조회 · 다운로드 원본 합계로 표시",
+            "T8886709",
+            (),
+            True,
+        )
+        try:
+            window._populate_truck_products((placeholder,))
+
+            self.assertEqual(window.truck_table.item(0, 0).text(), "코카콜라음료 주식회사")
+            self.assertEqual(window.truck_table.item(0, 1).text(), "T8886709")
+            self.assertEqual(window.truck_table.item(0, 2).text(), "16")
+            self.assertEqual(window.truck_table.item(0, 3).text(), "864")
+            self.assertEqual(window.truck_table.item(0, 4).text(), "?")
+            self.assertEqual(window.truck_table.item(0, 5).text(), "")
+            self.assertEqual(window.truck_table.item(0, 8).text(), "?")
+            button = window.truck_table.cellWidget(0, 9)
+            self.assertFalse(button.isEnabled())
+            self.assertIn("다운로드 원본", button.toolTip())
+
+            window._set_category_buttons_enabled(True)
+            self.assertFalse(button.isEnabled())
+
+            aggregate = window._raw_booking_aggregates()["T8886709"]
+            self.assertEqual(aggregate.pallet_count, Decimal("16"))
+            self.assertEqual(aggregate.categories, {"?": Decimal("16")})
+
+            with (
+                patch("Modules.GUI.MainWindow._open_product_memory_with_recovery") as open_memory,
+                patch.object(window, "_finalize_weight_if_ready") as finalize,
+            ):
+                window._start_weight_lookup((placeholder,))
+
+            open_memory.assert_not_called()
+            finalize.assert_called_once_with()
+            self.assertIsNone(window.weight_worker)
+            self.assertEqual(window._pending_weight_summary.total_skus, 0)
+            self.assertIn("원본 합계 1건", window.status_label.text())
+        finally:
+            window.close()
+
+    def test_restored_placeholder_forces_full_shipments_retry_without_resume_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = QSettings(
+                str(root / "settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            settings.setValue("base_date_mode", "manual")
+            settings.setValue("manual_base_date", "2026-08-09")
+            settings.setValue("milkrun_excel_path", str(root / "linked.xlsm"))
+            window = MainWindow(
+                smoke_test=True,
+                settings=settings,
+                product_memory_file=root / "memory.json",
+                snapshot_file=root / "snapshots.json",
+            )
+            placeholder = MilkrunProductRow(
+                "거래처",
+                "",
+                "16",
+                "864",
+                "",
+                "상세 SKU 미수집 · 다운로드 원본 합계로 표시",
+                "T8886709",
+                (),
+                True,
+            )
+            fake_driver = root / "chromedriver.exe"
+            fake_driver.write_bytes(b"driver")
+            fake_worker = mock.Mock()
+            for signal_name in (
+                "log_updated",
+                "detail_progress",
+                "completed",
+                "excel_failed",
+                "excel_close_required",
+                "detail_failed",
+                "detail_cancelled",
+                "failed",
+                "cancelled",
+                "finished",
+            ):
+                setattr(fake_worker, signal_name, mock.Mock())
+            try:
+                window._populate_truck_products((placeholder,))
+                with (
+                    patch("Modules.GUI.MainWindow.chromedriver_path", return_value=fake_driver),
+                    patch(
+                        "Modules.Excel.TruckExcelImporter.TruckExcelImporter.validate_target_path",
+                        return_value=root / "linked.xlsm",
+                    ),
+                    patch("Modules.GUI.MainWindow.MilkrunWorker", return_value=fake_worker),
+                    patch.object(window, "_ask_weight_retry_action") as ask_retry,
+                    patch.object(window, "_start_weight_lookup") as start_weight,
+                ):
+                    window._start_booking_download("truck")
+
+                ask_retry.assert_not_called()
+                start_weight.assert_not_called()
+                fake_worker.start.assert_called_once_with()
+                self.assertEqual(window._products_by_booking["truck"], ())
+            finally:
+                window.milkrun_worker = None
+                window.close()
 
     def test_incomplete_checkpoint_resume_skips_full_shipments_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2489,6 +3151,87 @@ class MainWindowSmokeTests(unittest.TestCase):
                 ):
                     dialog._delete_selected()
                 self.assertEqual(len(changes), 2)
+            finally:
+                dialog.close()
+
+    def test_product_memory_dialog_can_overwrite_different_manual_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = ProductMemory(root / "destination.json")
+            destination.set_manual_category("123", "양곡", "공유 상품")
+            source = ProductMemory(root / "source.json")
+            source.set_manual_category("123", "고단", "공유 상품")
+            exported = source.export_to(root / "import.json")
+            dialog = ProductMemoryDialog(destination)
+            changes = []
+            dialog.memory_changed.connect(lambda: changes.append(True))
+            try:
+                with (
+                    mock.patch.object(QFileDialog, "getOpenFileName", return_value=(str(exported), "")),
+                    mock.patch.object(dialog, "_ask_duplicate_action", return_value="overwrite") as ask,
+                    mock.patch.object(QMessageBox, "information"),
+                ):
+                    dialog._import_records()
+
+                ask.assert_called_once()
+                self.assertEqual(destination.get("123").category_override, "고단")
+                self.assertEqual(len(changes), 1)
+            finally:
+                dialog.close()
+
+    def test_product_memory_dialog_does_not_prompt_for_identical_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = ProductMemory(root / "destination.json")
+            destination.set_manual_category("123", "고단", "공유 상품")
+            exported = destination.export_to(root / "import.json")
+            dialog = ProductMemoryDialog(destination)
+            changes = []
+            dialog.memory_changed.connect(lambda: changes.append(True))
+            try:
+                with (
+                    mock.patch.object(QFileDialog, "getOpenFileName", return_value=(str(exported), "")),
+                    mock.patch.object(dialog, "_ask_duplicate_action") as ask,
+                    mock.patch.object(QMessageBox, "information"),
+                ):
+                    dialog._import_records()
+
+                ask.assert_not_called()
+                self.assertEqual(destination.get("123").category_override, "고단")
+                self.assertEqual(changes, [])
+            finally:
+                dialog.close()
+
+    def test_product_memory_dialog_can_keep_different_manual_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = ProductMemory(root / "destination.json")
+            destination.set_manual_category("123", "양곡", "공유 상품")
+            source = ProductMemory(root / "source.json")
+            source.set_manual_category("123", "고단", "공유 상품")
+            exported = source.export_to(root / "import.json")
+            dialog = ProductMemoryDialog(destination)
+            changes = []
+            dialog.memory_changed.connect(lambda: changes.append(True))
+            try:
+                with (
+                    mock.patch.object(
+                        QFileDialog,
+                        "getOpenFileName",
+                        return_value=(str(exported), ""),
+                    ),
+                    mock.patch.object(
+                        dialog,
+                        "_ask_duplicate_action",
+                        return_value="keep",
+                    ) as ask,
+                    mock.patch.object(QMessageBox, "information"),
+                ):
+                    dialog._import_records()
+
+                ask.assert_called_once()
+                self.assertEqual(destination.get("123").category_override, "양곡")
+                self.assertEqual(changes, [])
             finally:
                 dialog.close()
 

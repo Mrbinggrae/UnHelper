@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -96,6 +97,10 @@ class DailyInboundResult:
 class DailyInboundScraper:
     DAILY_SCHEDULE_HREF = "/app/inbound-schedule"
     DETAIL_HREF_FRAGMENT = MILKRUN_DAILY_INBOUND_PROFILE.detail_href_fragment
+    _CARD_BOOKING_TOKEN = re.compile(
+        r"(?<![A-Z0-9])([MT]\s*[0-9][0-9,]{4,19})(?![A-Z0-9])",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -191,11 +196,20 @@ class DailyInboundScraper:
                         products.append(row)
             self.progress(completed_dispatches, total_dispatches)
 
-        if not products and not empty_details:
+        if (
+            not products
+            and not empty_details
+            and self.profile.booking_prefix != "T"
+        ):
             missing = ", ".join(unmatched or requested)
             raise DailyInboundError(
                 "기준일 일별 입고 현황에서 표시할 상품 상세를 찾지 못했습니다.\n"
                 f"미조회 {self.profile.number_label}: {missing}"
+            )
+        if not products and self.profile.booking_prefix == "T":
+            self.log(
+                "트럭 상세 상품을 확인하지 못해 다운로드 원본의 예약별 "
+                "유닛/팔렛트 합계로 미분류 행을 표시합니다."
             )
 
         self.log(f"일별 입고 상세 {len(products)}개 상품을 수집했습니다.")
@@ -395,15 +409,7 @@ class DailyInboundScraper:
                 cards = []
             for card in cards:
                 try:
-                    labels = card.find_elements(By.CSS_SELECTOR, "b")
-                    if (
-                        labels
-                        and normalize_booking_card_number(
-                            labels[0].text,
-                            prefix=self.profile.booking_prefix,
-                        )
-                        == dispatch_number
-                    ):
+                    if dispatch_number in self._card_booking_numbers(card):
                         matches.append(card)
                 except (StaleElementReferenceException, WebDriverException):
                     had_stale = True
@@ -413,21 +419,36 @@ class DailyInboundScraper:
             self.browser.stop_event.wait(0.2)
         return []
 
+    def _card_booking_numbers(self, card: WebElement) -> tuple[str, ...]:
+        """Extract explicit M/T booking tokens from the whole visible card.
+
+        ``<b>`` is only a visual emphasis element and its ordering changes by
+        reservation status.  Matching the complete card text keeps Milkrun
+        and Truck behavior independent of the page's presentation markup.
+        """
+
+        text = str(card.text or "")
+        seen: set[str] = set()
+        result: list[str] = []
+        for match in self._CARD_BOOKING_TOKEN.finditer(text.upper()):
+            normalized = normalize_booking_card_number(
+                match.group(1),
+                prefix=self.profile.booking_prefix,
+            )
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return tuple(result)
+
     def _slot_signature(self) -> tuple[str, ...]:
         try:
             return tuple(
-                normalize_booking_card_number(
-                    element.text,
-                    prefix=self.profile.booking_prefix,
-                )
-                for element in self.browser._driver.find_elements(
+                booking_number
+                for card in self.browser._driver.find_elements(
                     By.CSS_SELECTOR,
-                    "div.booking-slot b",
+                    "div.booking-slot",
                 )
-                if normalize_booking_card_number(
-                    element.text,
-                    prefix=self.profile.booking_prefix,
-                )
+                for booking_number in self._card_booking_numbers(card)
             )
         except (StaleElementReferenceException, WebDriverException):
             return ()

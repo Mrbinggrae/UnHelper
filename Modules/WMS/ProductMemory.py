@@ -701,6 +701,12 @@ class ProductMemory:
             raise ValueError("가져올 상품 메모리에 중복 SKU ID가 있습니다.")
         return tuple(records)
 
+    @classmethod
+    def records_from(cls, path: str | os.PathLike[str]) -> tuple[ProductMemoryRecord, ...]:
+        """Read and fully validate an exported product-memory file."""
+
+        return cls.validate_payload(_read_json_payload(Path(path)))
+
     def import_records(
         self,
         records: Iterable[ProductMemoryRecord],

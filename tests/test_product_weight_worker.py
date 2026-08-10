@@ -239,6 +239,44 @@ class ProductWeightWorkerTests(unittest.TestCase):
                 self.assertEqual(record.boxes_per_pallet, Decimal("300"))
                 self.assertEqual(record.pallet_weight_kg, Decimal("300"))
 
+    def test_truck_detail_unavailable_placeholder_is_not_a_wms_failure_or_progress_item(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            placeholder = MilkrunProductRow(
+                vendor_name="다운로드 거래처",
+                milkrun_number="",
+                pallet_count="16",
+                box_count="864",
+                sku_id="",
+                sku_name="일별 입고 카드 미조회 · 다운로드 원본 합계로 표시",
+                dispatch_number="T8886709",
+                detail_unavailable=True,
+            )
+            worker = self._worker(
+                root,
+                (placeholder, _truck_product("T12345", "123")),
+                quantity_label="유닛",
+            )
+            failures = []
+            progress = []
+            summaries = []
+            worker.sku_failed.connect(failures.append)
+            worker.progress_updated.connect(
+                lambda completed, total: progress.append((completed, total))
+            )
+            worker.completed.connect(summaries.append)
+
+            worker.run()
+
+            self.assertEqual(FakeCrawler.instances[0].lookups, ["123"])
+            self.assertEqual(failures, [])
+            self.assertEqual(progress, [(0, 1), (1, 1)])
+            self.assertEqual(summaries[0].total_skus, 1)
+            self.assertEqual(summaries[0].wms_successes, 1)
+            self.assertEqual(summaries[0].failures, ())
+
     def test_invalid_sku_in_multi_truck_does_not_disable_valid_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -455,6 +493,28 @@ class ProductWeightWorkerTests(unittest.TestCase):
                 self.assertEqual(record.boxes_per_pallet, Decimal("2"))
                 self.assertEqual(record.pallet_weight_kg, Decimal("2"))
                 self.assertEqual(record.automatic_category, "경량")
+
+    def test_same_inner_milkrun_number_on_different_dispatches_is_not_weight_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            products = (
+                _milkrun_booking_product(
+                    "10813478", "123", dispatch_number="M10001", box_count="2"
+                ),
+                _milkrun_booking_product(
+                    "10813478", "456", dispatch_number="M10002", box_count="3"
+                ),
+            )
+            worker = self._worker(root, products)
+
+            worker.run()
+
+            first = ProductMemory(root / "memory.json").get("123")
+            second = ProductMemory(root / "memory.json").get("456")
+            self.assertEqual(first.boxes_per_pallet, Decimal("2"))
+            self.assertEqual(second.boxes_per_pallet, Decimal("3"))
+            self.assertEqual(first.automatic_category, "경량")
+            self.assertEqual(second.automatic_category, "경량")
 
     def test_invalid_sku_in_multi_milkrun_does_not_disable_valid_sku_calculation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

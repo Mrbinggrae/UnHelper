@@ -5,18 +5,24 @@ import os
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from Modules.Shipments.DailyInbound import MilkrunProductRow
+from Modules.Shipments.DailyInbound import (
+    MilkrunProductRow,
+    normalize_truck_card_number,
+)
 
 
 STORE_TYPE = "UnHelper_raw_table_snapshots"
 BUNDLE_TYPE = "UnHelper_raw_table_bundle"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = frozenset({1, FORMAT_VERSION})
 MAX_SNAPSHOT_DATES = 2
 MAX_ROWS_PER_TABLE = 5_000
 MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_CONTAINER_PALLETS = Decimal("1000000")
 BOOKING_TYPES = ("milkrun", "truck")
 
 _STORE_KEYS = frozenset({"type", "version", "entries"})
@@ -24,7 +30,7 @@ _BUNDLE_KEYS = frozenset(
     {"type", "version", "exported_at", "snapshot", "product_memory"}
 )
 _SNAPSHOT_KEYS = frozenset({"base_date", "updated_at", "tables"})
-_PRODUCT_KEYS = frozenset(
+_BASE_PRODUCT_KEYS = frozenset(
     {
         "vendor_name",
         "milkrun_number",
@@ -35,7 +41,8 @@ _PRODUCT_KEYS = frozenset(
         "dispatch_number",
     }
 )
-_LEGACY_PRODUCT_KEYS = _PRODUCT_KEYS | {"order_number"}
+_PRODUCT_KEYS = _BASE_PRODUCT_KEYS | {"container_pallets", "detail_unavailable"}
+_LEGACY_PRODUCT_KEYS = _BASE_PRODUCT_KEYS | {"order_number"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +77,15 @@ def _validated_timestamp(value: Any, field_name: str) -> str:
     return timestamp
 
 
-def _product_to_json(product: MilkrunProductRow) -> dict[str, str]:
+def _validated_format_version(value: Any, file_label: str) -> int:
+    if type(value) is not int or value not in SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"지원하지 않는 {file_label} 버전입니다: {value!r}"
+        )
+    return value
+
+
+def _product_to_json(product: MilkrunProductRow) -> dict[str, Any]:
     return {
         "vendor_name": str(product.vendor_name or ""),
         "milkrun_number": str(product.milkrun_number or ""),
@@ -79,24 +94,107 @@ def _product_to_json(product: MilkrunProductRow) -> dict[str, str]:
         "sku_id": str(product.sku_id or ""),
         "sku_name": str(product.sku_name or ""),
         "dispatch_number": str(product.dispatch_number or ""),
+        "container_pallets": [
+            [str(identity), str(pallet_count)]
+            for identity, pallet_count in product.container_pallets
+        ],
+        "detail_unavailable": product.detail_unavailable,
     }
 
 
-def _product_from_json(raw: Any, location: str) -> MilkrunProductRow:
+def _product_from_json(
+    raw: Any,
+    location: str,
+    *,
+    format_version: int,
+    booking_type: str,
+) -> MilkrunProductRow:
     if not isinstance(raw, dict):
         raise ValueError(f"{location} 행이 객체 형식이 아닙니다.")
     raw_keys = set(raw)
-    if raw_keys not in (_PRODUCT_KEYS, _LEGACY_PRODUCT_KEYS):
+    allowed_keys = (
+        (_BASE_PRODUCT_KEYS, _LEGACY_PRODUCT_KEYS)
+        if format_version == 1
+        else (_PRODUCT_KEYS,)
+    )
+    if raw_keys not in allowed_keys:
         raise ValueError(f"{location} 행의 필드 구성이 올바르지 않습니다.")
     values: dict[str, str] = {}
-    for key in _PRODUCT_KEYS:
+    for key in _BASE_PRODUCT_KEYS:
         value = raw[key]
         if not isinstance(value, str):
             raise ValueError(f"{location}.{key} 값은 문자열이어야 합니다.")
         if len(value) > 10_000:
             raise ValueError(f"{location}.{key} 값이 너무 깁니다.")
         values[key] = value
-    return MilkrunProductRow(**values)
+    raw_container_pallets = raw.get("container_pallets", [])
+    if not isinstance(raw_container_pallets, list) or len(raw_container_pallets) > 5_000:
+        raise ValueError(f"{location}.container_pallets 구성이 올바르지 않습니다.")
+    container_pallets: list[tuple[str, str]] = []
+    seen_container_ids: set[str] = set()
+    for index, allocation in enumerate(raw_container_pallets):
+        if (
+            not isinstance(allocation, list)
+            or len(allocation) != 2
+            or not all(isinstance(value, str) for value in allocation)
+        ):
+            raise ValueError(
+                f"{location}.container_pallets[{index}] 구성이 올바르지 않습니다."
+            )
+        identity, pallet_count = (value.strip() for value in allocation)
+        if not identity or len(identity) > 512 or len(pallet_count) > 100:
+            raise ValueError(
+                f"{location}.container_pallets[{index}] 값이 올바르지 않습니다."
+            )
+        try:
+            parsed_count = Decimal(pallet_count.replace(",", ""))
+        except InvalidOperation as exc:
+            raise ValueError(
+                f"{location}.container_pallets[{index}] 팔렛트 수가 숫자가 아닙니다."
+            ) from exc
+        if (
+            not parsed_count.is_finite()
+            or parsed_count <= 0
+            or parsed_count > MAX_CONTAINER_PALLETS
+            or parsed_count != parsed_count.to_integral_value()
+        ):
+            raise ValueError(
+                f"{location}.container_pallets[{index}] 팔렛트 수는 "
+                f"1~{MAX_CONTAINER_PALLETS} 범위의 정수여야 합니다."
+            )
+        normalized_identity = identity.casefold()
+        if normalized_identity in seen_container_ids:
+            raise ValueError(
+                f"{location}.container_pallets에 중복 컨테이너가 있습니다: {identity}"
+            )
+        seen_container_ids.add(normalized_identity)
+        container_pallets.append((identity, format(parsed_count.to_integral_value(), "f")))
+    detail_unavailable = raw.get("detail_unavailable", False)
+    if not isinstance(detail_unavailable, bool):
+        raise ValueError(f"{location}.detail_unavailable 값은 참/거짓이어야 합니다.")
+    if detail_unavailable:
+        if (
+            booking_type != "truck"
+            or not normalize_truck_card_number(values["dispatch_number"])
+        ):
+            raise ValueError(
+                f"{location}.detail_unavailable 행은 트럭 표에 있으며 "
+                "T로 시작하는 트럭 예약번호가 필요합니다."
+            )
+        if values["sku_id"].strip():
+            raise ValueError(
+                f"{location}.detail_unavailable 행의 SKU ID는 비어 있어야 합니다."
+            )
+        if container_pallets:
+            raise ValueError(
+                f"{location}.detail_unavailable 행의 컨테이너 팔렛트는 "
+                "비어 있어야 합니다."
+            )
+    return MilkrunProductRow(
+        **values,
+        container_pallets=tuple(container_pallets),
+        detail_unavailable=detail_unavailable,
+    )
 
 
 def _snapshot_to_json(snapshot: BookingDateSnapshot) -> dict[str, Any]:
@@ -113,7 +211,12 @@ def _snapshot_to_json(snapshot: BookingDateSnapshot) -> dict[str, Any]:
     }
 
 
-def _snapshot_from_json(raw: Any, location: str) -> BookingDateSnapshot:
+def _snapshot_from_json(
+    raw: Any,
+    location: str,
+    *,
+    format_version: int,
+) -> BookingDateSnapshot:
     if not isinstance(raw, dict) or set(raw) != _SNAPSHOT_KEYS:
         raise ValueError(f"{location} 스냅샷 구성이 올바르지 않습니다.")
     try:
@@ -134,7 +237,12 @@ def _snapshot_from_json(raw: Any, location: str) -> BookingDateSnapshot:
                 f"{booking_type} 표는 최대 {MAX_ROWS_PER_TABLE:,}행까지 저장할 수 있습니다."
             )
         parsed[booking_type] = tuple(
-            _product_from_json(row, f"{location}.tables.{booking_type}[{index}]")
+            _product_from_json(
+                row,
+                f"{location}.tables.{booking_type}[{index}]",
+                format_version=format_version,
+                booking_type=booking_type,
+            )
             for index, row in enumerate(rows)
         )
     return BookingDateSnapshot(
@@ -194,10 +302,10 @@ class BookingSnapshotStore:
         payload = _read_json(self.path)
         if set(payload) != _STORE_KEYS or payload.get("type") != STORE_TYPE:
             raise ValueError("UnHelper RAW 표 저장 파일이 아닙니다.")
-        if payload.get("version") != FORMAT_VERSION:
-            raise ValueError(
-                f"지원하지 않는 RAW 표 저장 버전입니다: {payload.get('version')!r}"
-            )
+        format_version = _validated_format_version(
+            payload.get("version"),
+            "RAW 표 저장",
+        )
         entries = payload.get("entries")
         if not isinstance(entries, list):
             raise ValueError("RAW 표 저장 entries는 배열이어야 합니다.")
@@ -205,7 +313,11 @@ class BookingSnapshotStore:
             raise ValueError("RAW 표 저장 파일에는 기준일을 최대 2개까지 저장할 수 있습니다.")
         result: dict[date, BookingDateSnapshot] = {}
         for index, raw in enumerate(entries):
-            snapshot = _snapshot_from_json(raw, f"entries[{index}]")
+            snapshot = _snapshot_from_json(
+                raw,
+                f"entries[{index}]",
+                format_version=format_version,
+            )
             if snapshot.base_date in result:
                 raise ValueError("RAW 표 저장 파일에 중복 기준일이 있습니다.")
             result[snapshot.base_date] = snapshot
@@ -261,12 +373,21 @@ class BookingSnapshotStore:
             updated_at=_now_iso(),
             **{f"{booking_type}_products": rows},
         )
-        snapshots[base_date] = updated
+        validated = _snapshot_from_json(
+            _snapshot_to_json(updated),
+            "snapshot",
+            format_version=FORMAT_VERSION,
+        )
+        snapshots[base_date] = validated
         self._commit(snapshots.values())
-        return updated
+        return validated
 
     def save_snapshot(self, snapshot: BookingDateSnapshot) -> BookingDateSnapshot:
-        validated = _snapshot_from_json(_snapshot_to_json(snapshot), "snapshot")
+        validated = _snapshot_from_json(
+            _snapshot_to_json(snapshot),
+            "snapshot",
+            format_version=FORMAT_VERSION,
+        )
         snapshots = self._load()
         updated = replace(validated, updated_at=_now_iso())
         snapshots[updated.base_date] = updated
@@ -302,12 +423,16 @@ class BookingSnapshotStore:
         payload = _read_json(Path(source))
         if set(payload) != _BUNDLE_KEYS or payload.get("type") != BUNDLE_TYPE:
             raise ValueError("UnHelper RAW 표 공유 파일이 아닙니다.")
-        if payload.get("version") != FORMAT_VERSION:
-            raise ValueError(
-                f"지원하지 않는 RAW 표 공유 버전입니다: {payload.get('version')!r}"
-            )
+        format_version = _validated_format_version(
+            payload.get("version"),
+            "RAW 표 공유",
+        )
         _validated_timestamp(payload["exported_at"], "exported_at")
-        snapshot = _snapshot_from_json(payload["snapshot"], "snapshot")
+        snapshot = _snapshot_from_json(
+            payload["snapshot"],
+            "snapshot",
+            format_version=format_version,
+        )
         product_memory = payload["product_memory"]
         if not isinstance(product_memory, dict):
             raise ValueError("RAW 표 공유 파일의 상품 메모리가 객체 형식이 아닙니다.")

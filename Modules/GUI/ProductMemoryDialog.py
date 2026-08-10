@@ -153,6 +153,67 @@ class ProductMemoryDialog(QDialog):
         category = record.effective_category or "미분류"
         return category == selected_filter
 
+    @staticmethod
+    def _records_equivalent(
+        existing: ProductMemoryRecord,
+        incoming: ProductMemoryRecord,
+    ) -> bool:
+        return (
+            existing.sku_id == incoming.sku_id
+            and existing.product_name == incoming.product_name
+            and existing.weight_grams == incoming.weight_grams
+            and existing.automatic_category == incoming.automatic_category
+            and existing.category_override == incoming.category_override
+            and existing.boxes_per_pallet == incoming.boxes_per_pallet
+            and existing.pallet_weight_kg == incoming.pallet_weight_kg
+        )
+
+    @staticmethod
+    def _record_description(record: ProductMemoryRecord) -> str:
+        weight = f"{record.weight_grams}g" if record.weight_grams is not None else "미측정"
+        return (
+            f"상품명: {record.product_name or '-'}\n"
+            f"무게: {weight}\n"
+            f"분류: {record.effective_category or '미분류'}"
+        )
+
+    def _ask_duplicate_action(
+        self,
+        existing: ProductMemoryRecord,
+        incoming: ProductMemoryRecord,
+        *,
+        index: int,
+        total: int,
+    ) -> str:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("중복 SKU 상품 분류 확인")
+        dialog.setText(
+            f"SKU {incoming.sku_id}가 이미 저장되어 있습니다. ({index}/{total})\n"
+            "가져온 무게와 수동 분류로 덮어쓸까요?"
+        )
+        dialog.setInformativeText(
+            "[현재 저장값]\n"
+            f"{self._record_description(existing)}\n\n"
+            "[가져올 값]\n"
+            f"{self._record_description(incoming)}"
+        )
+        overwrite_button = dialog.addButton("덮어쓰기", QMessageBox.ButtonRole.AcceptRole)
+        keep_button = dialog.addButton("기존 유지", QMessageBox.ButtonRole.RejectRole)
+        cancel_button = dialog.addButton(
+            "가져오기 취소",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        dialog.setDefaultButton(keep_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is overwrite_button:
+            return "overwrite"
+        if clicked is keep_button:
+            return "keep"
+        return "cancel"
+
     def _export_records(self) -> None:
         default_name = f"UnHelper_상품분류_{datetime.now():%Y%m%d_%H%M%S}.json"
         selected, _filter = QFileDialog.getSaveFileName(
@@ -183,18 +244,42 @@ class ProductMemoryDialog(QDialog):
         if not selected:
             return
         try:
-            summary = self.memory.import_from(selected)
+            records = ProductMemory.records_from(selected)
+            duplicates = tuple(
+                (existing, record)
+                for record in records
+                if (existing := self.memory.get(record.sku_id)) is not None
+                and not self._records_equivalent(existing, record)
+            )
+            overwrite_sku_ids: set[str] = set()
+            for index, (existing, incoming) in enumerate(duplicates, start=1):
+                action = self._ask_duplicate_action(
+                    existing,
+                    incoming,
+                    index=index,
+                    total=len(duplicates),
+                )
+                if action == "cancel":
+                    return
+                if action == "overwrite":
+                    overwrite_sku_ids.add(incoming.sku_id)
+            summary = self.memory.import_records(
+                records,
+                overwrite_sku_ids=overwrite_sku_ids,
+            )
         except Exception as exc:
             self._show_error("상품 분류 가져오기 실패", exc)
             return
         self.refresh()
-        if summary.added:
+        if summary.added or summary.overwritten:
             self.memory_changed.emit()
         QMessageBox.information(
             self,
             "가져오기 완료",
             "상품 분류 가져오기를 완료했습니다.\n"
-            f"추가: {summary.added}개\n기존 항목 유지: {summary.skipped}개",
+            f"추가: {summary.added}개\n"
+            f"덮어쓰기: {summary.overwritten}개\n"
+            f"기존 항목 유지: {summary.skipped}개",
         )
 
     def _delete_selected(self) -> None:
