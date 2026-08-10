@@ -22,15 +22,54 @@ from Modules.Excel.ArrivalSequenceReader import (
 
 
 class FakePythonCom:
-    def __init__(self) -> None:
+    def __init__(self, running_table=None) -> None:
         self.initialized = 0
         self.uninitialized = 0
+        self.running_table = running_table
 
     def CoInitialize(self) -> None:
         self.initialized += 1
 
     def CoUninitialize(self) -> None:
         self.uninitialized += 1
+
+    def GetRunningObjectTable(self):
+        if self.running_table is None:
+            raise RuntimeError("no running table")
+        return self.running_table
+
+    @staticmethod
+    def CreateBindCtx(_reserved):
+        return object()
+
+
+class FakeMoniker:
+    def __init__(self, display_name: str, running_object) -> None:
+        self.display_name = display_name
+        self.running_object = running_object
+
+    def GetDisplayName(self, _bind_context, _left_moniker) -> str:
+        return self.display_name
+
+
+class FakeMonikerEnumerator:
+    def __init__(self, monikers) -> None:
+        self.monikers = list(monikers)
+
+    def Next(self, _count):
+        return (self.monikers.pop(0),) if self.monikers else ()
+
+
+class FakeRunningObjectTable:
+    def __init__(self, monikers) -> None:
+        self.monikers = list(monikers)
+
+    def EnumRunning(self):
+        return FakeMonikerEnumerator(self.monikers)
+
+    @staticmethod
+    def GetObject(moniker):
+        return moniker.running_object
 
 
 class FakeEnd:
@@ -106,10 +145,13 @@ class FakeFloorSheet:
 
 
 class FakeWorkbook:
-    def __init__(self, path: Path, sheet: FakeSheet) -> None:
+    def __init__(self, path: Path, sheet: FakeSheet, *, read_only: bool = False) -> None:
         self.FullName = str(path)
         self.Worksheets = FakeWorksheets(sheet)
         self.close_calls: list[bool] = []
+        self.ReadOnly = read_only
+        self.Saved = True
+        self.Application = None
 
     def Close(self, SaveChanges=False) -> None:
         self.close_calls.append(SaveChanges)
@@ -147,6 +189,7 @@ class FakeComClient:
         self.active = active
         self.dispatched = dispatched
         self.dispatch_count = 0
+        self.wrap_count = 0
 
     def GetActiveObject(self, _progid):
         if self.active is None:
@@ -156,6 +199,10 @@ class FakeComClient:
     def DispatchEx(self, _progid):
         self.dispatch_count += 1
         return self.dispatched
+
+    def Dispatch(self, running_object):
+        self.wrap_count += 1
+        return running_object
 
 
 class ArrivalSequenceReaderTests(unittest.TestCase):
@@ -233,6 +280,83 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
             self.assertEqual(excel.Workbooks.open_calls[0][1]["ReadOnly"], True)
             self.assertEqual(workbook.close_calls, [False])
             self.assertEqual(excel.quit_count, 1)
+
+    def test_rot_reads_live_workbook_in_another_excel_instance_on_every_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = (Path(temp) / "SAN2_입고스케줄관리.xlsm").resolve()
+            path.touch()
+            live_sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
+            live_workbook = FakeWorkbook(path, live_sheet)
+            live_excel = FakeExcel(FakeWorkbooks(open_books=[live_workbook]))
+            live_workbook.Application = live_excel
+            stale_workbook = FakeWorkbook(path, live_sheet, read_only=True)
+            stale_excel = FakeExcel(FakeWorkbooks(open_books=[stale_workbook]))
+            stale_excel.Visible = False
+            stale_workbook.Application = stale_excel
+            pythoncom = FakePythonCom(
+                FakeRunningObjectTable(
+                    (
+                        FakeMoniker(str(path), stale_workbook),
+                        FakeMoniker(str(path), live_workbook),
+                    )
+                )
+            )
+            wrong_excel = FakeExcel(FakeWorkbooks())
+            com_client = FakeComClient(active=wrong_excel)
+            reader = ArrivalSequenceReader(
+                com_client=com_client,
+                pythoncom_module=pythoncom,
+            )
+
+            first = reader.read(path)
+            changed = list(list(row) for row in self.summary_values())
+            changed[2][4] = 777
+            live_sheet.summary_values = tuple(tuple(row) for row in changed)
+            second = reader.read(path)
+
+            self.assertEqual(first.summary.floor_targets[1][0], "30")
+            self.assertEqual(second.summary.floor_targets[1][0], "777")
+            self.assertEqual(com_client.dispatch_count, 0)
+            self.assertEqual(com_client.wrap_count, 4)
+            self.assertEqual(live_workbook.close_calls, [])
+            self.assertEqual(live_excel.quit_count, 0)
+            self.assertTrue(live_workbook.Saved)
+            self.assertEqual(stale_workbook.close_calls, [])
+            self.assertEqual(stale_excel.quit_count, 0)
+
+    def test_hidden_readonly_rot_snapshot_is_ignored_for_a_fresh_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = (Path(temp) / "SAN2_입고스케줄관리.xlsm").resolve()
+            path.touch()
+            stale_sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
+            stale_workbook = FakeWorkbook(path, stale_sheet, read_only=True)
+            stale_excel = FakeExcel(FakeWorkbooks(open_books=[stale_workbook]))
+            stale_excel.Visible = False
+            stale_workbook.Application = stale_excel
+
+            fresh_values = list(list(row) for row in self.summary_values())
+            fresh_values[2][4] = 888
+            fresh_sheet = FakeSheet(
+                tuple(tuple(row) for row in fresh_values),
+                self.detail_values(),
+                last_row=19,
+            )
+            fresh_workbook = FakeWorkbook(path, fresh_sheet, read_only=True)
+            fresh_excel = FakeExcel(FakeWorkbooks(open_result=fresh_workbook))
+            fresh_workbook.Application = fresh_excel
+            moniker = FakeMoniker(str(path), stale_workbook)
+            reader = ArrivalSequenceReader(
+                com_client=FakeComClient(active=stale_excel, dispatched=fresh_excel),
+                pythoncom_module=FakePythonCom(FakeRunningObjectTable([moniker])),
+            )
+
+            result = reader.read(path)
+
+            self.assertEqual(result.summary.floor_targets[1][0], "888")
+            self.assertEqual(stale_workbook.close_calls, [])
+            self.assertEqual(stale_excel.quit_count, 0)
+            self.assertEqual(fresh_workbook.close_calls, [False])
+            self.assertEqual(fresh_excel.quit_count, 1)
 
     def test_current_raw_wins_and_previous_ap_aw_is_counted_once(self) -> None:
         snapshot = ArrivalSequenceSnapshot(

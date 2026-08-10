@@ -303,6 +303,56 @@ def _read_json_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def recover_manual_category_overrides(
+    path: str | Path,
+) -> tuple[dict[str, str], int]:
+    """Recover only safe SKU/category pairs from a partially invalid memory file.
+
+    The normal :class:`ProductMemory` loader intentionally validates the whole
+    payload atomically.  Arrival aggregation, however, must not lose every
+    manually assigned category merely because an unrelated record has a bad
+    timestamp or stale calculation.  This read-only recovery path accepts only
+    independently valid SKU IDs and manual-category values.  Conflicting
+    duplicate SKUs are omitted instead of choosing an arbitrary value.
+    """
+
+    payload = _read_json_payload(Path(path))
+    if payload.get("type") != MEMORY_TYPE or payload.get("version") != MEMORY_VERSION:
+        raise ValueError("지원하지 않는 상품 메모리 형식입니다.")
+    raw_entries = payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raise ValueError("상품 메모리 entries가 배열 형식이 아닙니다.")
+    if len(raw_entries) > MAX_ENTRIES:
+        raise ValueError(f"상품 메모리 항목은 최대 {MAX_ENTRIES}개까지 복구할 수 있습니다.")
+
+    recovered: dict[str, str] = {}
+    conflicted: set[str] = set()
+    skipped = 0
+    for raw in raw_entries:
+        if not isinstance(raw, Mapping):
+            skipped += 1
+            continue
+        try:
+            sku_id = normalize_sku_id(raw.get("sku_id"))
+            category = _validated_override(raw.get("category_override"))
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if category is None:
+            continue
+        if sku_id in conflicted:
+            skipped += 1
+            continue
+        previous = recovered.get(sku_id)
+        if previous is not None and previous != category:
+            recovered.pop(sku_id, None)
+            conflicted.add(sku_id)
+            skipped += 2
+            continue
+        recovered[sku_id] = category
+    return recovered, skipped
+
+
 def _validated_payload(payload: Mapping[str, Any]) -> tuple[list[ProductMemoryRecord], int]:
     unexpected = set(payload) - _ROOT_KEYS
     if unexpected:

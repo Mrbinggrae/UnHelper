@@ -529,6 +529,100 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_persisted_manual_categories_reach_all_arrival_sections_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory_path = Path(temp) / "memory.json"
+            memory = ProductMemory(memory_path)
+            memory.set_manual_category("101", "고단", "고단 상품")
+            memory.set_manual_category("102", "양곡", "양곡 상품")
+            memory.set_manual_category("103", "양곡", "양곡 단일 상품")
+
+            window = MainWindow(smoke_test=True, product_memory_file=memory_path)
+            try:
+                window._populate_milkrun_products(
+                    (
+                        MilkrunProductRow(
+                            "거래처 A", "10800001", "3", "30", "101", "고단 상품", "M10001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처 A", "10800001", "3", "30", "102", "양곡 상품", "M10001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처 B", "10800002", "4", "40", "103", "양곡 단일 상품", "M10002"
+                        ),
+                    )
+                )
+                snapshot = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 10, 2, 3, 4),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(
+                        ArrivalSequenceEntry(
+                            18, "MBN10001", "M10001", "milkrun", "", "", ""
+                        ),
+                        ArrivalSequenceEntry(
+                            19, "MBN10002", "M10002", "milkrun", "2F", "", ""
+                        ),
+                    ),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "M10001", "milkrun", "2F", "Raw_밀크런", 2
+                        ),
+                        BookingFloorAssignment(
+                            "M10002", "milkrun", "2F", "Raw_밀크런", 3
+                        ),
+                    ),
+                )
+
+                window._render_arrival_sequence(snapshot)
+
+                waiting = window.arrival_detail_tables["outside_waiting"]["second"]
+                departure = window.arrival_detail_tables["departure"]["second"]
+                targets = window.arrival_detail_tables["floor_targets"]["second"]
+                self.assertEqual(waiting.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(waiting.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(4, 1).text(), "4 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "4 Pallet")
+            finally:
+                window.close()
+
+    def test_arrival_recovers_valid_manual_categories_from_partially_invalid_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory_path = Path(temp) / "memory.json"
+            memory = ProductMemory(memory_path)
+            memory.set_manual_category("101", "고단", "고단 상품")
+            payload = __import__("json").loads(memory_path.read_text(encoding="utf-8"))
+            payload["entries"].append(
+                {"sku_id": "broken", "category_override": "잘못된 분류"}
+            )
+            memory_path.write_text(
+                __import__("json").dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            window = MainWindow(smoke_test=True, product_memory_file=memory_path)
+            try:
+                window._populate_milkrun_products(
+                    (
+                        MilkrunProductRow(
+                            "거래처", "10800001", "3", "30", "101", "고단 상품", "M10001"
+                        ),
+                    )
+                )
+
+                aggregate = window._raw_booking_aggregates()["M10001"]
+
+                self.assertEqual(aggregate.categories["고단"], Decimal("3"))
+                self.assertIn("안전한 수동 분류만 복구", window.log_view.toPlainText())
+            finally:
+                window.close()
+
     def test_operation_progress_shows_completed_and_remaining_percent(self) -> None:
         window = MainWindow(smoke_test=True)
         try:

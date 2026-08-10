@@ -102,6 +102,7 @@ from Modules.WMS.ProductMemory import (
     calculate_pallet_measurement,
     normalize_product_name,
     normalize_sku_id,
+    recover_manual_category_overrides,
 )
 from Modules.WMS.ProductWeightWorker import (
     ProductWeightSummary,
@@ -832,6 +833,7 @@ class MainWindow(QMainWindow):
         self.arrival_worker: ArrivalSequenceWorker | None = None
         self._arrival_snapshot: ArrivalSequenceSnapshot | None = None
         self._arrival_auto_refreshed = False
+        self._arrival_category_memory_warning = ""
         self.product_memory_file = (
             Path(product_memory_file) if product_memory_file else product_memory_path()
         )
@@ -1290,22 +1292,59 @@ class MainWindow(QMainWindow):
             return f"{prefix}{digits}"
         return ""
 
+    def _arrival_manual_category_overrides(self) -> dict[str, str]:
+        overrides: dict[str, str] = {}
+        warning = ""
+        try:
+            records = ProductMemory(self.product_memory_file).entries()
+            overrides.update(
+                {
+                    record.sku_id: record.category_override
+                    for record in records
+                    if record.category_override in MANUAL_CATEGORIES
+                }
+            )
+        except Exception as exc:
+            try:
+                recovered, skipped = recover_manual_category_overrides(
+                    self.product_memory_file
+                )
+                overrides.update(recovered)
+                warning = (
+                    "상품 분류 메모리 전체 검증에 실패해 안전한 수동 분류만 "
+                    f"복구했습니다: {len(recovered)}개 복구 · {skipped}개 제외 · {exc}"
+                )
+            except Exception as recovery_exc:
+                warning = (
+                    "상품 분류 메모리를 읽지 못해 현재 RAW 표의 분류만 사용합니다. "
+                    "저장된 고단·양곡이 누락될 수 있습니다. "
+                    f"원인: {exc} / 복구 오류: {recovery_exc}"
+                )
+
+        # Current-session records are already validated and may be newer than
+        # the disk snapshot.  A missing override never removes a recovered one.
+        for raw_sku_id, record in self._weight_records.items():
+            if record.category_override not in MANUAL_CATEGORIES:
+                continue
+            try:
+                sku_id = normalize_sku_id(raw_sku_id)
+            except ValueError:
+                continue
+            overrides[sku_id] = record.category_override
+
+        if warning != self._arrival_category_memory_warning:
+            self._arrival_category_memory_warning = warning
+            if warning:
+                self.append_log(f"[상품 분류 메모리 경고] {warning}")
+                self.arrival_updated_label.setToolTip(warning)
+            else:
+                self.arrival_updated_label.setToolTip("")
+        return overrides
+
     def _raw_booking_aggregates(self) -> dict[str, RawBookingAggregate]:
         mutable: dict[str, dict[str, object]] = {}
         valid_categories = {"경량", "중량", "고단", GRAIN_CATEGORY, "?"}
-        persistent_categories = {
-            sku_id: record.category_override
-            for sku_id, record in self._weight_records.items()
-            if record.category_override in PERSISTENT_MANUAL_CATEGORIES
-        }
-        try:
-            for record in ProductMemory(self.product_memory_file).entries():
-                if record.category_override in PERSISTENT_MANUAL_CATEGORIES:
-                    persistent_categories[record.sku_id] = record.category_override
-        except Exception:
-            # Product-memory recovery is handled by the existing settings/raw
-            # workflow. Arrival rendering must still work from visible buttons.
-            pass
+        persistent_categories = self._arrival_manual_category_overrides()
         for booking_type in ("milkrun", "truck"):
             products = self._products_by_booking.get(booking_type, ())
             table = self._table_for_booking(booking_type)

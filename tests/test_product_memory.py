@@ -20,6 +20,7 @@ from Modules.WMS.ProductMemory import (
     calculate_pallet_measurement,
     normalize_product_name,
     normalize_sku_id,
+    recover_manual_category_overrides,
 )
 
 
@@ -88,6 +89,47 @@ class ProductMemoryTests(unittest.TestCase):
         self.assertEqual(record.weight_grams, Decimal("2000"))
         self.assertEqual(record.pallet_weight_kg, Decimal("280"))
         self.assertEqual(record.effective_category, HIGH_CATEGORY)
+
+    def test_manual_categories_recover_when_unrelated_record_breaks_full_validation(self) -> None:
+        path = self.root / "memory.json"
+        memory = ProductMemory(path)
+        memory.set_manual_category("101", HIGH_CATEGORY, "고단 상품")
+        memory.set_manual_category("102", GRAIN_CATEGORY, "양곡 상품")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["entries"].append(
+            {
+                "sku_id": "broken",
+                "category_override": "지원하지 않는 분류",
+            }
+        )
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            ProductMemory(path)
+
+        recovered, skipped = recover_manual_category_overrides(path)
+
+        self.assertEqual(recovered, {"101": HIGH_CATEGORY, "102": GRAIN_CATEGORY})
+        self.assertEqual(skipped, 1)
+
+    def test_manual_category_recovery_rejects_wrong_memory_identity(self) -> None:
+        path = self.root / "memory.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "AnotherApplication",
+                    "version": MEMORY_VERSION,
+                    "entries": [
+                        {"sku_id": "101", "category_override": HIGH_CATEGORY}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "지원하지 않는 상품 메모리 형식"):
+            recover_manual_category_overrides(path)
 
     def test_manual_category_can_create_unmeasured_placeholder(self) -> None:
         memory = ProductMemory(self.root / "memory.json")

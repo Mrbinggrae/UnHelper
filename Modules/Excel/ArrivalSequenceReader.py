@@ -396,12 +396,14 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
         coinitialized = False
         excel = None
         workbook = None
+        sheet = None
         owns_excel = False
         owns_workbook = False
         try:
             pythoncom.CoInitialize()
             coinitialized = True
             excel, workbook, owns_excel, owns_workbook = self._open_readonly_workbook(
+                pythoncom,
                 com_client,
                 target_path,
             )
@@ -459,17 +461,24 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
                 f"{exc}"
             ) from exc
         finally:
+            # Release child COM proxies before closing their workbook.  Keeping
+            # a Worksheet proxy alive past CoUninitialize can leave the hidden
+            # read-only Excel instance in the ROT, so a later refresh attaches
+            # to that stale snapshot instead of the user's live workbook.
+            sheet = None
+            gc.collect()
             if workbook is not None and owns_workbook:
                 try:
                     workbook.Close(SaveChanges=False)
                 except Exception:
                     pass
+            workbook = None
+            gc.collect()
             if excel is not None and owns_excel:
                 try:
                     excel.Quit()
                 except Exception:
                     pass
-            workbook = None
             excel = None
             gc.collect()
             if coinitialized:
@@ -480,9 +489,20 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
 
     def _open_readonly_workbook(
         self,
+        pythoncom: Any,
         com_client: Any,
         target_path: Path,
     ) -> tuple[Any, Any, bool, bool]:
+        running = self._find_running_workbook(
+            pythoncom,
+            com_client,
+            target_path,
+        )
+        if running is not None:
+            running_excel, running_workbook = running
+            self.log(f"열려 있는 Excel 파일의 현재 값을 읽습니다: {target_path.name}")
+            return running_excel, running_workbook, False, False
+
         active_excel = None
         try:
             active_excel = com_client.GetActiveObject("Excel.Application")
@@ -495,8 +515,29 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
                 "열려 있는 Excel 파일 찾기",
             )
             if open_target is not None:
-                self.log(f"열려 있는 Excel 파일의 현재 값을 읽습니다: {target_path.name}")
-                return active_excel, open_target, False, False
+                visible = self._run_excel_com_operation(
+                    active_excel,
+                    lambda: bool(getattr(active_excel, "Visible", False)),
+                    "열려 있는 Excel 표시 상태 확인",
+                )
+                read_only = self._run_excel_com_operation(
+                    active_excel,
+                    lambda: bool(getattr(open_target, "ReadOnly", False)),
+                    "열려 있는 Excel 읽기 상태 확인",
+                )
+                if visible or not read_only:
+                    self.log(
+                        f"열려 있는 Excel 파일의 현재 값을 읽습니다: {target_path.name}"
+                    )
+                    return active_excel, open_target, False, False
+                # A previous automation instance that failed to leave the ROT
+                # must never become the source for subsequent refreshes.
+                self.log(
+                    "숨은 읽기 전용 Excel 인스턴스의 이전 값을 무시하고 "
+                    f"파일을 새로 읽습니다: {target_path.name}"
+                )
+                open_target = None
+                active_excel = None
 
         excel = None
         try:
@@ -522,6 +563,47 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
             raise ArrivalSequenceError(
                 f"연결된 Excel 파일을 읽기 전용으로 열지 못했습니다.\n{exc}"
             ) from exc
+
+    def _find_running_workbook(
+        self,
+        pythoncom: Any,
+        com_client: Any,
+        target_path: Path,
+    ) -> tuple[Any, Any] | None:
+        """Find the exact workbook moniker across all running Excel instances."""
+
+        try:
+            running_table = pythoncom.GetRunningObjectTable()
+            monikers = running_table.EnumRunning()
+            bind_context = pythoncom.CreateBindCtx(0)
+        except Exception:
+            return None
+
+        while True:
+            try:
+                batch = monikers.Next(1)
+            except Exception:
+                return None
+            if not batch:
+                return None
+            moniker = batch[0]
+            try:
+                display_name = str(moniker.GetDisplayName(bind_context, None)).strip()
+                if display_name.lower().startswith("file:///"):
+                    display_name = display_name[8:].replace("/", "\\")
+                if not self._same_path(Path(display_name), target_path):
+                    continue
+                workbook = com_client.Dispatch(running_table.GetObject(moniker))
+                full_name = Path(str(workbook.FullName))
+                if not self._same_path(full_name, target_path):
+                    continue
+                excel = workbook.Application
+                visible = bool(getattr(excel, "Visible", False))
+                read_only = bool(getattr(workbook, "ReadOnly", False))
+                if visible or not read_only:
+                    return excel, workbook
+            except Exception:
+                continue
 
     def _find_open_workbook_for_read(
         self,

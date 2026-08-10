@@ -7,6 +7,7 @@ from .ProductMemory import (
     ProductMemoryRecord,
     calculate_boxes_per_pallet,
     calculate_pallet_measurement,
+    recover_manual_category_overrides,
 )
 from .ProductWeightCrawler import ProductWeightCrawler, ProductWeightLookup, WMSWeightError
 from .ProductWeightWorker import ProductWeightSummary, ProductWeightWorker, SkuWeightFailure
@@ -26,4 +27,5 @@ __all__ = [
     "WMSWeightError",
     "calculate_boxes_per_pallet",
     "calculate_pallet_measurement",
+    "recover_manual_category_overrides",
 ]
