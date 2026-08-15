@@ -127,6 +127,23 @@ class BookingSnapshotStoreTests(unittest.TestCase):
             self.assertEqual(legacy_restored.truck_products[0].container_pallets, ())
             self.assertFalse(legacy_restored.truck_products[0].detail_unavailable)
 
+    def test_rejects_truck_snapshot_when_declared_and_container_pallets_disagree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = BookingSnapshotStore(Path(temp) / "snapshots.json")
+            damaged = MilkrunProductRow(
+                vendor_name="거래처",
+                milkrun_number="PALLET_001",
+                pallet_count="16",
+                box_count="20",
+                sku_id="123",
+                sku_name="상품",
+                dispatch_number="T3372829",
+                container_pallets=(("barcode:cbn-1", "8"),),
+            )
+
+            with self.assertRaisesRegex(ValueError, "컨테이너 팔렛트 합계 8"):
+                store.save_table(date(2026, 8, 10), "truck", (damaged,))
+
     def test_v2_detail_unavailable_round_trips_through_store_and_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

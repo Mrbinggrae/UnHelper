@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-import gc
+import os
 import re
+import tempfile
+import time
+import zlib
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile, LargeZipFile
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, BinaryIO, Callable, Mapping
+
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from Modules.Excel.MilkrunExcelImporter import (
     ExcelImportCancelled,
@@ -20,6 +28,10 @@ LogCallback = Callable[[str], None]
 
 class ArrivalSequenceError(ExcelImportError):
     """Raised when the linked arrival-sequence sheet cannot be read safely."""
+
+
+class _WorkbookSnapshotChangedError(OSError):
+    """Raised when OneDrive replaces or updates the source during capture."""
 
 
 @dataclass(frozen=True)
@@ -58,6 +70,7 @@ class ArrivalSequenceSnapshot:
     summary: ArrivalSummary
     entries: tuple[ArrivalSequenceEntry, ...]
     floor_assignments: tuple[BookingFloorAssignment, ...] = ()
+    source_modified_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -266,7 +279,7 @@ def build_arrival_vehicles(
             notes = [assignment.note] if assignment is not None and assignment.note else []
             if current.missing_pallet_rows:
                 notes.append(
-                    f"팔렛트 수 미입력 SKU {current.missing_pallet_rows}행"
+                    f"팔렛트 수 확인 필요 SKU {current.missing_pallet_rows}행"
                 )
             vehicles.append(
                 ArrivalVehicle(
@@ -363,27 +376,33 @@ def build_status_pallet_breakdowns(
 
 
 class ArrivalSequenceReader(MilkrunExcelImporter):
-    """Read the linked workbook's ``입차순번`` sheet without changing it."""
+    """Read the synchronized workbook snapshot without starting Excel."""
 
     TARGET_SHEET = "입차순번"
+    TARGET_EXTENSIONS = frozenset({".xlsx", ".xlsm"})
     FIRST_DETAIL_ROW = 18
     MAX_DETAIL_ROW = 5000
     MAX_RAW_ROW = 10000
-    _XL_UP = -4162
+    _SEQUENCE_FIRST_ROW = 8
+    _SEQUENCE_FIRST_COLUMN = 28  # AB
+    _SEQUENCE_LAST_COLUMN = 49  # AW
+    _SUMMARY_FIRST_COLUMN_OFFSET = 9  # AK - AB
+    _SUMMARY_COLUMN_COUNT = 10  # AK:AT
+    _SNAPSHOT_MAX_ATTEMPTS = 4
+    _SNAPSHOT_COPY_CHUNK_BYTES = 2 * 1024 * 1024
+    _SNAPSHOT_MEMORY_LIMIT_BYTES = 32 * 1024 * 1024
+    _SNAPSHOT_RETRY_BASE_DELAY_SECONDS = 0.25
 
     def __init__(
         self,
         log: LogCallback | None = None,
         *,
-        com_client: Any | None = None,
-        pythoncom_module: Any | None = None,
+        workbook_loader: Callable[..., Any] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
-        super().__init__(
-            log=log,
-            com_client=com_client,
-            pythoncom_module=pythoncom_module,
-            reject_open_target=False,
-        )
+        super().__init__(log=log, reject_open_target=False)
+        self._workbook_loader = workbook_loader or load_workbook
+        self._sleep = sleep or time.sleep
 
     def read(
         self,
@@ -392,293 +411,251 @@ class ArrivalSequenceReader(MilkrunExcelImporter):
         cancel_requested: Callable[[], bool] | None = None,
     ) -> ArrivalSequenceSnapshot:
         target_path = self.validate_target_path(workbook_path)
-        pythoncom, com_client = self._load_com_modules()
-        coinitialized = False
-        excel = None
-        workbook = None
-        sheet = None
-        owns_excel = False
-        owns_workbook = False
-        try:
-            pythoncom.CoInitialize()
-            coinitialized = True
-            excel, workbook, owns_excel, owns_workbook = self._open_readonly_workbook(
-                pythoncom,
-                com_client,
-                target_path,
-            )
-            sheet = self._run_excel_com_operation(
-                excel,
-                lambda: workbook.Worksheets(self.TARGET_SHEET),
-                "입차순번 시트 확인",
-                cancel_requested=cancel_requested,
-            )
-            summary_values = self._run_excel_com_operation(
-                excel,
-                lambda: sheet.Range("AK8:AT11").Value2,
-                "입차순번 요약 값 읽기",
-                cancel_requested=cancel_requested,
-            )
-            last_row = self._last_detail_row(
-                excel,
-                sheet,
-                cancel_requested=cancel_requested,
-            )
-            detail_values = ()
-            if last_row >= self.FIRST_DETAIL_ROW:
-                detail_values = self._run_excel_com_operation(
-                    excel,
-                    lambda: sheet.Range(
-                        f"AB{self.FIRST_DETAIL_ROW}:AW{last_row}"
-                    ).Value2,
-                    "입차순번 차량 값 읽기",
+        last_error: Exception | None = None
+        for attempt in range(1, self._SNAPSHOT_MAX_ATTEMPTS + 1):
+            self._raise_if_cancelled(cancel_requested)
+            try:
+                snapshot = self._read_snapshot_once(
+                    target_path,
                     cancel_requested=cancel_requested,
                 )
-            snapshot = ArrivalSequenceSnapshot(
-                workbook=target_path,
-                sheet_name=self.TARGET_SHEET,
-                refreshed_at=datetime.now(),
-                summary=self._parse_summary(summary_values),
-                entries=self._parse_entries(detail_values),
-                floor_assignments=self._read_floor_assignments(
-                    excel,
-                    workbook,
-                    cancel_requested=cancel_requested,
-                ),
-            )
+            except ExcelImportCancelled:
+                raise
+            except ArrivalSequenceError:
+                raise
+            except (InvalidFileException, LargeZipFile) as exc:
+                raise ArrivalSequenceError(
+                    "입차순번 읽기는 암호화되지 않은 .xlsx 또는 .xlsm 저장본만 "
+                    f"지원합니다.\n{exc}"
+                ) from exc
+            except Exception as exc:
+                if not self._is_retryable_snapshot_error(exc):
+                    if isinstance(exc, OSError):
+                        raise ArrivalSequenceError(
+                            "연결된 Excel 저장본에 접근하지 못했습니다. "
+                            "파일 권한과 디스크 여유 공간을 확인해 주세요.\n"
+                            f"{exc}"
+                        ) from exc
+                    raise
+                last_error = exc
+                if attempt >= self._SNAPSHOT_MAX_ATTEMPTS:
+                    break
+                self.log(
+                    "Excel 또는 OneDrive가 저장본을 갱신 중입니다. "
+                    f"잠시 후 다시 읽습니다 ({attempt}/{self._SNAPSHOT_MAX_ATTEMPTS})."
+                )
+                self._wait_for_retry(attempt, cancel_requested)
+                continue
+
             self.log(
-                f"입차순번 시트에서 차량 {len(snapshot.entries)}건을 읽었습니다."
+                "Excel을 실행하지 않고 마지막 저장·동기화 값에서 "
+                f"차량 {len(snapshot.entries)}건을 읽었습니다."
             )
             return snapshot
-        except ExcelImportCancelled:
-            raise
-        except ArrivalSequenceError:
-            raise
-        except Exception as exc:
-            raise ArrivalSequenceError(
-                "연결된 Excel의 '입차순번' 시트를 읽지 못했습니다. "
-                "Excel의 편집 중인 셀이나 팝업창을 닫고 다시 시도해 주세요.\n"
-                f"{exc}"
-            ) from exc
-        finally:
-            # Release child COM proxies before closing their workbook.  Keeping
-            # a Worksheet proxy alive past CoUninitialize can leave the hidden
-            # read-only Excel instance in the ROT, so a later refresh attaches
-            # to that stale snapshot instead of the user's live workbook.
-            sheet = None
-            gc.collect()
-            if workbook is not None and owns_workbook:
-                try:
-                    workbook.Close(SaveChanges=False)
-                except Exception:
-                    pass
-            workbook = None
-            gc.collect()
-            if excel is not None and owns_excel:
-                try:
-                    excel.Quit()
-                except Exception:
-                    pass
-            excel = None
-            gc.collect()
-            if coinitialized:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
 
-    def _open_readonly_workbook(
+        raise ArrivalSequenceError(
+            "동기화된 Excel 저장본의 '입차순번' 값을 읽지 못했습니다. "
+            "웹 Excel의 저장 완료와 OneDrive 동기화 상태를 확인한 뒤 다시 시도해 주세요.\n"
+            f"{last_error}"
+        ) from last_error
+
+    def _read_snapshot_once(
         self,
-        pythoncom: Any,
-        com_client: Any,
         target_path: Path,
-    ) -> tuple[Any, Any, bool, bool]:
-        running = self._find_running_workbook(
-            pythoncom,
-            com_client,
-            target_path,
-        )
-        if running is not None:
-            running_excel, running_workbook = running
-            self.log(f"열려 있는 Excel 파일의 현재 값을 읽습니다: {target_path.name}")
-            return running_excel, running_workbook, False, False
-
-        active_excel = None
-        try:
-            active_excel = com_client.GetActiveObject("Excel.Application")
-        except Exception:
-            pass
-        if active_excel is not None:
-            open_target = self._run_excel_com_operation(
-                active_excel,
-                lambda: self._find_open_workbook_for_read(active_excel, target_path),
-                "열려 있는 Excel 파일 찾기",
+        *,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> ArrivalSequenceSnapshot:
+        with tempfile.SpooledTemporaryFile(
+            max_size=self._SNAPSHOT_MEMORY_LIMIT_BYTES,
+            mode="w+b",
+        ) as snapshot_stream:
+            source_stat = self._copy_stable_snapshot(
+                target_path,
+                snapshot_stream,
+                cancel_requested=cancel_requested,
             )
-            if open_target is not None:
-                visible = self._run_excel_com_operation(
-                    active_excel,
-                    lambda: bool(getattr(active_excel, "Visible", False)),
-                    "열려 있는 Excel 표시 상태 확인",
+            snapshot_stream.seek(0)
+            workbook = self._workbook_loader(
+                snapshot_stream,
+                read_only=True,
+                data_only=True,
+                keep_vba=False,
+                keep_links=False,
+            )
+            try:
+                sequence_sheet = self._required_sheet(workbook, self.TARGET_SHEET)
+                sequence_values = self._read_rows(
+                    sequence_sheet,
+                    min_row=self._SEQUENCE_FIRST_ROW,
+                    max_row=self.MAX_DETAIL_ROW,
+                    min_column=self._SEQUENCE_FIRST_COLUMN,
+                    max_column=self._SEQUENCE_LAST_COLUMN,
+                    cancel_requested=cancel_requested,
                 )
-                read_only = self._run_excel_com_operation(
-                    active_excel,
-                    lambda: bool(getattr(open_target, "ReadOnly", False)),
-                    "열려 있는 Excel 읽기 상태 확인",
+                summary_start = self._SUMMARY_FIRST_COLUMN_OFFSET
+                summary_end = summary_start + self._SUMMARY_COLUMN_COUNT
+                summary_values = tuple(
+                    tuple(row[summary_start:summary_end])
+                    for row in sequence_values[:4]
                 )
-                if visible or not read_only:
-                    self.log(
-                        f"열려 있는 Excel 파일의 현재 값을 읽습니다: {target_path.name}"
+                detail_offset = self.FIRST_DETAIL_ROW - self._SEQUENCE_FIRST_ROW
+                detail_values = sequence_values[detail_offset:]
+
+                floor_values: dict[str, tuple[tuple[Any, ...], ...]] = {}
+                for sheet_name, _booking_type, _prefix in self._floor_sheet_specs():
+                    floor_sheet = self._required_sheet(workbook, sheet_name)
+                    floor_values[sheet_name] = self._read_rows(
+                        floor_sheet,
+                        min_row=2,
+                        max_row=self.MAX_RAW_ROW,
+                        min_column=2,
+                        max_column=3,
+                        cancel_requested=cancel_requested,
                     )
-                    return active_excel, open_target, False, False
-                # A previous automation instance that failed to leave the ROT
-                # must never become the source for subsequent refreshes.
-                self.log(
-                    "숨은 읽기 전용 Excel 인스턴스의 이전 값을 무시하고 "
-                    f"파일을 새로 읽습니다: {target_path.name}"
-                )
-                open_target = None
-                active_excel = None
+            finally:
+                workbook.close()
 
-        excel = None
-        try:
-            excel = com_client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
-            workbook = self._workbooks_open_with_macros_disabled(
-                excel,
-                str(target_path),
-                UpdateLinks=0,
-                ReadOnly=True,
-                IgnoreReadOnlyRecommended=True,
-                AddToMru=False,
+        return ArrivalSequenceSnapshot(
+            workbook=target_path,
+            sheet_name=self.TARGET_SHEET,
+            refreshed_at=datetime.now(),
+            summary=self._parse_summary(summary_values),
+            entries=self._parse_entries(detail_values),
+            floor_assignments=self._parse_floor_assignments(floor_values),
+            source_modified_at=datetime.fromtimestamp(source_stat.st_mtime),
+        )
+
+    def _copy_stable_snapshot(
+        self,
+        source_path: Path,
+        snapshot_stream: BinaryIO,
+        *,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> os.stat_result:
+        before = source_path.stat()
+        with source_path.open("rb") as source:
+            opened_before = os.fstat(source.fileno())
+            while True:
+                self._raise_if_cancelled(cancel_requested)
+                chunk = source.read(self._SNAPSHOT_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                snapshot_stream.write(chunk)
+            opened_after = os.fstat(source.fileno())
+        snapshot_stream.flush()
+        after = source_path.stat()
+        signatures = {
+            self._source_signature(stat_result)
+            for stat_result in (before, opened_before, opened_after, after)
+        }
+        if len(signatures) != 1:
+            raise _WorkbookSnapshotChangedError(
+                "OneDrive 동기화 중 원본 파일이 변경되었습니다."
             )
-            self.log(f"닫힌 Excel 파일을 읽기 전용으로 열었습니다: {target_path.name}")
-            return excel, workbook, True, True
-        except Exception as exc:
-            if excel is not None:
-                try:
-                    excel.Quit()
-                except Exception:
-                    pass
+        return after
+
+    @staticmethod
+    def _source_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+        )
+
+    @staticmethod
+    def _required_sheet(workbook: Any, sheet_name: str) -> Any:
+        try:
+            return workbook[sheet_name]
+        except KeyError as exc:
             raise ArrivalSequenceError(
-                f"연결된 Excel 파일을 읽기 전용으로 열지 못했습니다.\n{exc}"
+                f"연결된 Excel 파일에 '{sheet_name}' 시트가 없습니다."
             ) from exc
 
-    def _find_running_workbook(
+    @staticmethod
+    def _is_retryable_snapshot_error(exc: Exception) -> bool:
+        if isinstance(
+            exc,
+            (
+                _WorkbookSnapshotChangedError,
+                BadZipFile,
+                EOFError,
+                ParseError,
+                zlib.error,
+                KeyError,
+                FileNotFoundError,
+                TimeoutError,
+            ),
+        ):
+            return True
+        if isinstance(exc, ValueError):
+            return "Unable to read workbook" in str(exc)
+        if isinstance(exc, OSError):
+            return getattr(exc, "winerror", None) in {32, 33, 995}
+        return False
+
+    def _read_rows(
         self,
-        pythoncom: Any,
-        com_client: Any,
-        target_path: Path,
-    ) -> tuple[Any, Any] | None:
-        """Find the exact workbook moniker across all running Excel instances."""
-
-        try:
-            running_table = pythoncom.GetRunningObjectTable()
-            monikers = running_table.EnumRunning()
-            bind_context = pythoncom.CreateBindCtx(0)
-        except Exception:
-            return None
-
-        while True:
-            try:
-                batch = monikers.Next(1)
-            except Exception:
-                return None
-            if not batch:
-                return None
-            moniker = batch[0]
-            try:
-                display_name = str(moniker.GetDisplayName(bind_context, None)).strip()
-                if display_name.lower().startswith("file:///"):
-                    display_name = display_name[8:].replace("/", "\\")
-                if not self._same_path(Path(display_name), target_path):
-                    continue
-                workbook = com_client.Dispatch(running_table.GetObject(moniker))
-                full_name = Path(str(workbook.FullName))
-                if not self._same_path(full_name, target_path):
-                    continue
-                excel = workbook.Application
-                visible = bool(getattr(excel, "Visible", False))
-                read_only = bool(getattr(workbook, "ReadOnly", False))
-                if visible or not read_only:
-                    return excel, workbook
-            except Exception:
-                continue
-
-    def _find_open_workbook_for_read(
-        self,
-        excel: Any,
-        target_path: Path,
-    ) -> Any | None:
-        for workbook in excel.Workbooks:
-            try:
-                full_name = Path(str(workbook.FullName))
-            except Exception as exc:
-                if self._is_excel_busy_error(exc):
-                    raise
-                continue
-            if self._same_path(full_name, target_path):
-                return workbook
-        return None
-
-    def _last_detail_row(
-        self,
-        excel: Any,
         sheet: Any,
         *,
+        min_row: int,
+        max_row: int,
+        min_column: int,
+        max_column: int,
         cancel_requested: Callable[[], bool] | None,
-    ) -> int:
-        def find_last_row() -> int:
-            row_count = int(sheet.Rows.Count)
-            columns = (28, 42, 46, 49)  # AB, AP, AT, AW
-            rows = [int(sheet.Cells(row_count, column).End(self._XL_UP).Row) for column in columns]
-            return max(rows, default=0)
+    ) -> tuple[tuple[Any, ...], ...]:
+        sheet_max_row = int(getattr(sheet, "max_row", max_row) or max_row)
+        bounded_max_row = min(max_row, sheet_max_row)
+        if bounded_max_row < min_row:
+            return ()
 
-        last_row = self._run_excel_com_operation(
-            excel,
-            find_last_row,
-            "입차순번 마지막 행 확인",
-            cancel_requested=cancel_requested,
-        )
-        return min(max(int(last_row), self.FIRST_DETAIL_ROW - 1), self.MAX_DETAIL_ROW)
+        rows: list[tuple[Any, ...]] = []
+        for offset, row in enumerate(
+            sheet.iter_rows(
+                min_row=min_row,
+                max_row=bounded_max_row,
+                min_col=min_column,
+                max_col=max_column,
+                values_only=True,
+            )
+        ):
+            if offset % 128 == 0:
+                self._raise_if_cancelled(cancel_requested)
+            rows.append(tuple(row))
+        while rows and all(value in (None, "") for value in rows[-1]):
+            rows.pop()
+        return tuple(rows)
 
-    def _read_floor_assignments(
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        if cancel_requested is not None and cancel_requested():
+            raise ExcelImportCancelled("사용자가 입차순번 새로고침을 중지했습니다.")
+
+    def _wait_for_retry(
         self,
-        excel: Any,
-        workbook: Any,
-        *,
+        attempt: int,
         cancel_requested: Callable[[], bool] | None,
-    ) -> tuple[BookingFloorAssignment, ...]:
-        assignments: list[BookingFloorAssignment] = []
-        for sheet_name, booking_type, prefix in (
+    ) -> None:
+        self._raise_if_cancelled(cancel_requested)
+        self._sleep(self._SNAPSHOT_RETRY_BASE_DELAY_SECONDS * attempt)
+        self._raise_if_cancelled(cancel_requested)
+
+    @staticmethod
+    def _floor_sheet_specs() -> tuple[tuple[str, str, str], ...]:
+        return (
             ("Raw_트럭", "truck", "T"),
             ("Raw_밀크런", "milkrun", "M"),
-        ):
-            sheet = self._run_excel_com_operation(
-                excel,
-                lambda name=sheet_name: workbook.Worksheets(name),
-                f"{sheet_name} 시트 확인",
-                cancel_requested=cancel_requested,
-            )
-            last_row = self._run_excel_com_operation(
-                excel,
-                lambda target=sheet: max(
-                    int(target.Cells(int(target.Rows.Count), column).End(self._XL_UP).Row)
-                    for column in (2, 3)
-                ),
-                f"{sheet_name} 마지막 행 확인",
-                cancel_requested=cancel_requested,
-            )
-            last_row = min(max(int(last_row), 1), self.MAX_RAW_ROW)
-            if last_row < 2:
-                continue
-            values = self._run_excel_com_operation(
-                excel,
-                lambda target=sheet, end=last_row: target.Range(f"B2:C{end}").Value2,
-                f"{sheet_name} 층·번호 읽기",
-                cancel_requested=cancel_requested,
-            )
-            for offset, row in enumerate(self._matrix(values)):
+        )
+
+    def _parse_floor_assignments(
+        self,
+        values_by_sheet: Mapping[str, Any],
+    ) -> tuple[BookingFloorAssignment, ...]:
+        assignments: list[BookingFloorAssignment] = []
+        for sheet_name, booking_type, prefix in self._floor_sheet_specs():
+            for offset, row in enumerate(self._matrix(values_by_sheet.get(sheet_name))):
                 floor_text = str(row[0] or "").strip() if len(row) > 0 else ""
                 floor_match = _FLOOR_PATTERN.search(floor_text)
                 booking_key = normalize_raw_sheet_booking(

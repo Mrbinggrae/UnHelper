@@ -169,6 +169,24 @@ def _product_from_json(
             )
         seen_container_ids.add(normalized_identity)
         container_pallets.append((identity, format(parsed_count.to_integral_value(), "f")))
+    if booking_type == "truck" and container_pallets:
+        try:
+            declared_pallets = Decimal(values["pallet_count"].strip().replace(",", ""))
+        except InvalidOperation as exc:
+            raise ValueError(f"{location}.pallet_count 값이 숫자가 아닙니다.") from exc
+        container_total = sum(
+            (Decimal(pallet_count) for _identity, pallet_count in container_pallets),
+            Decimal("0"),
+        )
+        if (
+            not declared_pallets.is_finite()
+            or declared_pallets <= 0
+            or declared_pallets != container_total
+        ):
+            raise ValueError(
+                f"{location}.pallet_count {values['pallet_count']!r}와 "
+                f"컨테이너 팔렛트 합계 {format(container_total, 'f')}가 일치하지 않습니다."
+            )
     detail_unavailable = raw.get("detail_unavailable", False)
     if not isinstance(detail_unavailable, bool):
         raise ValueError(f"{location}.detail_unavailable 값은 참/거짓이어야 합니다.")

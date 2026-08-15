@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from decimal import Decimal
 from unittest.mock import patch
@@ -161,6 +161,59 @@ class MainWindowSmokeTests(unittest.TestCase):
             information.assert_called_once()
             self.assertEqual(information.call_args.args[1], "RAW 데이터 필요")
             self.assertIsNone(window.arrival_worker)
+        finally:
+            window.close()
+
+    def test_arrival_auto_refresh_runs_every_ten_minutes_only_on_arrival_tab(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            self.assertTrue(window._arrival_auto_refresh_timer.isActive())
+            self.assertEqual(
+                window._arrival_auto_refresh_timer.interval(),
+                10 * 60 * 1000,
+            )
+            window._arrival_auto_refreshed = True
+            with patch.object(window, "refresh_arrival_sequence") as refresh:
+                window._on_arrival_auto_refresh_timeout()
+                refresh.assert_not_called()
+
+                window.main_tabs.setCurrentIndex(0)
+                window._on_arrival_auto_refresh_timeout()
+
+            refresh.assert_called_once_with(automatic=True, silent=True)
+        finally:
+            window.close()
+
+    def test_arrival_silent_auto_refresh_skips_missing_raw_without_dialog(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            with (
+                patch.object(QMessageBox, "information") as information,
+                patch.object(QMessageBox, "warning") as warning,
+            ):
+                window.refresh_arrival_sequence(automatic=True, silent=True)
+
+            information.assert_not_called()
+            warning.assert_not_called()
+            self.assertIsNone(window.arrival_worker)
+        finally:
+            window.close()
+
+    def test_reopening_stale_arrival_tab_refreshes_immediately(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            window._arrival_auto_refreshed = True
+            window._arrival_snapshot = ArrivalSequenceSnapshot(
+                workbook=Path("SAN2_입고스케줄관리.xlsm"),
+                sheet_name="입차순번",
+                refreshed_at=datetime.now() - timedelta(minutes=11),
+                summary=ArrivalSummary((), (), ()),
+                entries=(),
+            )
+            with patch.object(window, "refresh_arrival_sequence") as refresh:
+                window.main_tabs.setCurrentIndex(0)
+
+            refresh.assert_called_once_with(automatic=True, silent=True)
         finally:
             window.close()
 
@@ -616,8 +669,36 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 self.assertEqual(aggregate.pallet_count, Decimal("3"))
                 self.assertEqual(aggregate.categories, {"고단": Decimal("3")})
+                self.assertEqual(window.truck_table.item(0, 2).text(), "3")
+                self.assertEqual(window.truck_table.item(1, 2).text(), "공유 3")
+                self.assertIn("다시 더하지 않습니다", window.truck_table.item(1, 2).toolTip())
             finally:
                 window.close()
+
+    def test_arrival_flags_truck_container_metadata_count_mismatch(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            window._populate_truck_products(
+                (
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_001",
+                        "16",
+                        "100",
+                        "501",
+                        "상품",
+                        "T30001",
+                        (("barcode:cbn-partial", "8"),),
+                    ),
+                )
+            )
+
+            aggregate = window._raw_booking_aggregates()["T30001"]
+
+            self.assertEqual(aggregate.pallet_count, Decimal("8"))
+            self.assertEqual(aggregate.missing_pallet_rows, 1)
+        finally:
+            window.close()
 
     def test_clicked_special_categories_survive_snapshot_restore_and_reach_all_arrival_sections(
         self,
@@ -867,6 +948,63 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertIn("현재 기준일의 앱 RAW 표에 같은 예약번호가 없습니다.", tooltip)
             self.assertIn("외 2대", tooltip)
             self.assertNotIn("T10008", tooltip)
+            self.assertIn("RAW 미매칭 8대", window.arrival_reconciliation_label.text())
+        finally:
+            window.close()
+
+    def test_floor_target_tooltip_reports_unassigned_physical_truck_pallets(self) -> None:
+        window = MainWindow(smoke_test=True)
+        try:
+            shared_container = (("barcode:cbn-shared", "3"),)
+            window._populate_truck_products(
+                (
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_SHARED",
+                        "3",
+                        "30",
+                        "501",
+                        "상품 A",
+                        "T30001",
+                        shared_container,
+                    ),
+                    MilkrunProductRow(
+                        "트럭 거래처",
+                        "PALLET_SHARED",
+                        "3",
+                        "60",
+                        "502",
+                        "상품 B",
+                        "T30001",
+                        shared_container,
+                    ),
+                )
+            )
+            snapshot = ArrivalSequenceSnapshot(
+                workbook=Path("sample.xlsm"),
+                sheet_name="입차순번",
+                refreshed_at=datetime(2026, 8, 10, 1, 2, 3),
+                summary=ArrivalSummary(
+                    departure=(("0", "0", "0"),) * 3,
+                    outside_waiting=(("0", "0", "0"),) * 3,
+                    floor_targets=(("0", "0"),) * 3,
+                ),
+                entries=(),
+                floor_assignments=(),
+            )
+
+            window._render_arrival_sequence(snapshot)
+
+            tooltip = window.arrival_detail_tables["floor_targets"]["first"].item(
+                0, 1
+            ).toolTip()
+            self.assertIn("층 미매핑 1대 · 제외 3 Pallet", tooltip)
+            self.assertIn("T30001", tooltip)
+            self.assertNotIn("제외 6 Pallet", tooltip)
+            self.assertIn(
+                "층 미매핑 1대 · 제외 3 Pallet",
+                window.arrival_reconciliation_label.text(),
+            )
         finally:
             window.close()
 
@@ -997,6 +1135,10 @@ class MainWindowSmokeTests(unittest.TestCase):
             self.assertEqual(window.truck_table.horizontalHeaderItem(1).text(), "예약번호")
             self.assertEqual(window.truck_table.horizontalHeaderItem(3).text(), "유닛 수")
             self.assertEqual(window.truck_table.horizontalHeaderItem(4).text(), "팔렛트당 유닛")
+            self.assertIn(
+                "숫자로 시작하는 값만 합산",
+                window.truck_table.horizontalHeaderItem(2).toolTip(),
+            )
 
             milkrun = MilkrunProductRow(
                 "밀크런 거래처", "10813478", "1", "2", "100", "밀크런 상품", "M1"
@@ -1156,6 +1298,87 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(window.raw_table.rowSpan(0, 0), 1)
                 self.assertEqual(window.raw_table.rowSpan(0, 1), 1)
                 self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
+            finally:
+                window.close()
+
+    def test_real_multi_sku_milkrun_high_counts_despite_unknown_unit_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory_path = Path(temp) / "memory.json"
+            window = MainWindow(smoke_test=True, product_memory_file=memory_path)
+            sku_ids = (
+                "30761003",
+                "25497067",
+                "11415146",
+                "25610642",
+                "26717387",
+                "26717390",
+                "26748336",
+                "29016235",
+                "43755718",
+                "43755721",
+                "44916551",
+            )
+            box_counts = ("360", "100", "144", "324", "180", "264", "540", "168", "288", "144", "120")
+            products = tuple(
+                MilkrunProductRow(
+                    "유한킴벌리 주식회사",
+                    "10838262",
+                    "8",
+                    box_count,
+                    sku_id,
+                    f"상품 {sku_id}",
+                    "M3373803",
+                )
+                for sku_id, box_count in zip(sku_ids, box_counts)
+            )
+            try:
+                window._populate_milkrun_products(products)
+                ProductMemory(memory_path).set_manual_category(
+                    "30761003",
+                    "고단",
+                    "New 크리넥스 마이비데 클린케어",
+                )
+                window._refresh_current_product_memory()
+
+                self.assertTrue(
+                    all(window.raw_table.item(row, 4).text() == "?" for row in range(11))
+                )
+                self.assertEqual(window.raw_table.rowSpan(0, 0), 11)
+                self.assertEqual(window.raw_table.rowSpan(0, 1), 11)
+                self.assertEqual(window.raw_table.rowSpan(0, 2), 11)
+                self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
+                aggregate = window._raw_booking_aggregates()["M3373803"]
+                self.assertEqual(aggregate.pallet_count, Decimal("8"))
+                self.assertEqual(aggregate.categories, {"고단": Decimal("8")})
+
+                snapshot = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 10, 1, 2, 3),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "M3373803", "milkrun", "2F", "Raw_밀크런", 2
+                        ),
+                    ),
+                )
+                window._render_arrival_sequence(snapshot)
+                second = window.arrival_detail_tables["floor_targets"]["second"]
+                self.assertEqual(second.item(0, 1).text(), "8 Pallet")
+                self.assertEqual(second.item(3, 1).text(), "8 Pallet")
+                self.assertIn(
+                    "앱 RAW 고단 1대/8 Pallet",
+                    window.arrival_reconciliation_label.text(),
+                )
+                self.assertIn(
+                    "M3373803 8P",
+                    window.arrival_reconciliation_label.toolTip(),
+                )
             finally:
                 window.close()
 

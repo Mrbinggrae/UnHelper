@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
+import zipfile
+import zlib
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
+
+from openpyxl import Workbook, load_workbook
 
 from Modules.Excel.ArrivalSequenceReader import (
     ArrivalSequenceEntry,
+    ArrivalSequenceError,
     ArrivalSequenceReader,
     ArrivalSequenceSnapshot,
     ArrivalSummary,
@@ -19,190 +27,7 @@ from Modules.Excel.ArrivalSequenceReader import (
     normalize_raw_sheet_booking,
     normalize_sequence_booking,
 )
-
-
-class FakePythonCom:
-    def __init__(self, running_table=None) -> None:
-        self.initialized = 0
-        self.uninitialized = 0
-        self.running_table = running_table
-
-    def CoInitialize(self) -> None:
-        self.initialized += 1
-
-    def CoUninitialize(self) -> None:
-        self.uninitialized += 1
-
-    def GetRunningObjectTable(self):
-        if self.running_table is None:
-            raise RuntimeError("no running table")
-        return self.running_table
-
-    @staticmethod
-    def CreateBindCtx(_reserved):
-        return object()
-
-
-class FakeMoniker:
-    def __init__(self, display_name: str, running_object) -> None:
-        self.display_name = display_name
-        self.running_object = running_object
-
-    def GetDisplayName(self, _bind_context, _left_moniker) -> str:
-        return self.display_name
-
-
-class FakeMonikerEnumerator:
-    def __init__(self, monikers) -> None:
-        self.monikers = list(monikers)
-
-    def Next(self, _count):
-        return (self.monikers.pop(0),) if self.monikers else ()
-
-
-class FakeRunningObjectTable:
-    def __init__(self, monikers) -> None:
-        self.monikers = list(monikers)
-
-    def EnumRunning(self):
-        return FakeMonikerEnumerator(self.monikers)
-
-    @staticmethod
-    def GetObject(moniker):
-        return moniker.running_object
-
-
-class FakeEnd:
-    def __init__(self, row: int) -> None:
-        self.Row = row
-
-
-class FakeCell:
-    def __init__(self, row: int) -> None:
-        self.row = row
-
-    def End(self, _direction: int) -> FakeEnd:
-        return FakeEnd(self.row)
-
-
-class FakeCells:
-    def __init__(self, last_row: int) -> None:
-        self.last_row = last_row
-
-    def __call__(self, _row: int, _column: int) -> FakeCell:
-        return FakeCell(self.last_row)
-
-
-class FakeRows:
-    Count = 1048576
-
-
-class FakeRange:
-    def __init__(self, values) -> None:
-        self.Value2 = values
-
-
-class FakeSheet:
-    def __init__(self, summary_values, detail_values, *, last_row: int) -> None:
-        self.Rows = FakeRows()
-        self.Cells = FakeCells(last_row)
-        self.summary_values = summary_values
-        self.detail_values = detail_values
-        self.ranges: list[str] = []
-
-    def Range(self, address: str) -> FakeRange:
-        self.ranges.append(address)
-        if address == "AK8:AT11":
-            return FakeRange(self.summary_values)
-        return FakeRange(self.detail_values)
-
-
-class FakeWorksheets:
-    def __init__(self, sheet: FakeSheet) -> None:
-        truck_values = (("1F", 456),)
-        milkrun_values = (("2F", 123),)
-        self.sheets = {
-            "입차순번": sheet,
-            "Raw_트럭": FakeFloorSheet(truck_values),
-            "Raw_밀크런": FakeFloorSheet(milkrun_values),
-        }
-
-    def __call__(self, key):
-        try:
-            return self.sheets[key]
-        except KeyError as exc:
-            raise RuntimeError("sheet not found") from exc
-
-
-class FakeFloorSheet:
-    def __init__(self, values) -> None:
-        self.Rows = FakeRows()
-        self.Cells = FakeCells(len(values) + 1)
-        self.values = values
-
-    def Range(self, _address: str) -> FakeRange:
-        return FakeRange(self.values)
-
-
-class FakeWorkbook:
-    def __init__(self, path: Path, sheet: FakeSheet, *, read_only: bool = False) -> None:
-        self.FullName = str(path)
-        self.Worksheets = FakeWorksheets(sheet)
-        self.close_calls: list[bool] = []
-        self.ReadOnly = read_only
-        self.Saved = True
-        self.Application = None
-
-    def Close(self, SaveChanges=False) -> None:
-        self.close_calls.append(SaveChanges)
-
-
-class FakeWorkbooks:
-    def __init__(self, open_books=(), open_result=None) -> None:
-        self.open_books = list(open_books)
-        self.open_result = open_result
-        self.open_calls = []
-
-    def __iter__(self):
-        return iter(self.open_books)
-
-    def Open(self, path, **kwargs):
-        self.open_calls.append((path, kwargs))
-        return self.open_result
-
-
-class FakeExcel:
-    def __init__(self, workbooks: FakeWorkbooks) -> None:
-        self.Workbooks = workbooks
-        self.Ready = True
-        self.Visible = True
-        self.DisplayAlerts = True
-        self.AutomationSecurity = 1
-        self.quit_count = 0
-
-    def Quit(self) -> None:
-        self.quit_count += 1
-
-
-class FakeComClient:
-    def __init__(self, *, active=None, dispatched=None) -> None:
-        self.active = active
-        self.dispatched = dispatched
-        self.dispatch_count = 0
-        self.wrap_count = 0
-
-    def GetActiveObject(self, _progid):
-        if self.active is None:
-            raise RuntimeError("no active Excel")
-        return self.active
-
-    def DispatchEx(self, _progid):
-        self.dispatch_count += 1
-        return self.dispatched
-
-    def Dispatch(self, running_object):
-        self.wrap_count += 1
-        return running_object
+from Modules.Excel.MilkrunExcelImporter import ExcelImportCancelled, ExcelImportError
 
 
 class ArrivalSequenceReaderTests(unittest.TestCase):
@@ -227,6 +52,36 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
         second[14] = 8
         return (tuple(first), tuple(second))
 
+    @classmethod
+    def create_workbook(
+        cls,
+        path: Path,
+        *,
+        include_sequence: bool = True,
+        include_truck_floor: bool = True,
+        include_milkrun_floor: bool = True,
+    ) -> None:
+        workbook = Workbook()
+        sequence = workbook.active
+        sequence.title = "입차순번" if include_sequence else "기타"
+        if include_sequence:
+            for row_offset, row in enumerate(cls.summary_values(), start=8):
+                for column_offset, value in enumerate(row, start=37):
+                    sequence.cell(row=row_offset, column=column_offset, value=value)
+            for row_offset, row in enumerate(cls.detail_values(), start=18):
+                for column_offset, value in enumerate(row, start=28):
+                    sequence.cell(row=row_offset, column=column_offset, value=value)
+        if include_truck_floor:
+            truck = workbook.create_sheet("Raw_트럭")
+            truck["B2"] = "1F"
+            truck["C2"] = 456
+        if include_milkrun_floor:
+            milkrun = workbook.create_sheet("Raw_밀크런")
+            milkrun["B2"] = "2F"
+            milkrun["C2"] = 123
+        workbook.save(path)
+        workbook.close()
+
     def test_normalizes_sequence_reservation_prefixes(self) -> None:
         self.assertEqual(normalize_sequence_booking("MBN123"), ("M123", "milkrun"))
         self.assertEqual(normalize_sequence_booking(" mbn000123 "), ("M123", "milkrun"))
@@ -237,126 +92,289 @@ class ArrivalSequenceReaderTests(unittest.TestCase):
         self.assertEqual(normalize_raw_sheet_booking("00123", prefix="T"), "T123")
         self.assertEqual(normalize_raw_sheet_booking("T123", prefix="T"), "T123")
 
-    def test_reads_live_open_workbook_without_closing_it(self) -> None:
+    def test_reads_xlsm_memory_snapshot_with_loader_options_and_source_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
-            path.touch()
-            sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
-            workbook = FakeWorkbook(path.resolve(), sheet)
-            excel = FakeExcel(FakeWorkbooks(open_books=[workbook]))
-            pythoncom = FakePythonCom()
+            self.create_workbook(path)
+            expected_modified = 1_700_000_000
+            os.utime(path, (expected_modified, expected_modified))
+            loader_calls: list[tuple[object, dict[str, object]]] = []
+            loaded_snapshot_streams: list[object] = []
+
+            def loader(snapshot_stream, **kwargs):
+                self.assertTrue(snapshot_stream.readable())
+                self.assertEqual(snapshot_stream.tell(), 0)
+                loader_calls.append((snapshot_stream, kwargs))
+                loaded_snapshot_streams.append(snapshot_stream)
+                return load_workbook(snapshot_stream, **kwargs)
+
             reader = ArrivalSequenceReader(
-                com_client=FakeComClient(active=excel),
-                pythoncom_module=pythoncom,
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
             )
 
             result = reader.read(path)
 
             self.assertEqual(result.summary.floor_targets[2], ("100", "200"))
             self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+            self.assertEqual(result.entries[0].excel_row, 18)
+            self.assertEqual(result.entries[0].unloading_floor, "1F")
             self.assertEqual(
                 [(entry.booking_key, entry.floor) for entry in result.floor_assignments],
                 [("T456", "1F"), ("M123", "2F")],
             )
-            self.assertEqual(workbook.close_calls, [])
-            self.assertEqual(excel.quit_count, 0)
-            self.assertEqual(pythoncom.initialized, 1)
-            self.assertEqual(pythoncom.uninitialized, 1)
+            self.assertEqual(result.workbook, path.resolve())
+            self.assertEqual(
+                result.source_modified_at,
+                datetime.fromtimestamp(path.stat().st_mtime),
+            )
+            self.assertEqual(len(loader_calls), 1)
+            self.assertEqual(
+                loader_calls[0][1],
+                {
+                    "read_only": True,
+                    "data_only": True,
+                    "keep_vba": False,
+                    "keep_links": False,
+                },
+            )
+            self.assertTrue(loaded_snapshot_streams[0].closed)
 
-    def test_opens_closed_workbook_read_only_and_closes_owned_excel(self) -> None:
+    def test_reads_saved_values_while_source_file_is_already_open(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
-            path.touch()
-            sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
-            workbook = FakeWorkbook(path.resolve(), sheet)
-            excel = FakeExcel(FakeWorkbooks(open_result=workbook))
-            reader = ArrivalSequenceReader(
-                com_client=FakeComClient(dispatched=excel),
-                pythoncom_module=FakePythonCom(),
-            )
+            self.create_workbook(path)
 
-            reader.read(path)
+            with path.open("rb") as existing_read_handle:
+                result = ArrivalSequenceReader(sleep=lambda _delay: None).read(path)
+                self.assertFalse(existing_read_handle.closed)
 
-            self.assertEqual(excel.Workbooks.open_calls[0][1]["ReadOnly"], True)
-            self.assertEqual(workbook.close_calls, [False])
-            self.assertEqual(excel.quit_count, 1)
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
 
-    def test_rot_reads_live_workbook_in_another_excel_instance_on_every_refresh(self) -> None:
+    def test_first_bad_zip_file_is_retried_and_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            path = (Path(temp) / "SAN2_입고스케줄관리.xlsm").resolve()
-            path.touch()
-            live_sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
-            live_workbook = FakeWorkbook(path, live_sheet)
-            live_excel = FakeExcel(FakeWorkbooks(open_books=[live_workbook]))
-            live_workbook.Application = live_excel
-            stale_workbook = FakeWorkbook(path, live_sheet, read_only=True)
-            stale_excel = FakeExcel(FakeWorkbooks(open_books=[stale_workbook]))
-            stale_excel.Visible = False
-            stale_workbook.Application = stale_excel
-            pythoncom = FakePythonCom(
-                FakeRunningObjectTable(
-                    (
-                        FakeMoniker(str(path), stale_workbook),
-                        FakeMoniker(str(path), live_workbook),
-                    )
-                )
-            )
-            wrong_excel = FakeExcel(FakeWorkbooks())
-            com_client = FakeComClient(active=wrong_excel)
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            loader_calls = 0
+            sleeps: list[float] = []
+            logs: list[str] = []
+
+            def loader(snapshot_path, **kwargs):
+                nonlocal loader_calls
+                loader_calls += 1
+                if loader_calls == 1:
+                    raise zipfile.BadZipFile("OneDrive is replacing the package")
+                return load_workbook(snapshot_path, **kwargs)
+
             reader = ArrivalSequenceReader(
-                com_client=com_client,
-                pythoncom_module=pythoncom,
-            )
-
-            first = reader.read(path)
-            changed = list(list(row) for row in self.summary_values())
-            changed[2][4] = 777
-            live_sheet.summary_values = tuple(tuple(row) for row in changed)
-            second = reader.read(path)
-
-            self.assertEqual(first.summary.floor_targets[1][0], "30")
-            self.assertEqual(second.summary.floor_targets[1][0], "777")
-            self.assertEqual(com_client.dispatch_count, 0)
-            self.assertEqual(com_client.wrap_count, 4)
-            self.assertEqual(live_workbook.close_calls, [])
-            self.assertEqual(live_excel.quit_count, 0)
-            self.assertTrue(live_workbook.Saved)
-            self.assertEqual(stale_workbook.close_calls, [])
-            self.assertEqual(stale_excel.quit_count, 0)
-
-    def test_hidden_readonly_rot_snapshot_is_ignored_for_a_fresh_read(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = (Path(temp) / "SAN2_입고스케줄관리.xlsm").resolve()
-            path.touch()
-            stale_sheet = FakeSheet(self.summary_values(), self.detail_values(), last_row=19)
-            stale_workbook = FakeWorkbook(path, stale_sheet, read_only=True)
-            stale_excel = FakeExcel(FakeWorkbooks(open_books=[stale_workbook]))
-            stale_excel.Visible = False
-            stale_workbook.Application = stale_excel
-
-            fresh_values = list(list(row) for row in self.summary_values())
-            fresh_values[2][4] = 888
-            fresh_sheet = FakeSheet(
-                tuple(tuple(row) for row in fresh_values),
-                self.detail_values(),
-                last_row=19,
-            )
-            fresh_workbook = FakeWorkbook(path, fresh_sheet, read_only=True)
-            fresh_excel = FakeExcel(FakeWorkbooks(open_result=fresh_workbook))
-            fresh_workbook.Application = fresh_excel
-            moniker = FakeMoniker(str(path), stale_workbook)
-            reader = ArrivalSequenceReader(
-                com_client=FakeComClient(active=stale_excel, dispatched=fresh_excel),
-                pythoncom_module=FakePythonCom(FakeRunningObjectTable([moniker])),
+                log=logs.append,
+                workbook_loader=loader,
+                sleep=sleeps.append,
             )
 
             result = reader.read(path)
 
-            self.assertEqual(result.summary.floor_targets[1][0], "888")
-            self.assertEqual(stale_workbook.close_calls, [])
-            self.assertEqual(stale_excel.quit_count, 0)
-            self.assertEqual(fresh_workbook.close_calls, [False])
-            self.assertEqual(fresh_excel.quit_count, 1)
+            self.assertEqual(loader_calls, 2)
+            self.assertEqual(sleeps, [ArrivalSequenceReader._SNAPSHOT_RETRY_BASE_DELAY_SECONDS])
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+            self.assertTrue(any("다시 읽습니다" in message for message in logs))
+
+    def test_source_change_during_capture_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            sleeps: list[float] = []
+            reader = ArrivalSequenceReader(sleep=sleeps.append)
+            original_signature = reader._source_signature
+            signature_calls = 0
+
+            def unstable_first_capture(stat_result):
+                nonlocal signature_calls
+                signature_calls += 1
+                signature = original_signature(stat_result)
+                if signature_calls == 4:
+                    return (*signature[:-1], signature[-1] + 1)
+                return signature
+
+            with mock.patch.object(
+                reader,
+                "_source_signature",
+                side_effect=unstable_first_capture,
+            ):
+                result = reader.read(path)
+
+            self.assertEqual(signature_calls, 8)
+            self.assertEqual(sleeps, [reader._SNAPSHOT_RETRY_BASE_DELAY_SECONDS])
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+
+    def test_large_snapshot_rolls_from_memory_to_system_temp_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            rolled: list[bool] = []
+
+            def loader(snapshot_stream, **kwargs):
+                rolled.append(bool(getattr(snapshot_stream, "_rolled", False)))
+                return load_workbook(snapshot_stream, **kwargs)
+
+            reader = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
+            )
+            reader._SNAPSHOT_MEMORY_LIMIT_BYTES = 1
+
+            reader.read(path)
+
+            self.assertEqual(rolled, [True])
+
+    def test_retry_exhaustion_returns_sync_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            loader = mock.Mock(side_effect=zipfile.BadZipFile("still syncing"))
+            sleeps: list[float] = []
+            reader = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=sleeps.append,
+            )
+            reader._SNAPSHOT_MAX_ATTEMPTS = 2
+
+            with self.assertRaisesRegex(ArrivalSequenceError, "동기화된 Excel 저장본"):
+                reader.read(path)
+
+            self.assertEqual(loader.call_count, 2)
+            self.assertEqual(sleeps, [reader._SNAPSHOT_RETRY_BASE_DELAY_SECONDS])
+
+    def test_openpyxl_wrapped_xml_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            loader_calls = 0
+
+            def loader(snapshot_stream, **kwargs):
+                nonlocal loader_calls
+                loader_calls += 1
+                if loader_calls == 1:
+                    raise ValueError("Unable to read workbook: invalid XML")
+                return load_workbook(snapshot_stream, **kwargs)
+
+            result = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
+            ).read(path)
+
+            self.assertEqual(loader_calls, 2)
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+
+    def test_zip_compression_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            loader_calls = 0
+
+            def loader(snapshot_stream, **kwargs):
+                nonlocal loader_calls
+                loader_calls += 1
+                if loader_calls == 1:
+                    raise zlib.error("incomplete compressed stream")
+                return load_workbook(snapshot_stream, **kwargs)
+
+            result = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
+            ).read(path)
+
+            self.assertEqual(loader_calls, 2)
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+
+    def test_permanent_permission_error_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            sleeps: list[float] = []
+            reader = ArrivalSequenceReader(sleep=sleeps.append)
+
+            with (
+                mock.patch.object(
+                    reader,
+                    "_copy_stable_snapshot",
+                    side_effect=PermissionError(13, "access denied"),
+                ),
+                self.assertRaisesRegex(ArrivalSequenceError, "파일 권한"),
+            ):
+                reader.read(path)
+
+            self.assertEqual(sleeps, [])
+
+    def test_missing_required_sheet_fails_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path, include_milkrun_floor=False)
+            loader_calls = 0
+            sleeps: list[float] = []
+
+            def loader(snapshot_path, **kwargs):
+                nonlocal loader_calls
+                loader_calls += 1
+                return load_workbook(snapshot_path, **kwargs)
+
+            reader = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=sleeps.append,
+            )
+
+            with self.assertRaisesRegex(ArrivalSequenceError, "Raw_밀크런"):
+                reader.read(path)
+
+            self.assertEqual(loader_calls, 1)
+            self.assertEqual(sleeps, [])
+
+    def test_all_empty_summary_values_are_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            workbook = load_workbook(path)
+            sequence = workbook["입차순번"]
+            for row in range(8, 12):
+                for column in range(37, 47):
+                    sequence.cell(row=row, column=column).value = None
+            workbook.save(path)
+            workbook.close()
+
+            result = ArrivalSequenceReader(sleep=lambda _delay: None).read(path)
+
+            self.assertEqual(result.summary.departure[0], ("", "", ""))
+            self.assertEqual([entry.booking_key for entry in result.entries], ["M123", "T456"])
+
+    def test_xlsb_is_rejected_before_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsb"
+            path.write_bytes(b"not an OOXML package")
+            loader = mock.Mock()
+            reader = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
+            )
+
+            with self.assertRaisesRegex(ExcelImportError, "지원하지 않는 Excel 파일 형식"):
+                reader.read(path)
+
+            loader.assert_not_called()
+
+    def test_cancelled_read_stops_before_snapshot_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "SAN2_입고스케줄관리.xlsm"
+            self.create_workbook(path)
+            loader = mock.Mock()
+            reader = ArrivalSequenceReader(
+                workbook_loader=loader,
+                sleep=lambda _delay: None,
+            )
+
+            with self.assertRaisesRegex(ExcelImportCancelled, "새로고침을 중지"):
+                reader.read(path, cancel_requested=lambda: True)
+
+            loader.assert_not_called()
 
     def test_current_raw_wins_and_previous_ap_aw_is_counted_once(self) -> None:
         snapshot = ArrivalSequenceSnapshot(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -649,7 +649,8 @@ class SettingsDialog(QDialog):
 
         excel_help = QLabel(
             "Milkrun은 Raw_밀크런!C1:P1000, 트럭은 Raw_트럭!C1:U1000의 "
-            "값만 지운 뒤 각각 C1부터 값으로 붙여넣습니다."
+            "값만 지운 뒤 각각 C1부터 값으로 붙여넣습니다. "
+            "입차순번의 경량 읽기·자동 갱신은 .xlsx와 .xlsm에서 지원합니다."
         )
         excel_help.setWordWrap(True)
         excel_help.setObjectName("HelpText")
@@ -856,6 +857,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     WEIGHT_RETRY_CHECKPOINTS_KEY = "weight_retry_checkpoints_v1"
     MAX_WEIGHT_RETRY_CHECKPOINTS = 8
+    ARRIVAL_AUTO_REFRESH_INTERVAL_MS = 10 * 60 * 1000
     DETAIL_UNAVAILABLE_TOOLTIP = (
         "일별 입고 상세를 확인하지 못해 다운로드 원본의 예약 합계만 표시합니다. "
         "SKU 무게와 분류는 확인할 수 없습니다. 데이터 얻기를 다시 누르면 "
@@ -880,6 +882,7 @@ class MainWindow(QMainWindow):
         self.arrival_worker: ArrivalSequenceWorker | None = None
         self._arrival_snapshot: ArrivalSequenceSnapshot | None = None
         self._arrival_auto_refreshed = False
+        self._arrival_refresh_silent = False
         self._arrival_category_memory_warning = ""
         self.product_memory_file = (
             Path(product_memory_file) if product_memory_file else product_memory_path()
@@ -923,6 +926,14 @@ class MainWindow(QMainWindow):
         self.resize(1400, 820)
         self.setMinimumSize(1024, 650)
         self._build_ui()
+        self._arrival_auto_refresh_timer = QTimer(self)
+        self._arrival_auto_refresh_timer.setInterval(
+            self.ARRIVAL_AUTO_REFRESH_INTERVAL_MS
+        )
+        self._arrival_auto_refresh_timer.timeout.connect(
+            self._on_arrival_auto_refresh_timeout
+        )
+        self._arrival_auto_refresh_timer.start()
         if self._snapshot_restore_enabled:
             self._restore_snapshot_for_selected_date(announce=True, clear_if_missing=False)
         if not smoke_test:
@@ -1095,7 +1106,9 @@ class MainWindow(QMainWindow):
         heading_column.setSpacing(2)
         title = QLabel("입차순번 현황")
         title.setObjectName("SectionTitle")
-        self.arrival_file_label = QLabel("연결된 Excel의 입차순번 시트를 읽습니다.")
+        self.arrival_file_label = QLabel(
+            "연결된 Excel의 마지막 저장·동기화 값을 읽습니다."
+        )
         self.arrival_file_label.setObjectName("SectionDescription")
         heading_column.addWidget(title)
         heading_column.addWidget(self.arrival_file_label)
@@ -1107,11 +1120,23 @@ class MainWindow(QMainWindow):
         self.arrival_refresh_button = QPushButton("새로고침")
         self.arrival_refresh_button.setObjectName("PrimaryButton")
         self.arrival_refresh_button.setToolTip(
-            "연결된 Excel이 열려 있으면 현재 값을 읽고, 닫혀 있으면 읽기 전용으로 엽니다."
+            "Excel을 실행하지 않고 동기화된 .xlsx/.xlsm 저장본을 읽습니다. "
+            "입차순번 탭에서는 10분마다 자동 갱신하며 이 버튼으로 즉시 갱신할 수 있습니다."
         )
         self.arrival_refresh_button.clicked.connect(self.refresh_arrival_sequence)
         header.addWidget(self.arrival_refresh_button)
         outer.addLayout(header)
+
+        self.arrival_reconciliation_label = QLabel(
+            "집계 기준 · 트럭의 같은 CBN은 여러 SKU 행에 있어도 물리 팔렛트로 한 번만 합산합니다."
+        )
+        self.arrival_reconciliation_label.setObjectName("MutedText")
+        self.arrival_reconciliation_label.setWordWrap(True)
+        self.arrival_reconciliation_label.setToolTip(
+            "앱 RAW 표와 Raw_트럭·Raw_밀크런 B:C의 층 배정이 일치한 차량만 "
+            "각층 목표치 팔렛트에 반영됩니다."
+        )
+        outer.addWidget(self.arrival_reconciliation_label)
 
         cards = QHBoxLayout()
         cards.setSpacing(12)
@@ -1267,15 +1292,29 @@ class MainWindow(QMainWindow):
         return card
 
     def _on_main_tab_changed(self, index: int) -> None:
-        if index != 0 or self._arrival_auto_refreshed:
+        if index != 0:
             return
-        self.refresh_arrival_sequence(automatic=True)
+        if self._arrival_auto_refreshed and not self._arrival_refresh_is_due():
+            return
+        self.refresh_arrival_sequence(automatic=True, silent=True)
+
+    def _arrival_refresh_is_due(self) -> bool:
+        if self._arrival_snapshot is None:
+            return not self._arrival_auto_refreshed
+        elapsed = datetime.now() - self._arrival_snapshot.refreshed_at
+        return elapsed >= timedelta(milliseconds=self.ARRIVAL_AUTO_REFRESH_INTERVAL_MS)
+
+    def _on_arrival_auto_refresh_timeout(self) -> None:
+        if self.main_tabs.currentIndex() != 0:
+            return
+        self.refresh_arrival_sequence(automatic=True, silent=True)
 
     def refresh_arrival_sequence(
         self,
         _checked: bool = False,
         *,
         automatic: bool = False,
+        silent: bool = False,
     ) -> None:
         if self._automation_worker_running():
             if not automatic:
@@ -1286,37 +1325,44 @@ class MainWindow(QMainWindow):
                 )
             return
         if not any(self._products_by_booking.values()):
-            QMessageBox.information(
-                self,
-                "RAW 데이터 필요",
-                "입차순번 현황을 계산할 RAW 데이터가 없습니다.\n\n"
-                "먼저 RAW 탭에서 Milkrun 또는 트럭의 '데이터 얻기'를 실행하거나 "
-                "저장된 표를 가져온 뒤 다시 새로고침해 주세요.",
-            )
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "RAW 데이터 필요",
+                    "입차순번 현황을 계산할 RAW 데이터가 없습니다.\n\n"
+                    "먼저 RAW 탭에서 Milkrun 또는 트럭의 '데이터 얻기'를 실행하거나 "
+                    "저장된 표를 가져온 뒤 다시 새로고침해 주세요.",
+                )
             return
 
         configured_workbook = str(
             self.settings.value("milkrun_excel_path", "")
         ).strip()
         if not configured_workbook:
-            QMessageBox.warning(
-                self,
-                "Excel 파일 연결 필요",
-                "먼저 설정에서 입고스케줄관리 Excel 파일을 연결해 주세요.",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Excel 파일 연결 필요",
+                    "먼저 설정에서 입고스케줄관리 Excel 파일을 연결해 주세요.",
+                )
             return
         try:
             workbook_path = ArrivalSequenceReader.validate_target_path(
                 configured_workbook
             )
         except ExcelImportError as exc:
-            QMessageBox.warning(self, "Excel 파일 확인", str(exc))
+            if not silent:
+                QMessageBox.warning(self, "Excel 파일 확인", str(exc))
             return
 
-        self.arrival_file_label.setText(f"연결된 Excel: {workbook_path.name}")
-        self.arrival_updated_label.setText("Excel 값을 읽는 중...")
-        self.append_log("연결된 Excel의 입차순번 시트를 새로고침합니다.")
+        self.arrival_file_label.setText(f"연결된 Excel 저장본: {workbook_path.name}")
+        self.arrival_updated_label.setText("동기화된 저장본을 읽는 중...")
+        self.append_log(
+            "Excel을 실행하지 않고 동기화된 저장본의 입차순번을 새로고침합니다."
+        )
         self.status_label.setText("입차순번 새로고침 중")
+        self._arrival_refresh_silent = silent
+        self._arrival_auto_refresh_timer.start()
         self.arrival_worker = ArrivalSequenceWorker(workbook_path)
         self.arrival_worker.log_updated.connect(self.append_log)
         self.arrival_worker.completed.connect(self._on_arrival_sequence_completed)
@@ -1437,6 +1483,7 @@ class MainWindow(QMainWindow):
 
                 if booking_type == "truck" and product.container_pallets:
                     valid_container = False
+                    row_container_total = Decimal("0")
                     truck_containers = state["truck_containers"]
                     for raw_identity, raw_count in product.container_pallets:
                         identity = normalize_product_name(raw_identity).casefold()
@@ -1451,6 +1498,7 @@ class MainWindow(QMainWindow):
                         except (InvalidOperation, TypeError, ValueError):
                             continue
                         valid_container = True
+                        row_container_total += container_pallets
                         container_state = truck_containers.get(identity)
                         if container_state is None:
                             truck_containers[identity] = {
@@ -1470,6 +1518,23 @@ class MainWindow(QMainWindow):
                         container_state["categories"].add(category)
                     if not valid_container:
                         state["missing"] += 1
+                    else:
+                        try:
+                            declared_pallets = Decimal(
+                                str(product.pallet_count).replace(",", "")
+                            )
+                            if (
+                                not declared_pallets.is_finite()
+                                or declared_pallets <= 0
+                                or declared_pallets != row_container_total
+                            ):
+                                raise ValueError("container pallet total mismatch")
+                        except (InvalidOperation, TypeError, ValueError):
+                            # Current scraper output and v2 snapshots require
+                            # these values to agree.  Keep the safer CBN-based
+                            # physical total, but never hide damaged/partial
+                            # metadata as an apparently exact target number.
+                            state["missing"] += 1
                     continue
 
                 try:
@@ -1567,9 +1632,16 @@ class MainWindow(QMainWindow):
     ) -> None:
         self._arrival_snapshot = snapshot
         self._arrival_auto_refreshed = True
+        self._arrival_auto_refresh_timer.start()
         self._render_arrival_sequence(snapshot)
         stamp = snapshot.refreshed_at.strftime("%Y-%m-%d %H:%M:%S")
-        self.arrival_updated_label.setText(f"마지막 새로고침 {stamp}")
+        if snapshot.source_modified_at is None:
+            self.arrival_updated_label.setText(f"마지막 새로고침 {stamp}")
+        else:
+            source_stamp = snapshot.source_modified_at.strftime("%Y-%m-%d %H:%M:%S")
+            self.arrival_updated_label.setText(
+                f"마지막 새로고침 {stamp} · 저장본 {source_stamp}"
+            )
         self.status_label.setText(f"입차순번 새로고침 완료 · 차량 {len(snapshot.entries)}대")
         self.append_log(f"입차순번 현황을 차량 {len(snapshot.entries)}대로 갱신했습니다.")
 
@@ -1679,7 +1751,7 @@ class MainWindow(QMainWindow):
         for row_index, breakdown in enumerate(floor_breakdowns):
             notes: list[str] = []
             if breakdown.missing_pallet_rows:
-                notes.append(f"팔렛트 수 미입력 {breakdown.missing_pallet_rows}행")
+                notes.append(f"팔렛트 수 확인 필요 {breakdown.missing_pallet_rows}행")
             if breakdown.unmapped_bookings:
                 notes.append(
                     booking_preview(
@@ -1690,12 +1762,102 @@ class MainWindow(QMainWindow):
                 )
             if row_index == 0 and breakdown.unassigned_raw_bookings:
                 missing_keys = breakdown.unassigned_raw_bookings
+                excluded_pallets = sum(
+                    (
+                        raw_bookings[booking_key].pallet_count
+                        for booking_key in missing_keys
+                        if booking_key in raw_bookings
+                    ),
+                    Decimal("0"),
+                )
                 preview = ", ".join(missing_keys[:10])
                 if len(missing_keys) > 10:
                     preview += f" 외 {len(missing_keys) - 10}건"
-                notes.append("층 미매핑 " + preview)
+                notes.append(
+                    f"층 미매핑 {len(missing_keys)}대 · 제외 "
+                    f"{self._format_decimal(excluded_pallets)} Pallet\n{preview}"
+                )
             floor_notes.append(" · ".join(notes))
         first_floor, second_floor = floor_breakdowns
+        raw_mismatch_keys = tuple(
+            dict.fromkeys(
+                booking_key
+                for breakdown in floor_breakdowns
+                for booking_key in breakdown.unmapped_bookings
+            )
+        )
+        floor_unmapped_keys = first_floor.unassigned_raw_bookings
+        excluded_pallets = sum(
+            (
+                raw_bookings[booking_key].pallet_count
+                for booking_key in floor_unmapped_keys
+                if booking_key in raw_bookings
+            ),
+            Decimal("0"),
+        )
+        special_category_bookings: dict[str, tuple[tuple[str, Decimal], ...]] = {}
+        for special_category in (HIGH_CATEGORY, GRAIN_CATEGORY):
+            special_category_bookings[special_category] = tuple(
+                (booking_key, aggregate.categories.get(special_category, Decimal("0")))
+                for booking_key, aggregate in raw_bookings.items()
+                if aggregate.categories.get(special_category, Decimal("0")) > 0
+            )
+        reconciliation_parts = [
+            "집계 기준 · 트럭의 같은 CBN은 여러 SKU 행에 있어도 물리 팔렛트로 한 번만 합산합니다."
+        ]
+        for special_category in (HIGH_CATEGORY, GRAIN_CATEGORY):
+            bookings = special_category_bookings[special_category]
+            total = sum((value for _booking_key, value in bookings), Decimal("0"))
+            reconciliation_parts.append(
+                f"앱 RAW {special_category} {len(bookings)}대/"
+                f"{self._format_decimal(total)} Pallet"
+            )
+        if raw_mismatch_keys:
+            reconciliation_parts.append(f"RAW 미매칭 {len(raw_mismatch_keys)}대")
+        if floor_unmapped_keys:
+            reconciliation_parts.append(
+                f"층 미매핑 {len(floor_unmapped_keys)}대 · 제외 "
+                f"{self._format_decimal(excluded_pallets)} Pallet"
+            )
+        self.arrival_reconciliation_label.setText("  |  ".join(reconciliation_parts))
+        reconciliation_tooltip = "\n\n".join(
+            note
+            for note in (
+                booking_preview(
+                    raw_mismatch_keys,
+                    label="RAW 미매칭",
+                    explanation="Excel 층 배정에는 있지만 현재 앱 RAW 표에 없어 제외됩니다.",
+                    limit=10,
+                ),
+                booking_preview(
+                    floor_unmapped_keys,
+                    label="층 미매핑",
+                    explanation=(
+                        f"앱 RAW에는 있지만 유효한 1F/2F 배정이 없어 "
+                        f"{self._format_decimal(excluded_pallets)} Pallet이 제외됩니다."
+                    ),
+                    limit=10,
+                ),
+                *(
+                    booking_preview(
+                        (
+                            f"{booking_key} {self._format_decimal(value)}P"
+                            for booking_key, value in special_category_bookings[special_category]
+                        ),
+                        label=f"앱 RAW {special_category} 포함",
+                        explanation="ProductMemory 또는 현재 SKU 분류를 반영했습니다.",
+                        limit=10,
+                    )
+                    for special_category in (HIGH_CATEGORY, GRAIN_CATEGORY)
+                    if special_category_bookings[special_category]
+                ),
+            )
+            if note
+        )
+        self.arrival_reconciliation_label.setToolTip(
+            reconciliation_tooltip
+            or "앱 RAW 표와 층 배정이 모두 일치했습니다. 트럭 공유 CBN은 한 번만 합산합니다."
+        )
         render_detail_tables(
             "floor_targets",
             first_floor,
@@ -1716,7 +1878,7 @@ class MainWindow(QMainWindow):
         self.arrival_updated_label.setText("새로고침 실패")
         self.status_label.setText("입차순번 새로고침 실패")
         self.append_log(f"[입차순번 오류] {details.summary}")
-        if not self._closing_after_cancel:
+        if not self._closing_after_cancel and not self._arrival_refresh_silent:
             self._show_error_dialog(
                 "입차순번 새로고침 실패",
                 details,
@@ -1733,6 +1895,7 @@ class MainWindow(QMainWindow):
         self.arrival_worker = None
         if worker is not None:
             worker.deleteLater()
+        self._arrival_refresh_silent = False
         self._set_automation_working(self._automation_worker_running())
         if self._closing_after_cancel and not self._automation_worker_running():
             QTimer.singleShot(0, self.close)
@@ -1771,7 +1934,8 @@ class MainWindow(QMainWindow):
         section_title.setObjectName("SectionTitle")
         section_description = QLabel(
             (
-                "선택한 기준일의 트럭 예약과 WMS 상품 무게를 예약번호 기준으로 정리합니다."
+                "선택한 기준일의 트럭 예약과 WMS 상품 무게를 예약번호 기준으로 정리합니다. "
+                "공유 CBN은 최초 SKU 행에 숫자, 이후 행에 '공유'로 표시합니다."
                 if is_truck
                 else "Shipments 예약 정보와 WMS 상품 무게를 선택한 기준일로 정리합니다."
             )
@@ -1841,6 +2005,16 @@ class MainWindow(QMainWindow):
                 ]
             )
         )
+        if is_truck:
+            table.horizontalHeaderItem(2).setToolTip(
+                "한 CBN이 여러 SKU를 담으면 최초 행에만 물리 팔렛트 숫자를 표시하고 "
+                "이후 행은 '공유'로 표시합니다. 숫자로 시작하는 값만 합산하면 차량별 "
+                "고유 CBN 물리 팔렛트와 일치하며, 입차순번도 같은 기준을 사용합니다."
+            )
+            table.horizontalHeaderItem(4).setToolTip(
+                "팔렛트 수 셀이 '공유'여도 이 값은 해당 SKU가 포함된 실제 PALLET 수를 "
+                "사용해 계산합니다. 공유 CBN 표시는 물리 팔렛트 총합의 중복만 막습니다."
+            )
         table.setWordWrap(False)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -2722,6 +2896,79 @@ class MainWindow(QMainWindow):
         return tuple(product for identity in group_order for product in grouped[identity])
 
     @classmethod
+    def _truck_physical_pallet_display(
+        cls,
+        products,
+    ) -> dict[int, tuple[str, str]]:
+        """Show each physical Truck container once across its SKU rows.
+
+        A PALLET container can contain more than one SKU.  The detail parser
+        intentionally keeps that container on every related SKU row, but
+        summing those row values would count the same CBN repeatedly.  The
+        first row keeps the numeric physical count and later rows say ``공유``.
+        """
+
+        counts: dict[tuple[str, str], Decimal] = {}
+        first_rows: dict[tuple[str, str], int] = {}
+        row_keys: dict[int, list[tuple[str, str]]] = {}
+        for row_index, product in enumerate(products):
+            booking_key = normalize_product_name(product.dispatch_number).upper()
+            if not booking_key:
+                booking_key = f"ROW:{row_index}"
+            seen_in_row: set[tuple[str, str]] = set()
+            for raw_identity, raw_count in getattr(product, "container_pallets", ()):
+                identity = normalize_product_name(raw_identity).casefold()
+                if not identity:
+                    continue
+                try:
+                    count = Decimal(str(raw_count).replace(",", ""))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if not count.is_finite() or count <= 0:
+                    continue
+                key = (booking_key, identity)
+                if key in seen_in_row:
+                    continue
+                seen_in_row.add(key)
+                row_keys.setdefault(row_index, []).append(key)
+                first_rows.setdefault(key, row_index)
+                previous = counts.get(key)
+                if previous is None or count > previous:
+                    counts[key] = count
+
+        def count_text(value: Decimal) -> str:
+            text = format(value, "f")
+            return text.rstrip("0").rstrip(".") if "." in text else text
+
+        result: dict[int, tuple[str, str]] = {}
+        for row_index, keys in row_keys.items():
+            owned_keys = [key for key in keys if first_rows[key] == row_index]
+            shared_keys = [key for key in keys if first_rows[key] != row_index]
+            owned_total = sum((counts[key] for key in owned_keys), Decimal("0"))
+            shared_total = sum((counts[key] for key in shared_keys), Decimal("0"))
+            if owned_keys:
+                display = count_text(owned_total)
+                explanation = f"이 행에서 처음 표시한 물리 팔렛트 {display}P"
+                if shared_keys:
+                    display += f" + 공유 {count_text(shared_total)}"
+                    explanation += (
+                        f" · 다른 SKU 행과 공유한 CBN {len(shared_keys)}개/"
+                        f"{count_text(shared_total)}P는 합계에서 제외"
+                    )
+            else:
+                display = f"공유 {count_text(shared_total)}"
+                explanation = (
+                    f"같은 차량의 다른 SKU 행에 이미 표시한 CBN {len(shared_keys)}개/"
+                    f"{count_text(shared_total)}P입니다. "
+                    "물리 팔렛트 합계에 다시 더하지 않습니다."
+                )
+            result[row_index] = (
+                display,
+                explanation + "\n입차순번도 차량 내 같은 CBN을 한 번만 합산합니다.",
+            )
+        return result
+
+    @classmethod
     def _truck_multi_sku_groups(cls, products) -> dict[str, tuple[int, ...]]:
         return cls._booking_multi_sku_groups(products, "truck")
 
@@ -2752,6 +2999,11 @@ class MainWindow(QMainWindow):
             for reservation_number, rows in multi_sku_groups.items()
             for row_index in rows
         }
+        truck_pallet_display = (
+            self._truck_physical_pallet_display(self.current_products)
+            if booking_type == "truck"
+            else {}
+        )
         for row_index, product in enumerate(self.current_products):
             detail_unavailable = bool(
                 getattr(product, "detail_unavailable", False)
@@ -2766,10 +3018,14 @@ class MainWindow(QMainWindow):
                     )
                 except (TypeError, ValueError):
                     boxes_per_pallet = "-"
+            pallet_display, pallet_tooltip = truck_pallet_display.get(
+                row_index,
+                (str(product.pallet_count), ""),
+            )
             values = (
                 product.vendor_name,
                 self._display_booking_number(product, booking_type),
-                product.pallet_count,
+                pallet_display,
                 product.box_count,
                 boxes_per_pallet,
                 product.sku_id,
@@ -2782,6 +3038,8 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column_index in (0, 6):
                     item.setToolTip(str(value))
+                elif column_index == 2 and pallet_tooltip:
+                    item.setToolTip(pallet_tooltip)
                 table.setItem(row_index, column_index, item)
             category_button = QPushButton("?")
             category_button.setObjectName("CategoryButton")
