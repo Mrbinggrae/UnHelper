@@ -4,7 +4,7 @@ import json
 import threading
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QSettings, QThread, QTimer, Qt, QUrl, Signal
@@ -1456,8 +1456,6 @@ class MainWindow(QMainWindow):
                         "categories": {},
                         "milkrun_groups": {},
                         "truck_containers": {},
-                        "has_high": False,
-                        "has_grain": False,
                         "missing": 0,
                     },
                 )
@@ -1476,11 +1474,6 @@ class MainWindow(QMainWindow):
                     category = button.text() if isinstance(button, QPushButton) else "?"
                 if category not in valid_categories:
                     category = "?"
-                if category == HIGH_CATEGORY:
-                    state["has_high"] = True
-                elif category == GRAIN_CATEGORY:
-                    state["has_grain"] = True
-
                 if booking_type == "truck" and product.container_pallets:
                     valid_container = False
                     row_container_total = Decimal("0")
@@ -1552,14 +1545,18 @@ class MainWindow(QMainWindow):
                     if group_state is None:
                         group_state = {
                             "pallets": pallets,
-                            "categories": set(),
+                            "sku_categories": {},
                         }
                         milkrun_groups[group_identity] = group_state
                     elif group_state["pallets"] != pallets:
                         # Rowspan-expanded Milkrun rows must share one pallet
                         # count. Count the group once and flag the conflict.
                         state["missing"] += 1
-                    group_state["categories"].add(category)
+                    sku_identity = sku_id or f"row:{row_index}"
+                    group_state["sku_categories"].setdefault(
+                        sku_identity,
+                        set(),
+                    ).add(category)
                     continue
 
                 state["pallets"] += pallets
@@ -1573,43 +1570,65 @@ class MainWindow(QMainWindow):
                 container_categories = container_state["categories"]
                 state["pallets"] += pallets
                 # A shared Truck PALLET can contain multiple SKU rows. Count
-                # that physical pallet once; if its ordinary SKU categories
-                # disagree, do not invent a split. Vehicle-wide high/grain is
-                # applied below after the exact total has been established.
-                category = (
-                    next(iter(container_categories))
-                    if len(container_categories) == 1
-                    else "?"
-                )
+                # that physical pallet once and apply special handling only to
+                # this physical container. High-stack wins if the same CBN
+                # contains both high-stack and grain SKUs; separate CBNs keep
+                # their own categories.
+                if HIGH_CATEGORY in container_categories:
+                    category = HIGH_CATEGORY
+                elif GRAIN_CATEGORY in container_categories:
+                    category = GRAIN_CATEGORY
+                else:
+                    category = (
+                        next(iter(container_categories))
+                        if len(container_categories) == 1
+                        else "?"
+                    )
                 categories[category] = categories.get(category, Decimal("0")) + pallets
             for group_state in state["milkrun_groups"].values():
                 pallets = group_state["pallets"]
-                group_categories = group_state["categories"]
+                sku_categories = group_state["sku_categories"]
                 state["pallets"] += pallets
-                special_category = None
-                if HIGH_CATEGORY in group_categories:
-                    special_category = HIGH_CATEGORY
-                elif GRAIN_CATEGORY in group_categories:
-                    special_category = GRAIN_CATEGORY
-                if special_category is not None:
-                    # Shared Milkrun pallets cannot be divided accurately per
-                    # SKU. High-stack and grain are handling flags; high-stack
-                    # takes precedence in the unlikely event both are present.
-                    categories[special_category] = (
-                        categories.get(special_category, Decimal("0")) + pallets
-                    )
+                if not sku_categories:
+                    categories["?"] = categories.get("?", Decimal("0")) + pallets
                     continue
-                category = next(iter(group_categories)) if len(group_categories) == 1 else "?"
-                categories[category] = categories.get(category, Decimal("0")) + pallets
 
-            # A booking key represents one physical vehicle.  Handling rules
-            # are vehicle-wide: if any SKU is high-stack, every pallet on that
-            # vehicle is high-stack; otherwise any grain SKU makes the whole
-            # vehicle grain.  High-stack wins in the unlikely mixed case.
-            if state["has_high"]:
-                state["categories"] = {HIGH_CATEGORY: state["pallets"]}
-            elif state["has_grain"]:
-                state["categories"] = {GRAIN_CATEGORY: state["pallets"]}
+                # Milkrun exposes one pallet total for the whole inner group,
+                # not a per-SKU pallet count. Split that total evenly across
+                # the unique SKUs and add each share to its displayed category.
+                # When all SKUs share one category, the full group total lands
+                # in that category without any approximation.
+                category_counts: dict[str, int] = {}
+                for candidate_categories in sku_categories.values():
+                    if HIGH_CATEGORY in candidate_categories:
+                        category = HIGH_CATEGORY
+                    elif GRAIN_CATEGORY in candidate_categories:
+                        category = GRAIN_CATEGORY
+                    else:
+                        category = (
+                            next(iter(candidate_categories))
+                            if len(candidate_categories) == 1
+                            else "?"
+                        )
+                    category_counts[category] = category_counts.get(category, 0) + 1
+
+                ordered_counts = [
+                    (category, category_counts[category])
+                    for category in ("경량", "중량", HIGH_CATEGORY, GRAIN_CATEGORY, "?")
+                    if category_counts.get(category, 0)
+                ]
+                remaining = pallets
+                sku_count = sum(count for _category, count in ordered_counts)
+                for index, (category, count) in enumerate(ordered_counts):
+                    allocation = (
+                        remaining
+                        if index == len(ordered_counts) - 1
+                        else (
+                            pallets * Decimal(count) / Decimal(sku_count)
+                        ).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+                    )
+                    categories[category] = categories.get(category, Decimal("0")) + allocation
+                    remaining -= allocation
 
         return {
             booking_key: RawBookingAggregate(
@@ -1667,7 +1686,7 @@ class MainWindow(QMainWindow):
         floor_breakdowns = build_floor_target_breakdowns(snapshot, raw_bookings)
 
         def pallet_value_text(value: Decimal) -> str:
-            return f"{self._format_decimal(value)} Pallet"
+            return f"{self._format_decimal(value, 3)} Pallet"
 
         def booking_preview(
             values,
@@ -1775,7 +1794,7 @@ class MainWindow(QMainWindow):
                     preview += f" 외 {len(missing_keys) - 10}건"
                 notes.append(
                     f"층 미매핑 {len(missing_keys)}대 · 제외 "
-                    f"{self._format_decimal(excluded_pallets)} Pallet\n{preview}"
+                    f"{self._format_decimal(excluded_pallets, 3)} Pallet\n{preview}"
                 )
             floor_notes.append(" · ".join(notes))
         first_floor, second_floor = floor_breakdowns
@@ -1803,21 +1822,23 @@ class MainWindow(QMainWindow):
                 if aggregate.categories.get(special_category, Decimal("0")) > 0
             )
         reconciliation_parts = [
-            "집계 기준 · 트럭의 같은 CBN은 여러 SKU 행에 있어도 물리 팔렛트로 한 번만 합산합니다."
+            "집계 기준 · 트럭의 같은 CBN은 여러 SKU 행에 있어도 물리 팔렛트로 "
+            "한 번만 합산하고, Milkrun 다중 SKU는 내부 Milkrun별 공유 팔렛트를 "
+            "SKU 수로 균등 배분합니다."
         ]
         for special_category in (HIGH_CATEGORY, GRAIN_CATEGORY):
             bookings = special_category_bookings[special_category]
             total = sum((value for _booking_key, value in bookings), Decimal("0"))
             reconciliation_parts.append(
                 f"앱 RAW {special_category} {len(bookings)}대/"
-                f"{self._format_decimal(total)} Pallet"
+                f"{self._format_decimal(total, 3)} Pallet"
             )
         if raw_mismatch_keys:
             reconciliation_parts.append(f"RAW 미매칭 {len(raw_mismatch_keys)}대")
         if floor_unmapped_keys:
             reconciliation_parts.append(
                 f"층 미매핑 {len(floor_unmapped_keys)}대 · 제외 "
-                f"{self._format_decimal(excluded_pallets)} Pallet"
+                f"{self._format_decimal(excluded_pallets, 3)} Pallet"
             )
         self.arrival_reconciliation_label.setText("  |  ".join(reconciliation_parts))
         reconciliation_tooltip = "\n\n".join(
@@ -1834,14 +1855,14 @@ class MainWindow(QMainWindow):
                     label="층 미매핑",
                     explanation=(
                         f"앱 RAW에는 있지만 유효한 1F/2F 배정이 없어 "
-                        f"{self._format_decimal(excluded_pallets)} Pallet이 제외됩니다."
+                        f"{self._format_decimal(excluded_pallets, 3)} Pallet이 제외됩니다."
                     ),
                     limit=10,
                 ),
                 *(
                     booking_preview(
                         (
-                            f"{booking_key} {self._format_decimal(value)}P"
+                            f"{booking_key} {self._format_decimal(value, 3)}P"
                             for booking_key, value in special_category_bookings[special_category]
                         ),
                         label=f"앱 RAW {special_category} 포함",

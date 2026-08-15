@@ -492,7 +492,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_arrival_counts_shared_milkrun_pallets_once_per_group(self) -> None:
+    def test_arrival_keeps_categories_separate_between_milkrun_groups(self) -> None:
         window = MainWindow(smoke_test=True)
         try:
             products = (
@@ -521,24 +521,27 @@ class MainWindowSmokeTests(unittest.TestCase):
             aggregate = window._raw_booking_aggregates()["M3370492"]
 
             self.assertEqual(aggregate.pallet_count, Decimal("20"))
-            self.assertEqual(aggregate.categories, {"고단": Decimal("20")})
+            self.assertEqual(
+                aggregate.categories,
+                {"중량": Decimal("4"), "고단": Decimal("16")},
+            )
         finally:
             window.close()
 
-    def test_arrival_prefers_high_when_shared_group_also_contains_grain(self) -> None:
+    def test_arrival_splits_shared_group_evenly_across_unique_sku_categories(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
             try:
                 products = (
                     MilkrunProductRow(
-                        "거래처", "10807763", "16", "320", "101", "상품 A", "M3370492"
+                        "거래처", "10807763", "15", "320", "101", "상품 A", "M3370492"
                     ),
                     MilkrunProductRow(
-                        "거래처", "10807763", "16", "160", "102", "상품 B", "M3370492"
+                        "거래처", "10807763", "15", "160", "102", "상품 B", "M3370492"
                     ),
                     MilkrunProductRow(
-                        "거래처", "10807763", "16", "80", "103", "상품 C", "M3370492"
+                        "거래처", "10807763", "15", "80", "103", "상품 C", "M3370492"
                     ),
                 )
                 window._populate_milkrun_products(products)
@@ -549,14 +552,92 @@ class MainWindowSmokeTests(unittest.TestCase):
 
                 aggregate = window._raw_booking_aggregates()["M3370492"]
 
-                self.assertEqual(aggregate.pallet_count, Decimal("16"))
-                self.assertEqual(aggregate.categories["고단"], Decimal("16"))
-                self.assertNotIn("양곡", aggregate.categories)
+                self.assertEqual(aggregate.pallet_count, Decimal("15"))
+                self.assertEqual(
+                    aggregate.categories,
+                    {
+                        "중량": Decimal("5"),
+                        "고단": Decimal("5"),
+                        "양곡": Decimal("5"),
+                    },
+                )
                 self.assertNotIn("?", aggregate.categories)
             finally:
                 window.close()
 
-    def test_arrival_uses_grain_when_shared_group_has_no_high(self) -> None:
+    def test_arrival_rounds_milkrun_unique_sku_shares_and_preserves_total(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                window._populate_milkrun_products(
+                    (
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "10", "40", "101", "고단 상품", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "10", "20", "101", "고단 상품", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "10", "30", "102", "중량 상품", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "10", "10", "103", "양곡 상품", "M30001"
+                        ),
+                    )
+                )
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("101", "고단", "고단 상품")
+                memory.set_manual_category("102", "중량", "중량 상품")
+                memory.set_manual_category("103", "양곡", "양곡 상품")
+
+                aggregate = window._raw_booking_aggregates()["M30001"]
+
+                self.assertEqual(aggregate.pallet_count, Decimal("10"))
+                self.assertEqual(
+                    aggregate.categories,
+                    {
+                        "중량": Decimal("3.333"),
+                        "고단": Decimal("3.333"),
+                        "양곡": Decimal("3.334"),
+                    },
+                )
+
+                snapshot = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 15, 1, 2, 3),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "M30001", "milkrun", "2F", "Raw_밀크런", 2
+                        ),
+                    ),
+                )
+
+                window._render_arrival_sequence(snapshot)
+
+                second = window.arrival_detail_tables["floor_targets"]["second"]
+                self.assertEqual(second.item(0, 1).text(), "10 Pallet")
+                self.assertEqual(second.item(2, 1).text(), "3.333 Pallet")
+                self.assertEqual(second.item(3, 1).text(), "3.333 Pallet")
+                self.assertEqual(second.item(4, 1).text(), "3.334 Pallet")
+                self.assertEqual(
+                    sum(
+                        Decimal(second.item(row, 1).text().removesuffix(" Pallet"))
+                        for row in range(1, 6)
+                    ),
+                    Decimal("10"),
+                )
+            finally:
+                window.close()
+
+    def test_arrival_splits_shared_group_between_grain_and_heavy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
@@ -577,11 +658,14 @@ class MainWindowSmokeTests(unittest.TestCase):
                 aggregate = window._raw_booking_aggregates()["M3370492"]
 
                 self.assertEqual(aggregate.pallet_count, Decimal("12"))
-                self.assertEqual(aggregate.categories, {"양곡": Decimal("12")})
+                self.assertEqual(
+                    aggregate.categories,
+                    {"중량": Decimal("6"), "양곡": Decimal("6")},
+                )
             finally:
                 window.close()
 
-    def test_arrival_promotes_special_category_to_entire_multi_sku_vehicle(self) -> None:
+    def test_arrival_keeps_categories_on_independent_vehicle_pallet_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             window = MainWindow(smoke_test=True)
             window.product_memory_file = Path(temp) / "memory.json"
@@ -623,11 +707,158 @@ class MainWindowSmokeTests(unittest.TestCase):
                 aggregates = window._raw_booking_aggregates()
 
                 self.assertEqual(aggregates["T20001"].pallet_count, Decimal("10"))
-                self.assertEqual(aggregates["T20001"].categories, {"고단": Decimal("10")})
+                self.assertEqual(
+                    aggregates["T20001"].categories,
+                    {"중량": Decimal("8"), "고단": Decimal("2")},
+                )
                 self.assertEqual(aggregates["T20002"].pallet_count, Decimal("7"))
-                self.assertEqual(aggregates["T20002"].categories, {"양곡": Decimal("7")})
+                self.assertEqual(
+                    aggregates["T20002"].categories,
+                    {"경량": Decimal("4"), "양곡": Decimal("3")},
+                )
                 self.assertEqual(aggregates["M10001"].pallet_count, Decimal("12"))
-                self.assertEqual(aggregates["M10001"].categories, {"고단": Decimal("12")})
+                self.assertEqual(
+                    aggregates["M10001"].categories,
+                    {"중량": Decimal("7"), "고단": Decimal("5")},
+                )
+            finally:
+                window.close()
+
+    def test_arrival_classifies_mixed_truck_vehicle_per_physical_container(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                window._populate_truck_products(
+                    (
+                        MilkrunProductRow(
+                            "트럭 거래처",
+                            "PALLET_HIGH",
+                            "3",
+                            "30",
+                            "501",
+                            "고단 상품",
+                            "T30001",
+                            (
+                                ("barcode:cbn-high", "2"),
+                                ("barcode:cbn-shared", "1"),
+                            ),
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처",
+                            "PALLET_GRAIN",
+                            "4",
+                            "40",
+                            "502",
+                            "양곡 상품",
+                            "T30001",
+                            (
+                                ("barcode:cbn-grain", "3"),
+                                ("barcode:cbn-shared", "1"),
+                            ),
+                        ),
+                        MilkrunProductRow(
+                            "트럭 거래처",
+                            "PALLET_HEAVY",
+                            "4",
+                            "40",
+                            "503",
+                            "중량 상품",
+                            "T30001",
+                            (("barcode:cbn-heavy", "4"),),
+                        ),
+                    )
+                )
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("501", "고단", "고단 상품")
+                memory.set_manual_category("502", "양곡", "양곡 상품")
+                memory.set_manual_category("503", "중량", "중량 상품")
+
+                aggregate = window._raw_booking_aggregates()["T30001"]
+
+                self.assertEqual(aggregate.pallet_count, Decimal("10"))
+                self.assertEqual(aggregate.missing_pallet_rows, 0)
+                self.assertEqual(
+                    aggregate.categories,
+                    {
+                        "중량": Decimal("4"),
+                        "고단": Decimal("3"),
+                        "양곡": Decimal("3"),
+                    },
+                )
+                self.assertEqual(window.truck_table.item(0, 2).text(), "3")
+                self.assertEqual(window.truck_table.item(1, 2).text(), "3 + 공유 1")
+                self.assertEqual(window.truck_table.item(2, 2).text(), "4")
+
+                snapshot = ArrivalSequenceSnapshot(
+                    workbook=Path("sample.xlsm"),
+                    sheet_name="입차순번",
+                    refreshed_at=datetime(2026, 8, 15, 1, 2, 3),
+                    summary=ArrivalSummary(
+                        departure=(("0", "0", "0"),) * 3,
+                        outside_waiting=(("0", "0", "0"),) * 3,
+                        floor_targets=(("0", "0"),) * 3,
+                    ),
+                    entries=(),
+                    floor_assignments=(
+                        BookingFloorAssignment(
+                            "T30001", "truck", "2F", "Raw_트럭", 2
+                        ),
+                    ),
+                )
+
+                window._render_arrival_sequence(snapshot)
+
+                second = window.arrival_detail_tables["floor_targets"]["second"]
+                self.assertEqual(second.item(0, 1).text(), "10 Pallet")
+                self.assertEqual(second.item(2, 1).text(), "4 Pallet")
+                self.assertEqual(second.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(second.item(4, 1).text(), "3 Pallet")
+            finally:
+                window.close()
+
+    def test_arrival_classifies_mixed_milkrun_vehicle_per_inner_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            window = MainWindow(smoke_test=True)
+            window.product_memory_file = Path(temp) / "memory.json"
+            try:
+                window._populate_milkrun_products(
+                    (
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "4", "40", "601", "고단 상품", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_A", "4", "20", "602", "양곡 상품 A", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_B", "4", "30", "603", "양곡 상품 B", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_B", "4", "15", "604", "중량 상품 B", "M30001"
+                        ),
+                        MilkrunProductRow(
+                            "거래처", "INNER_C", "2", "20", "605", "중량 상품 C", "M30001"
+                        ),
+                    )
+                )
+                memory = ProductMemory(window.product_memory_file)
+                memory.set_manual_category("601", "고단", "고단 상품")
+                memory.set_manual_category("602", "양곡", "양곡 상품 A")
+                memory.set_manual_category("603", "양곡", "양곡 상품 B")
+                memory.set_manual_category("604", "중량", "중량 상품 B")
+                memory.set_manual_category("605", "중량", "중량 상품 C")
+
+                aggregate = window._raw_booking_aggregates()["M30001"]
+
+                self.assertEqual(aggregate.pallet_count, Decimal("10"))
+                self.assertEqual(
+                    aggregate.categories,
+                    {
+                        "중량": Decimal("4"),
+                        "고단": Decimal("2"),
+                        "양곡": Decimal("4"),
+                    },
+                )
             finally:
                 window.close()
 
@@ -840,8 +1071,14 @@ class MainWindowSmokeTests(unittest.TestCase):
                 aggregates = restored._raw_booking_aggregates()
                 self.assertEqual(aggregates["T20001"].categories, {"고단": Decimal("3")})
                 self.assertEqual(aggregates["T20002"].categories, {"양곡": Decimal("4")})
-                self.assertEqual(aggregates["M10001"].categories, {"고단": Decimal("12")})
-                self.assertEqual(aggregates["M10002"].categories, {"양곡": Decimal("10")})
+                self.assertEqual(
+                    aggregates["M10001"].categories,
+                    {"고단": Decimal("2.5"), "?": Decimal("9.5")},
+                )
+                self.assertEqual(
+                    aggregates["M10002"].categories,
+                    {"양곡": Decimal("3"), "?": Decimal("7")},
+                )
 
                 arrival = ArrivalSequenceSnapshot(
                     workbook=Path("sample.xlsm"),
@@ -884,14 +1121,17 @@ class MainWindowSmokeTests(unittest.TestCase):
                 departure = restored.arrival_detail_tables["departure"]["second"]
                 targets = restored.arrival_detail_tables["floor_targets"]["second"]
                 self.assertEqual(waiting.item(0, 1).text(), "15 Pallet")
-                self.assertEqual(waiting.item(3, 1).text(), "15 Pallet")
+                self.assertEqual(waiting.item(3, 1).text(), "5.5 Pallet")
                 self.assertEqual(waiting.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(waiting.item(5, 1).text(), "9.5 Pallet")
                 self.assertEqual(departure.item(0, 1).text(), "14 Pallet")
                 self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
-                self.assertEqual(departure.item(4, 1).text(), "14 Pallet")
+                self.assertEqual(departure.item(4, 1).text(), "7 Pallet")
+                self.assertEqual(departure.item(5, 1).text(), "7 Pallet")
                 self.assertEqual(targets.item(0, 1).text(), "29 Pallet")
-                self.assertEqual(targets.item(3, 1).text(), "15 Pallet")
-                self.assertEqual(targets.item(4, 1).text(), "14 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "5.5 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "7 Pallet")
+                self.assertEqual(targets.item(5, 1).text(), "16.5 Pallet")
             finally:
                 restored.close()
 
@@ -1063,12 +1303,12 @@ class MainWindowSmokeTests(unittest.TestCase):
                 waiting = window.arrival_detail_tables["outside_waiting"]["second"]
                 departure = window.arrival_detail_tables["departure"]["second"]
                 targets = window.arrival_detail_tables["floor_targets"]["second"]
-                self.assertEqual(waiting.item(3, 1).text(), "3 Pallet")
-                self.assertEqual(waiting.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(waiting.item(3, 1).text(), "1.5 Pallet")
+                self.assertEqual(waiting.item(4, 1).text(), "1.5 Pallet")
                 self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
                 self.assertEqual(departure.item(4, 1).text(), "4 Pallet")
-                self.assertEqual(targets.item(3, 1).text(), "3 Pallet")
-                self.assertEqual(targets.item(4, 1).text(), "4 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "1.5 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "5.5 Pallet")
             finally:
                 window.close()
 
@@ -1301,7 +1541,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_real_multi_sku_milkrun_high_counts_despite_unknown_unit_ratio(self) -> None:
+    def test_real_multi_sku_milkrun_splits_pallets_by_unique_sku(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             memory_path = Path(temp) / "memory.json"
             window = MainWindow(smoke_test=True, product_memory_file=memory_path)
@@ -1349,7 +1589,13 @@ class MainWindowSmokeTests(unittest.TestCase):
                 self.assertEqual(window.raw_table.rowSpan(0, 9), 1)
                 aggregate = window._raw_booking_aggregates()["M3373803"]
                 self.assertEqual(aggregate.pallet_count, Decimal("8"))
-                self.assertEqual(aggregate.categories, {"고단": Decimal("8")})
+                self.assertEqual(
+                    aggregate.categories,
+                    {
+                        "고단": Decimal("0.727"),
+                        "?": Decimal("7.273"),
+                    },
+                )
 
                 snapshot = ArrivalSequenceSnapshot(
                     workbook=Path("sample.xlsm"),
@@ -1370,13 +1616,21 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window._render_arrival_sequence(snapshot)
                 second = window.arrival_detail_tables["floor_targets"]["second"]
                 self.assertEqual(second.item(0, 1).text(), "8 Pallet")
-                self.assertEqual(second.item(3, 1).text(), "8 Pallet")
+                self.assertEqual(second.item(3, 1).text(), "0.727 Pallet")
+                self.assertEqual(second.item(5, 1).text(), "7.273 Pallet")
+                self.assertEqual(
+                    sum(
+                        Decimal(second.item(row, 1).text().removesuffix(" Pallet"))
+                        for row in range(1, 6)
+                    ),
+                    Decimal("8"),
+                )
                 self.assertIn(
-                    "앱 RAW 고단 1대/8 Pallet",
+                    "앱 RAW 고단 1대/",
                     window.arrival_reconciliation_label.text(),
                 )
                 self.assertIn(
-                    "M3373803 8P",
+                    "M3373803",
                     window.arrival_reconciliation_label.toolTip(),
                 )
             finally:
@@ -2468,12 +2722,16 @@ class MainWindowSmokeTests(unittest.TestCase):
                 targets = destination_window.arrival_detail_tables["floor_targets"][
                     "second"
                 ]
-                self.assertEqual(outside.item(3, 1).text(), "3 Pallet")
+                self.assertEqual(outside.item(2, 1).text(), "1.5 Pallet")
+                self.assertEqual(outside.item(3, 1).text(), "1.5 Pallet")
                 self.assertEqual(outside.item(4, 1).text(), "0 Pallet")
+                self.assertEqual(departure.item(1, 1).text(), "4 Pallet")
                 self.assertEqual(departure.item(3, 1).text(), "0 Pallet")
-                self.assertEqual(departure.item(4, 1).text(), "6 Pallet")
-                self.assertEqual(targets.item(3, 1).text(), "3 Pallet")
-                self.assertEqual(targets.item(4, 1).text(), "6 Pallet")
+                self.assertEqual(departure.item(4, 1).text(), "2 Pallet")
+                self.assertEqual(targets.item(1, 1).text(), "4 Pallet")
+                self.assertEqual(targets.item(2, 1).text(), "1.5 Pallet")
+                self.assertEqual(targets.item(3, 1).text(), "1.5 Pallet")
+                self.assertEqual(targets.item(4, 1).text(), "2 Pallet")
             finally:
                 destination_window.close()
 
