@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import csv
 import gc
 import math
@@ -738,7 +739,10 @@ class MilkrunExcelImporter:
     @staticmethod
     def _decode_text(raw: bytes) -> str:
         encoding = MilkrunExcelImporter._detect_text_encoding(raw)
-        return raw.decode(encoding)
+        # A fixed-size probe can stop in the middle of a multibyte character.
+        # Keep strict validation for complete bytes while buffering that tail.
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        return decoder.decode(raw, final=False)
 
     @staticmethod
     def _detect_text_encoding(raw: bytes) -> str:

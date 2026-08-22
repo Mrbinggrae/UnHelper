@@ -900,6 +900,42 @@ class MilkrunExcelImporterTests(unittest.TestCase):
             self.assertEqual((result.rows, result.columns), (2, 2))
             self.assertEqual(sheet.destination.Value2, (("이름", "수량"), ("상품", "2")))
 
+    def test_utf8_bom_probe_may_end_in_the_middle_of_a_character(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_bytes(
+                b"\xef\xbb\xbf"
+                + (b"a" * 8187)
+                + "상품,value\n다음,2\n".encode("utf-8")
+            )
+            sheet = FakeTargetSheet()
+            importer, _target_book, _excel, _pythoncom = self._active_importer(target, sheet)
+
+            result = importer.import_values(source, target)
+
+            self.assertEqual((result.rows, result.columns), (2, 2))
+            self.assertTrue(sheet.destination.Value2[0][0].endswith("상품"))
+            self.assertEqual(sheet.destination.Value2[1], ("다음", "2"))
+
+    def test_truncated_utf8_file_is_rejected_after_probe_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, target = self._paths(root)
+            source.write_bytes(
+                b"\xef\xbb\xbfheader,value\n"
+                + "상품".encode("utf-8")[:-1]
+            )
+            sheet = FakeTargetSheet()
+            importer, target_book, _excel, pythoncom = self._active_importer(target, sheet)
+
+            with self.assertRaisesRegex(ExcelImportError, "문자 인코딩"):
+                importer.import_values(source, target)
+
+            self.assertEqual(sheet.clear_range.clear_count, 0)
+            self.assertEqual(target_book.save_count, 0)
+            self.assertEqual((pythoncom.initialized, pythoncom.uninitialized), (1, 1))
+
     def test_cp949_is_retried_when_first_8k_is_ascii_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
